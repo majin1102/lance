@@ -14,43 +14,63 @@
 package com.lancedb.lance.schema;
 
 import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class LanceField {
 
   private final int id;
+  private final int parentId;
   private final String name;
   private final boolean nullable;
   private final ArrowType type;
-  private final DictionaryEncoding dictionary;
+  private final StorageType storageType;
+  private final Optional<Encoding> encoding;
+  private final Optional<Dictionary> dictionary;
   private final Map<String, String> metadata;
   private final List<LanceField> children;
+  private final boolean isUnenforcedPrimaryKey;
 
   LanceField(
       int id,
+      int parentId,
       String name,
       boolean nullable,
       ArrowType type,
-      DictionaryEncoding dictionary,
+      StorageType storageType,
+      Encoding encoding,
+      Dictionary dictionary,
       Map<String, String> metadata,
-      List<LanceField> children) {
+      List<LanceField> children,
+      boolean isUnenforcedPrimaryKey) {
     this.id = id;
+    this.parentId = parentId;
     this.name = name;
     this.nullable = nullable;
     this.type = type;
-    this.dictionary = dictionary;
+    this.storageType = storageType;
+    this.encoding = Optional.ofNullable(encoding);
+    this.dictionary = Optional.ofNullable(dictionary);
     this.metadata = metadata;
     this.children = children;
+    this.isUnenforcedPrimaryKey = isUnenforcedPrimaryKey;
   }
 
   public int getId() {
     return id;
+  }
+
+  public int getParentId() {
+    return parentId;
+  }
+
+  public String getName() {
+    return name;
   }
 
   public boolean isNullable() {
@@ -61,7 +81,15 @@ public class LanceField {
     return type;
   }
 
-  public DictionaryEncoding getDictionary() {
+  public StorageType getStorageType() {
+    return storageType;
+  }
+
+  public Optional<Encoding> getEncoding() {
+    return encoding;
+  }
+
+  public Optional<Dictionary> getDictionary() {
     return dictionary;
   }
 
@@ -69,13 +97,46 @@ public class LanceField {
     return metadata;
   }
 
+  public List<LanceField> getChildren() {
+    return children;
+  }
+
+  public boolean isUnenforcedPrimaryKey() {
+    return isUnenforcedPrimaryKey;
+  }
+
   public Field asArrowField() {
     List<Field> arrowChildren =
         children.stream().map(LanceField::asArrowField).collect(Collectors.toList());
-    return new Field(name, new FieldType(nullable, type, dictionary, metadata), arrowChildren);
+    return new Field(name, new FieldType(nullable, type, null, metadata), arrowChildren);
   }
 
-  public List<LanceField> getChildren() {
-    return children;
+  @Override
+  public String toString() {
+    return "LanceField{"
+        + "id="
+        + id
+        + ", parentId="
+        + parentId
+        + ", name='"
+        + name
+        + '\''
+        + ", nullable="
+        + nullable
+        + ", type="
+        + type
+        + ", storageType="
+        + storageType
+        + ", encoding="
+        + encoding
+        + ", dictionary="
+        + dictionary
+        + ", metadata="
+        + metadata
+        + ", isUnenforcedPrimaryKey="
+        + isUnenforcedPrimaryKey
+        + ", children="
+        + children
+        + '}';
   }
 }

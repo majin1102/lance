@@ -1,11 +1,14 @@
 use crate::error::{Error, Result};
 use crate::utils::to_java_map;
+use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::DataType;
+use arrow::ffi::FFI_ArrowArray;
+use arrow_schema::ffi::FFI_ArrowSchema;
 use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
-use jni::sys::{jboolean, jint};
+use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
-use lance_core::datatypes::Field;
+use lance_core::datatypes::{Encoding, Field, StorageClass};
 
 pub fn convert_to_java_field<'local>(
     env: &mut JNIEnv<'local>,
@@ -14,24 +17,133 @@ pub fn convert_to_java_field<'local>(
     let name = env.new_string(&lance_field.name)?;
     let children = convert_children_fields(env, &lance_field)?;
     let metadata = to_java_map(env, &lance_field.metadata)?;
-    let dict_encoding = JObject::null();
+    let dictionary = convert_dictionary(env, lance_field)?;
+    let encoding = convert_encoding_to_java(env, lance_field)?;
     let arrow_type = convert_arrow_type(env, &lance_field.data_type())?;
+    let storage_type = convert_storage_type(env, &lance_field.storage_class)?;
 
+    let ctor_sig = "(IILjava/lang/String;".to_owned()
+        + "ZLorg/apache/arrow/vector/types/pojo/ArrowType;"
+        + "Lcom/lancedb/lance/schema/StorageType;"
+        + "Lcom/lancedb/lance/schema/Encoding;"
+        + "Lcom/lancedb/lance/schema/Dictionary;"
+        + "Ljava/util/Map;"
+        + "Ljava/util/List;Z)V";
     let field_obj = env.new_object(
         "com/lancedb/lance/schema/LanceField",
-        "(ILjava/lang/String;ZLorg/apache/arrow/vector/types/pojo/ArrowType;Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;Ljava/util/Map;Ljava/util/List;)V",
+        ctor_sig.as_str(),
         &[
             JValue::Int(lance_field.id as jint),
+            JValue::Int(lance_field.parent_id as jint),
             JValue::Object(&JObject::from(name)),
             JValue::Bool(lance_field.nullable as jboolean),
             JValue::Object(&arrow_type),
-            JValue::Object(&dict_encoding),
+            JValue::Object(&storage_type),
+            JValue::Object(&encoding),
+            JValue::Object(&dictionary),
             JValue::Object(&metadata),
             JValue::Object(&children),
+            JValue::Bool(lance_field.unenforced_primary_key as jboolean),
         ],
     )?;
 
     Ok(field_obj)
+}
+
+fn convert_encoding_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    lance_field: &Field,
+) -> Result<JObject<'local>> {
+    let variant_name = match lance_field.encoding.as_ref() {
+        Some(lance_encoding) => match lance_encoding {
+            Encoding::Plain => "PLAIN",
+            Encoding::VarBinary => "VAR_BINARY",
+            Encoding::Dictionary => "DICTIONARY",
+            Encoding::RLE => "RLE",
+        },
+        None => return Ok(JObject::null()),
+    };
+    let jname = env.new_string(variant_name)?;
+
+    Ok(env
+        .call_static_method(
+            "com/lancedb/lance/schema/Encoding",
+            "valueOf",
+            "(Ljava/lang/String;)Lcom/lancedb/lance/schema/Encoding;",
+            &[JValue::Object(&JObject::from(jname))],
+        )?
+        .l()?)
+}
+
+fn convert_storage_type<'local>(
+    env: &mut JNIEnv<'local>,
+    storage_class: &StorageClass,
+) -> Result<JObject<'local>> {
+    let jname = match storage_class {
+        StorageClass::Blob => env.new_string("BLOB")?,
+        _ => env.new_string("DEFAULT")?,
+    };
+
+    Ok(env
+        .call_static_method(
+            "com/lancedb/lance/schema/StorageType",
+            "valueOf",
+            "(Ljava/lang/String;)Lcom/lancedb/lance/schema/StorageType;",
+            &[JValue::Object(&JObject::from(jname))],
+        )?
+        .l()?)
+}
+
+fn export_arrow_array(array: &ArrayRef) -> (*mut FFI_ArrowArray, *mut FFI_ArrowSchema) {
+    let ffi_array = FFI_ArrowArray::new(&array.as_ref().to_data());
+    let ffi_schema = FFI_ArrowSchema::try_from(array.data_type()).unwrap();
+
+    let array_ptr = unsafe {
+        std::alloc::alloc(std::alloc::Layout::new::<FFI_ArrowArray>()) as *mut FFI_ArrowArray
+    };
+    let schema_ptr = unsafe {
+        std::alloc::alloc(std::alloc::Layout::new::<FFI_ArrowSchema>()) as *mut FFI_ArrowSchema
+    };
+    unsafe {
+        std::ptr::write_unaligned(array_ptr, ffi_array);
+        std::ptr::write_unaligned(schema_ptr, ffi_schema);
+    }
+    (array_ptr, schema_ptr)
+}
+
+fn convert_dictionary<'local>(
+    env: &mut JNIEnv<'local>,
+    lance_field: &Field,
+) -> Result<JObject<'local>> {
+    let lance_dict = match lance_field.dictionary.as_ref() {
+        Some(dict) => dict,
+        None => return Ok(JObject::null()),
+    };
+    let dict_value = match &lance_dict.values {
+        None => JObject::null(),
+        Some(array) => {
+            let (array_ptr, schema_ptr) = export_arrow_array(array);
+            env.new_object(
+                "com/lancedb/lance/schema/Dictionary$DictionaryValuePointer",
+                "(JJ)V",
+                &[
+                    JValue::Long(array_ptr as jlong),
+                    JValue::Long(schema_ptr as jlong),
+                ],
+            )?
+        }
+    };
+
+    let dictionary = env.new_object(
+        "com/lancedb/lance/schema/Dictionary",
+        "(IILcom/lancedb/lance/schema/Dictionary$DictionaryValuePointer;)V",
+        &[
+            JValue::Int(lance_dict.offset as jint),
+            JValue::Int(lance_dict.length as jint),
+            JValue::Object(&dict_value),
+        ],
+    )?;
+    Ok(dictionary)
 }
 
 fn convert_children_fields<'local>(
@@ -123,9 +235,8 @@ fn convert_int_type<'local>(
     bit_width: i32,
     is_signed: bool,
 ) -> Result<JObject<'local>> {
-    let class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$Int")?;
     Ok(env.new_object(
-        class,
+        "org/apache/arrow/vector/types/pojo/ArrowType$Int",
         "(IZ)V",
         &[
             JValue::Int(bit_width as jint),
@@ -138,7 +249,6 @@ fn convert_floating_point_type<'local>(
     env: &mut JNIEnv<'local>,
     precision: &str,
 ) -> Result<JObject<'local>> {
-    let class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$FloatingPoint")?;
     let precision_enum = env
         .get_static_field(
             "org/apache/arrow/vector/types/FloatingPointPrecision",
@@ -148,7 +258,7 @@ fn convert_floating_point_type<'local>(
         .l()?;
 
     Ok(env.new_object(
-        class,
+        "org/apache/arrow/vector/types/pojo/ArrowType$FloatingPoint",
         "(Lorg/apache/arrow/vector/types/FloatingPointPrecision;)V",
         &[JValue::Object(&precision_enum)],
     )?)
@@ -391,7 +501,3 @@ fn convert_map_type<'local>(
         &[JValue::Bool(keys_sorted as jboolean)],
     )?)
 }
-
-// pub extern "C" fn free_arrow_buffer(ptr: *const u8, len: usize) {
-//     unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) };
-// }
