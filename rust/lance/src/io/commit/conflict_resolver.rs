@@ -44,6 +44,7 @@ impl<'a> TransactionRebase<'a> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Overwrite { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
@@ -210,6 +211,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateMemWalState { .. } => {
                 self.check_update_mem_wal_state_txn(other_transaction, other_version)
             }
+            Operation::Clone { .. } => Ok(()),
         }
     }
 
@@ -221,6 +223,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
+                | Operation::Clone { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Append { .. }
@@ -435,9 +438,13 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
-                    self.incompatible_conflict_err(other_transaction, other_version, location!())
-                ),
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::Clone { .. } => Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                )),
                 Operation::UpdateMemWalState { added, updated, .. } => {
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         added,
@@ -471,7 +478,7 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
-                Operation::Append { .. } => Ok(()),
+                Operation::Append { .. } | Operation::Clone { .. } => Ok(()),
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 // unless it is the same frag reuse index
                 Operation::CreateIndex {
@@ -597,6 +604,7 @@ impl<'a> TransactionRebase<'a> {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
+                | Operation::Clone { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateConfig { .. }
@@ -771,6 +779,7 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Delete { .. }
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
@@ -797,6 +806,7 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Rewrite { .. }
             | Operation::CreateIndex { .. }
             | Operation::Delete { .. }
@@ -816,6 +826,7 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Delete { .. }
             | Operation::Update { .. }
             | Operation::Merge { .. }
@@ -849,6 +860,7 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::CreateIndex { .. }
+            | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
 
@@ -876,6 +888,7 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Delete { .. }
             | Operation::Overwrite { .. }
             | Operation::CreateIndex { .. }
@@ -903,6 +916,7 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Delete { .. }
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
@@ -924,6 +938,7 @@ impl<'a> TransactionRebase<'a> {
         match &other_transaction.operation {
             // Project is compatible with anything that doesn't change the schema
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Update { .. }
             | Operation::Delete { .. }
             | Operation::UpdateConfig { .. }
@@ -994,6 +1009,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::Append { .. }
+                | Operation::Clone { .. }
                 | Operation::Delete { .. }
                 | Operation::CreateIndex { .. }
                 | Operation::Rewrite { .. }
@@ -1084,6 +1100,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. } => Ok(()),
                 Operation::Append { .. }
+                | Operation::Clone { .. }
                 | Operation::Overwrite { .. }
                 | Operation::Delete { .. }
                 | Operation::DataReplacement { .. }
@@ -1156,6 +1173,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::CreateIndex { .. } => self.finish_create_index(dataset).await,
             Operation::Rewrite { .. } => self.finish_rewrite(dataset).await,
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Overwrite { .. }
             | Operation::DataReplacement { .. }
             | Operation::Merge { .. }
@@ -1635,6 +1653,7 @@ mod tests {
             read_deletion_file(
                 fragment.id,
                 deletion_file,
+                // Reference deletion file should never enter this apply_deletion. So base path is fine.
                 &dataset.base,
                 dataset.object_store(),
             )
@@ -2418,6 +2437,7 @@ mod tests {
         match operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Overwrite { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }

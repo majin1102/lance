@@ -227,6 +227,14 @@ pub enum Operation {
         updated: Vec<MemWal>,
         removed: Vec<MemWal>,
     },
+
+    /// Clone a new dataset from another dataset.
+    Clone {
+        is_shallow: bool,
+        ref_name: String,
+        ref_version: u64,
+        ref_path: String,
+    },
 }
 
 impl std::fmt::Display for Operation {
@@ -245,6 +253,7 @@ impl std::fmt::Display for Operation {
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
+            Self::Clone { .. } => write!(f, "Clone"),
         }
     }
 }
@@ -261,6 +270,25 @@ impl PartialEq for Operation {
         }
         match (self, other) {
             (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
+            (
+                Self::Clone {
+                    is_shallow: a_is_shallow,
+                    ref_name: a_ref_name,
+                    ref_version: a_ref_version,
+                    ref_path: a_source_path,
+                },
+                Self::Clone {
+                    is_shallow: b_is_shallow,
+                    ref_name: b_ref_name,
+                    ref_version: b_ref_version,
+                    ref_path: b_source_path,
+                },
+            ) => {
+                a_is_shallow == b_is_shallow
+                    && a_ref_name == b_ref_name
+                    && a_ref_version == b_ref_version
+                    && a_source_path == b_source_path
+            },
             (
                 Self::Delete {
                     updated_fragments: a_updated,
@@ -427,6 +455,9 @@ impl PartialEq for Operation {
             (Self::Append { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Append { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Delete { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -462,6 +493,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Delete { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -501,6 +535,9 @@ impl PartialEq for Operation {
             (Self::Overwrite { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Overwrite { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::CreateIndex { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -536,6 +573,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::CreateIndex { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -575,6 +615,9 @@ impl PartialEq for Operation {
             (Self::Rewrite { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Rewrite { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Merge { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -612,6 +655,10 @@ impl PartialEq for Operation {
             (Self::Merge { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Merge { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
 
             (Self::Restore { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -647,6 +694,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Restore { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -686,6 +736,9 @@ impl PartialEq for Operation {
             (Self::ReserveFragments { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::ReserveFragments { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Update { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -721,6 +774,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Update { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -760,6 +816,9 @@ impl PartialEq for Operation {
             (Self::Project { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Project { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::UpdateConfig { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -795,6 +854,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::UpdateConfig { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -834,6 +896,9 @@ impl PartialEq for Operation {
             (Self::DataReplacement { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::DataReplacement { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::UpdateMemWalState { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -871,6 +936,9 @@ impl PartialEq for Operation {
             (Self::UpdateMemWalState { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateMemWalState { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
             (
                 Self::UpdateMemWalState {
                     added: a_added,
@@ -886,6 +954,46 @@ impl PartialEq for Operation {
                 compare_vec(a_added, b_added)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_removed, b_removed)
+            }
+
+            (Self::Clone { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
             }
         }
     }
@@ -1015,6 +1123,7 @@ impl Operation {
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
+            Self::Clone { .. } => "Clone",
         }
     }
 }
@@ -1180,6 +1289,11 @@ impl Transaction {
             });
         }
 
+        let base_paths = match current_manifest {
+            Some(m) => m.base_paths.clone(),
+            None => HashMap::new(),
+        };
+
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -1239,6 +1353,9 @@ impl Transaction {
                 });
 
         match &self.operation {
+            Operation::Clone { .. } => {
+                unreachable!()
+            }
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
@@ -1562,6 +1679,7 @@ impl Transaction {
                 Arc::new(final_fragments),
                 data_storage_format,
                 new_blob_version,
+                base_paths,
             )
         };
 
@@ -1682,8 +1800,7 @@ impl Transaction {
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)
-        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> =
-            std::collections::HashMap::new();
+        let mut indices_by_name: HashMap<String, Vec<&Index>> = HashMap::new();
 
         // Group indices by name
         for index in indices.iter() {
@@ -1928,6 +2045,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .collect::<Result<Vec<_>>>()?,
                 }
             }
+            Some(pb::transaction::Operation::Clone(pb::transaction::Clone {
+               is_shallow,
+               ref_name,
+               ref_version,
+               ref_path,
+           })) => Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -2224,6 +2352,17 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
         let operation = match &value.operation {
+            Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            } => pb::transaction::Operation::Clone(pb::transaction::Clone {
+                is_shallow: *is_shallow,
+                ref_name: ref_name.clone(),
+                ref_version: *ref_version,
+                ref_path: ref_path.clone(),
+            }),
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),

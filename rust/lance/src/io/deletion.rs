@@ -18,6 +18,7 @@ pub async fn read_dataset_deletion_file(
         deletion_file,
     };
 
+    let deletion_base = dataset.deletion_file_root_dir(deletion_file)?;
     if let Some(cached) = dataset.metadata_cache.get_with_key(&key).await {
         Ok(cached)
     } else {
@@ -25,7 +26,7 @@ pub async fn read_dataset_deletion_file(
             read_deletion_file(
                 fragment_id,
                 deletion_file,
-                &dataset.base,
+                &deletion_base,
                 dataset.object_store.as_ref(),
             )
             .await?,
