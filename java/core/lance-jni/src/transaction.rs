@@ -3,7 +3,10 @@
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString, IntoJava, JLance};
+use crate::traits::{
+    export_vec, import_vec, import_vec_from_method, FromJObjectWithEnv, FromJString, IntoJava,
+    JLance,
+};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
@@ -240,13 +243,7 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
                 .i()? as u32;
             Some(DateTime::from_timestamp(seconds, nanos).unwrap())
         };
-        let base_id_obj = env.get_field(self, "baseId", "Ljava/lang/Integer;")?.l()?;
-        let base_id = if base_id_obj.is_null() {
-            None
-        } else {
-            let id_value = env.call_method(&base_id_obj, "intValue", "()I", &[])?.i()? as u32;
-            Some(id_value)
-        };
+        let base_id = env.get_optional_u32_from_method(self, "baseId")?;
 
         Ok(Index {
             uuid,
@@ -259,6 +256,23 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
             created_at,
             base_id,
         })
+    }
+}
+
+impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataReplacementGroup> {
+        let fragment_id = env.call_method(self, "fragmentId", "()J", &[])?.j()? as u64;
+        let new_file_obj = env
+            .call_method(
+                self,
+                "replacedFile",
+                "()Lcom/lancedb/lance/fragment/DataFile;",
+                &[],
+            )?
+            .l()?;
+        let new_file = new_file_obj.extract_object(env)?;
+
+        Ok(DataReplacementGroup(fragment_id, new_file))
     }
 }
 
@@ -694,14 +708,8 @@ fn convert_to_rust_transaction(
     java_transaction: JObject,
     java_dataset: Option<&JObject>,
 ) -> Result<Transaction> {
-    let read_ver = env
-        .call_method(&java_transaction, "readVersion", "()J", &[])?
-        .j()?;
-    let uuid = env
-        .call_method(&java_transaction, "uuid", "()Ljava/lang/String;", &[])?
-        .l()?;
-    let uuid = JString::from(uuid);
-    let uuid = env.get_string(&uuid)?.into();
+    let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
+    let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
     let op = env
         .call_method(
             &java_transaction,
@@ -710,7 +718,7 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let op = convert_to_rust_operation(env, op, java_dataset)?;
+    let op = convert_to_rust_operation(env, &op, java_dataset)?;
 
     let blobs_op = env
         .call_method(
@@ -720,334 +728,29 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let blobs_op = if blobs_op.is_null() {
-        None
+    let is_present = env.call_method(&blobs_op, "isPresent", "()Z", &[])?;
+    let blobs_op = if is_present.z()? {
+        let blobs_op = env
+            .call_method(&blobs_op, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        Some(convert_to_rust_operation(env, &blobs_op, java_dataset))
     } else {
-        Some(convert_to_rust_operation(env, blobs_op, java_dataset)?)
+        None
     };
 
-    let transaction_properties = env
-        .call_method(
-            &java_transaction,
-            "transactionProperties",
-            "()Ljava/util/Map;",
-            &[],
-        )?
-        .l()?;
-    let transaction_properties = JMap::from_env(env, &transaction_properties)?;
-    let transaction_properties = to_rust_map(env, &transaction_properties)?;
-    Ok(TransactionBuilder::new(read_ver as u64, op)
+    let transaction_properties = env.get_optional_from_method(
+        &java_transaction,
+        "transactionProperties",
+        |env, transaction_properties| {
+            let transaction_properties = JMap::from_env(env, &transaction_properties)?;
+            to_rust_map(env, &transaction_properties)
+        },
+    )?;
+    Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
         .blobs_op(blobs_op)
-        .transaction_properties(Some(Arc::new(transaction_properties)))
+        .transaction_properties(transaction_properties.map(|inner| Arc::new(inner)))
         .build())
-}
-
-fn convert_to_rust_operation(
-    env: &mut JNIEnv,
-    java_operation: JObject,
-    java_dataset: Option<&JObject>,
-) -> Result<Operation> {
-    let name = env
-        .call_method(&java_operation, "name", "()Ljava/lang/String;", &[])?
-        .l()?;
-    let name = JString::from(name);
-    let name: String = env.get_string(&name)?.into();
-    let op = match name.as_str() {
-        "Project" => Operation::Project {
-            schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
-        },
-        "UpdateConfig" => {
-            let upsert_values = env
-                .call_method(&java_operation, "upsertValues", "()Ljava/util/Map;", &[])?
-                .l()?;
-            let upsert_values = if !upsert_values.is_null() {
-                let upsert_values = JMap::from_env(env, &upsert_values)?;
-                Some(to_rust_map(env, &upsert_values)?)
-            } else {
-                None
-            };
-
-            let delete_keys = env
-                .call_method(&java_operation, "deleteKeys", "()Ljava/util/List;", &[])?
-                .l()?;
-            let delete_keys = if !delete_keys.is_null() {
-                let keys = import_vec(env, &delete_keys)?;
-                let keys = keys
-                    .into_iter()
-                    .map(JString::from)
-                    .map(|key| key.extract(env))
-                    .collect::<Result<Vec<_>>>()?;
-                Some(keys)
-            } else {
-                None
-            };
-
-            let schema_metadata = env
-                .call_method(&java_operation, "schemaMetadata", "()Ljava/util/Map;", &[])?
-                .l()?;
-            let schema_metadata = if !schema_metadata.is_null() {
-                let schema_metadata = JMap::from_env(env, &schema_metadata)?;
-                Some(to_rust_map(env, &schema_metadata)?)
-            } else {
-                None
-            };
-
-            let field_metadata = env
-                .call_method(&java_operation, "fieldMetadata", "()Ljava/util/Map;", &[])?
-                .l()?;
-            let field_metadata = if !field_metadata.is_null() {
-                let field_metadata = JMap::from_env(env, &field_metadata)?;
-                let mut field_metadata_map = HashMap::new();
-                let mut iter = field_metadata.iter(env)?;
-                env.with_local_frame(16, |env| {
-                    while let Some((key, value)) = iter.next(env)? {
-                        let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
-                        let inner_map = JMap::from_env(env, &value)?;
-                        let value_map = to_rust_map(env, &inner_map)?;
-                        field_metadata_map.insert(field_id, value_map);
-                    }
-                    Ok::<(), Error>(())
-                })?;
-                Some(field_metadata_map)
-            } else {
-                None
-            };
-
-            Operation::UpdateConfig {
-                upsert_values,
-                delete_keys,
-                schema_metadata,
-                field_metadata,
-            }
-        }
-        "Append" => {
-            let fragment_objs = env
-                .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
-                .l()?;
-            let fragment_objs = import_vec(env, &fragment_objs)?;
-            let mut fragments = Vec::with_capacity(fragment_objs.len());
-            for f in fragment_objs {
-                fragments.push(f.extract_object(env)?);
-            }
-            Operation::Append { fragments }
-        }
-        "Delete" => {
-            let updated_fragments_objs = env
-                .call_method(
-                    &java_operation,
-                    "updatedFragments",
-                    "()Ljava/util/List;",
-                    &[],
-                )?
-                .l()?;
-            let updated_fragments_objs = import_vec(env, &updated_fragments_objs)?;
-            let mut updated_fragments: Vec<Fragment> =
-                Vec::with_capacity(updated_fragments_objs.len());
-            for f in updated_fragments_objs {
-                updated_fragments.push(f.extract_object(env)?);
-            }
-
-            let deleted_fragment_ids_objs = env
-                .call_method(
-                    &java_operation,
-                    "deletedFragmentIds",
-                    "()Ljava/util/List;",
-                    &[],
-                )?
-                .l()?;
-            let deleted_fragment_ids: Vec<u64> = env
-                .get_longs(&deleted_fragment_ids_objs)?
-                .into_iter()
-                .map(|x| x.try_into().unwrap())
-                .collect();
-
-            let predicate_obj = env
-                .call_method(&java_operation, "predicate", "()Ljava/util/Optional;", &[])?
-                .l()?;
-            let predicate = env
-                .get_string_opt(&predicate_obj)?
-                .unwrap_or("".to_string());
-
-            Operation::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                predicate,
-            }
-        }
-        "Overwrite" => {
-            let fragment_objs = env
-                .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
-                .l()?;
-            let fragment_objs = import_vec(env, &fragment_objs)?;
-            let mut fragments = Vec::with_capacity(fragment_objs.len());
-            for f in fragment_objs {
-                fragments.push(f.extract_object(env)?);
-            }
-            let config_upsert_values = env
-                .call_method(
-                    &java_operation,
-                    "configUpsertValues",
-                    "()Ljava/util/Map;",
-                    &[],
-                )?
-                .l()?;
-            let config_upsert_values = if config_upsert_values.is_null() {
-                None
-            } else {
-                let config_upsert_values = JMap::from_env(env, &config_upsert_values)?;
-                Some(to_rust_map(env, &config_upsert_values)?)
-            };
-            Operation::Overwrite {
-                fragments,
-                schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
-                config_upsert_values,
-            }
-        }
-        "Rewrite" => {
-            let groups_obj = env
-                .call_method(&java_operation, "groups", "()Ljava/util/List;", &[])?
-                .l()?;
-            let groups_objs = import_vec(env, &groups_obj)?;
-            let mut groups = Vec::with_capacity(groups_objs.len());
-            for g in groups_objs {
-                groups.push(g.extract_object(env)?);
-            }
-
-            let rewritten_indices_obj = env
-                .call_method(
-                    &java_operation,
-                    "rewrittenIndices",
-                    "()Ljava/util/List;",
-                    &[],
-                )?
-                .l()?;
-            let rewritten_indices_objs = import_vec(env, &rewritten_indices_obj)?;
-            let mut rewritten_indices = Vec::with_capacity(rewritten_indices_objs.len());
-            for i in rewritten_indices_objs {
-                rewritten_indices.push(i.extract_object(env)?);
-            }
-
-            let frag_reuse_index_obj = env
-                .call_method(
-                    &java_operation,
-                    "fragReuseIndex",
-                    "()Lcom/lancedb/lance/index/Index;",
-                    &[],
-                )?
-                .l()?;
-            let frag_reuse_index = if frag_reuse_index_obj.is_null() {
-                None
-            } else {
-                Some(frag_reuse_index_obj.extract_object(env)?)
-            };
-
-            Operation::Rewrite {
-                groups,
-                rewritten_indices,
-                frag_reuse_index,
-            }
-        }
-        "Update" => {
-            let removed_fragment_ids_objs = env
-                .call_method(
-                    &java_operation,
-                    "removedFragmentIds",
-                    "()Ljava/util/List;",
-                    &[],
-                )?
-                .l()?;
-            let removed_fragment_ids: Vec<u64> = env
-                .get_longs(&removed_fragment_ids_objs)?
-                .into_iter()
-                .map(|x| x.try_into().unwrap())
-                .collect();
-
-            let updated_fragments_objs = env
-                .call_method(
-                    &java_operation,
-                    "updatedFragments",
-                    "()Ljava/util/List;",
-                    &[],
-                )?
-                .l()?;
-            let updated_fragments_objs = import_vec(env, &updated_fragments_objs)?;
-            let mut updated_fragments: Vec<Fragment> =
-                Vec::with_capacity(updated_fragments_objs.len());
-            for f in updated_fragments_objs {
-                updated_fragments.push(f.extract_object(env)?);
-            }
-
-            let new_fragments_objs = env
-                .call_method(&java_operation, "newFragments", "()Ljava/util/List;", &[])?
-                .l()?;
-            let new_fragments_objs = import_vec(env, &new_fragments_objs)?;
-            let mut new_fragments: Vec<Fragment> = Vec::with_capacity(new_fragments_objs.len());
-            for f in new_fragments_objs {
-                new_fragments.push(f.extract_object(env)?);
-            }
-
-            Operation::Update {
-                removed_fragment_ids,
-                updated_fragments,
-                new_fragments,
-                fields_modified: vec![],
-                mem_wal_to_flush: None,
-            }
-        }
-        "DataReplacement" => {
-            let replacement_objs = env
-                .call_method(&java_operation, "replacements", "()Ljava/util/List;", &[])?
-                .l()?;
-            let replacement_objs = import_vec(env, &replacement_objs)?;
-            let mut replacements = Vec::with_capacity(replacement_objs.len());
-
-            for replacement in replacement_objs {
-                let fragment_id = env
-                    .call_method(&replacement, "fragmentId", "()J", &[])?
-                    .j()? as u64;
-                let new_file_obj = env
-                    .call_method(
-                        &replacement,
-                        "replacedFile",
-                        "()Lcom/lancedb/lance/fragment/DataFile;",
-                        &[],
-                    )?
-                    .l()?;
-                let new_file = new_file_obj.extract_object(env)?;
-
-                replacements.push(DataReplacementGroup(fragment_id, new_file));
-            }
-
-            Operation::DataReplacement { replacements }
-        }
-        "Merge" => {
-            let fragment_objs = env
-                .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
-                .l()?;
-            let fragment_objs = import_vec(env, &fragment_objs)?;
-            let mut fragments = Vec::with_capacity(fragment_objs.len());
-            for f in fragment_objs {
-                fragments.push(f.extract_object(env)?);
-            }
-            Operation::Merge {
-                fragments,
-                schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
-            }
-        }
-        "Restore" => {
-            let version = env.call_method(java_operation, "version", "()J", &[])?;
-            let version = version.j()? as u64;
-            return Ok(Operation::Restore { version });
-        }
-        "ReserveFragments" => {
-            let num_fragments = env.call_method(java_operation, "numFragments", "()I", &[])?;
-            let num_fragments = num_fragments.i()? as u32;
-            return Ok(Operation::ReserveFragments { num_fragments });
-        }
-        _ => unimplemented!(),
-    };
-    Ok(op)
 }
 
 fn convert_schema_from_operation(
@@ -1078,4 +781,248 @@ fn convert_schema_from_operation(
         LanceSchema::try_from(&schema)
             .expect("Failed to convert from arrow schema to lance schema"),
     )
+}
+
+fn convert_to_rust_operation<'local>(
+    env: &mut JNIEnv<'local>,
+    java_operation: &JObject<'local>,
+    java_dataset: Option<&JObject<'local>>,
+) -> Result<Operation> {
+    let op_name = env.get_string_from_method(java_operation, "name")?;
+    let op = match op_name.as_str() {
+        "Project" => Operation::Project {
+            schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+        },
+        "UpdateConfig" => {
+            let upsert_values = env.get_optional_from_method(
+                java_operation,
+                "upsert_values",
+                |env, upsert_values| {
+                    let upsert_values = JMap::from_env(env, &upsert_values)?;
+                    to_rust_map(env, &upsert_values)
+                },
+            )?;
+
+            let delete_keys =
+                env.get_optional_from_method(java_operation, "delete_keys", |env, delete_keys| {
+                    let keys = import_vec(env, &delete_keys)?;
+                    let keys = keys
+                        .into_iter()
+                        .map(JString::from)
+                        .map(|key| key.extract(env))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(keys)
+                })?;
+
+            let schema_metadata = env.get_optional_from_method(
+                java_operation,
+                "schema_metadata",
+                |env, schema_metadata| {
+                    let schema_metadata = JMap::from_env(env, &schema_metadata)?;
+                    to_rust_map(env, &schema_metadata)
+                },
+            )?;
+
+            let field_metadata = env.get_optional_from_method(
+                java_operation,
+                "field_metadata",
+                |env, field_metadata| {
+                    let field_metadata = JMap::from_env(env, &field_metadata)?;
+                    let mut field_metadata_map = HashMap::new();
+                    let mut iter = field_metadata.iter(env)?;
+                    env.with_local_frame(16, |env| {
+                        while let Some((key, value)) = iter.next(env)? {
+                            let field_id =
+                                env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
+                            let inner_map = JMap::from_env(env, &value)?;
+                            let value_map = to_rust_map(env, &inner_map)?;
+                            field_metadata_map.insert(field_id, value_map);
+                        }
+                        Ok::<(), Error>(())
+                    })?;
+                    Ok(field_metadata_map)
+                },
+            )?;
+
+            Operation::UpdateConfig {
+                upsert_values,
+                delete_keys,
+                schema_metadata,
+                field_metadata,
+            }
+        }
+        "Append" => {
+            let fragments = import_vec_from_method(
+                env,
+                java_operation,
+                "fragments",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment| fragment.extract_object(env),
+            )?;
+            Operation::Append { fragments }
+        }
+        "Delete" => {
+            let updated_fragments: Vec<Fragment> = import_vec_from_method(
+                env,
+                java_operation,
+                "updatedFragments",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment| fragment.extract_object(env),
+            )?;
+
+            let deleted_fragment_ids: Vec<u64> = import_vec_from_method(
+                env,
+                java_operation,
+                "deletedFragmentIds",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment_id| {
+                    Ok(env.call_method(fragment_id, "longValue", "()J", &[])?.j()? as u64)
+                },
+            )?;
+
+            let predicate = env.get_optional_string_from_method(java_operation, "predicate")?;
+
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate: predicate.unwrap_or_default(),
+            }
+        }
+        "Overwrite" => {
+            let fragments: Vec<Fragment> = import_vec_from_method(
+                env,
+                java_operation,
+                "fragments",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment| fragment.extract_object(env),
+            )?;
+
+            let config_upsert_values = env.get_optional_from_method(
+                java_operation,
+                "configUpsertValues",
+                |env, config_upsert_values| {
+                    let config_upsert_values = JMap::from_env(env, &config_upsert_values)?;
+                    to_rust_map(env, &config_upsert_values)
+                },
+            )?;
+            let schema = convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?;
+            Operation::Overwrite {
+                fragments,
+                schema,
+                config_upsert_values,
+            }
+        }
+        "Rewrite" => {
+            let groups: Vec<RewriteGroup> = import_vec_from_method(
+                env,
+                java_operation,
+                "groups",
+                "()Ljava/util/List;",
+                &[],
+                |env, group| group.extract_object(env),
+            )?;
+
+            let rewritten_indices: Vec<RewrittenIndex> = import_vec_from_method(
+                env,
+                java_operation,
+                "rewritedIndices",
+                "()Ljava/util/List;",
+                &[],
+                |env, index| index.extract_object(env),
+            )?;
+
+            let frag_reuse_index: Option<Index> = env.get_optional_from_method(
+                java_operation,
+                "fragReuseIndex",
+                |env, frag_reuse_index| frag_reuse_index.extract_object(env),
+            )?;
+
+            Operation::Rewrite {
+                groups,
+                rewritten_indices,
+                frag_reuse_index,
+            }
+        }
+        "Update" => {
+            let removed_fragment_ids = import_vec_from_method(
+                env,
+                java_operation,
+                "removedFragmentIds",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment_id| {
+                    Ok(env.call_method(fragment_id, "longValue", "()J", &[])?.j()? as u64)
+                },
+            )?;
+
+            let updated_fragments: Vec<Fragment> = import_vec_from_method(
+                env,
+                java_operation,
+                "updatedFragments",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment| fragment.extract_object(env),
+            )?;
+
+            let new_fragments: Vec<Fragment> = import_vec_from_method(
+                env,
+                java_operation,
+                "newFragments",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment| fragment.extract_object(env),
+            )?;
+
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified: vec![],
+                mem_wal_to_flush: None,
+            }
+        }
+        "DataReplacement" => {
+            let replacements: Vec<DataReplacementGroup> = import_vec_from_method(
+                env,
+                java_operation,
+                "replacements",
+                "()Ljava/util/List;",
+                &[],
+                |env, replacement| replacement.extract_object(env),
+            )?;
+            Operation::DataReplacement { replacements }
+        }
+        "Merge" => {
+            let fragments: Vec<Fragment> = import_vec_from_method(
+                env,
+                java_operation,
+                "fragments",
+                "()Ljava/util/List;",
+                &[],
+                |env, fragment| fragment.extract_object(env),
+            )?;
+            Operation::Merge {
+                fragments,
+                schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+            }
+        }
+        "Restore" => {
+            let version: u64 = env
+                .call_method(java_operation, "version", "()J", &[])?
+                .j()? as u64;
+            return Ok(Operation::Restore { version });
+        }
+        "ReserveFragments" => {
+            let num_fragments = env
+                .call_method(java_operation, "numFragments", "()I", &[])?
+                .i()? as u32;
+            return Ok(Operation::ReserveFragments { num_fragments });
+        }
+        _ => unimplemented!(),
+    };
+    Ok(op)
 }

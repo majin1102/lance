@@ -20,6 +20,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Overwrite the dataset with new fragments. This operation will overwrite the existing dataset.
@@ -29,20 +30,20 @@ import java.util.Objects;
 public class Overwrite extends SchemaOperation {
 
   private final List<FragmentMetadata> fragments;
-  private final Map<String, String> configUpsertValues;
+  private final Optional<Map<String, String>> configUpsertValues;
 
   protected Overwrite(
       List<FragmentMetadata> fragments, Schema schema, Map<String, String> configUpsertValues) {
     super(schema);
     this.fragments = fragments;
-    this.configUpsertValues = configUpsertValues;
+    this.configUpsertValues = Optional.ofNullable(configUpsertValues);
   }
 
   public List<FragmentMetadata> fragments() {
     return fragments;
   }
 
-  public Map<String, String> configUpsertValues() {
+  public Optional<Map<String, String>> configUpsertValues() {
     return configUpsertValues;
   }
 

@@ -20,6 +20,7 @@ import org.apache.arrow.util.Preconditions;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -35,14 +36,14 @@ public class Transaction {
   // Mainly for JNI usage
   private final Dataset dataset;
   private final Operation operation;
-  private final Operation blobOp;
+  private final Optional<Operation> blobOp;
 
   private Transaction(
       Dataset dataset,
       long readVersion,
       String uuid,
       Operation operation,
-      Operation blobOp,
+      Optional<Operation> blobOp,
       Map<String, String> writeParams,
       Map<String, String> transactionProperties) {
     this.dataset = dataset;
@@ -67,7 +68,7 @@ public class Transaction {
     return operation;
   }
 
-  public Operation blobsOperation() {
+  public Optional<Operation> blobsOperation() {
     return blobOp;
   }
 
@@ -88,9 +89,7 @@ public class Transaction {
 
   public void release() {
     operation.release();
-    if (blobOp != null) {
-      blobOp.release();
-    }
+    blobOp.ifPresent(Operation::release);
   }
 
   @Override
@@ -122,7 +121,7 @@ public class Transaction {
     private final Dataset dataset;
     private long readVersion;
     private Operation operation;
-    private Operation blobOp;
+    private Optional<Operation> blobOp;
     private Map<String, String> writeParams;
     private Map<String, String> transactionProperties;
 
@@ -149,6 +148,11 @@ public class Transaction {
     public Builder operation(Operation operation) {
       validateState();
       this.operation = operation;
+      return this;
+    }
+
+    public Builder blobsOperation(Operation blobOp) {
+      this.blobOp = Optional.of(blobOp);
       return this;
     }
 

@@ -21,15 +21,15 @@ import java.util.Objects;
 import java.util.Optional;
 
 public class Delete implements Operation {
-  private List<FragmentMetadata> updatedFragments;
-  private List<Long> deletedFragmentIds;
-  private String predicate;
+  private final List<FragmentMetadata> updatedFragments;
+  private final List<Long> deletedFragmentIds;
+  private final Optional<String> predicate;
 
   private Delete(
       List<FragmentMetadata> updatedFragments, List<Long> deletedFragmentIds, String predicate) {
     this.updatedFragments = updatedFragments;
     this.deletedFragmentIds = deletedFragmentIds;
-    this.predicate = predicate;
+    this.predicate = Optional.ofNullable(predicate);
   }
 
   public static Builder builder() {
@@ -44,8 +44,8 @@ public class Delete implements Operation {
     return deletedFragmentIds;
   }
 
-  public Optional predicate() {
-    return Optional.ofNullable(predicate);
+  public Optional<String> predicate() {
+    return predicate;
   }
 
   @Override

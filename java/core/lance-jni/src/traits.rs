@@ -149,6 +149,29 @@ pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec
     Ok(ret)
 }
 
+pub fn import_vec_from_method<'local, T, F>(
+    env: &mut JNIEnv<'local>,
+    java_obj: &JObject<'local>,
+    method_name: &str,
+    method_sig: &str,
+    method_args: &[JValue],
+    mut extractor: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&mut JNIEnv<'local>, JObject<'local>) -> Result<T>,
+{
+    let list_obj = env
+        .call_method(java_obj, method_name, method_sig, method_args)?
+        .l()?;
+
+    let java_items = import_vec(env, &list_obj)?;
+    let mut result = Vec::with_capacity(java_items.len());
+    for item in java_items {
+        result.push(extractor(env, item)?);
+    }
+    Ok(result)
+}
+
 pub struct JLance<T>(pub T);
 
 impl IntoJava for JLance<Vec<i32>> {
