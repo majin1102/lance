@@ -720,23 +720,13 @@ fn convert_to_rust_transaction(
         .l()?;
     let op = convert_to_rust_operation(env, &op, java_dataset)?;
 
-    let blobs_op = env
-        .call_method(
-            &java_transaction,
-            "blobsOperation",
-            "()Lcom/lancedb/lance/operation/Operation;",
-            &[],
-        )?
-        .l()?;
-    let is_present = env.call_method(&blobs_op, "isPresent", "()Z", &[])?;
-    let blobs_op = if is_present.z()? {
-        let blobs_op = env
-            .call_method(&blobs_op, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        Some(convert_to_rust_operation(env, &blobs_op, java_dataset))
-    } else {
-        None
-    };
+    let blobs_op = env.get_optional_from_method(
+        &java_transaction,
+        "blobsOperation",
+        |env, blobs_op| {
+            convert_to_rust_operation(env, &blobs_op, java_dataset)
+        },
+    )?;
 
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
