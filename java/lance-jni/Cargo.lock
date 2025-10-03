@@ -3456,6 +3456,7 @@ name = "lance-jni"
 version = "0.38.0"
 dependencies = [
  "arrow",
+ "arrow-array",
  "arrow-schema",
  "chrono",
  "env_logger",
