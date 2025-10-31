@@ -1,7 +1,6 @@
 # Manage Tags and Branches
 
-Lance, much like Git, employs the `LanceDataset.tags` and `LanceDataset.branches`
-property to provide tag and branch capabilities.
+Lance provides Git-like tag and branch capabilities through the `LanceDataset.tags` and `LanceDataset.branches` properties.
 
 ## Tags
 Tags label specific versions within a branch's history.
@@ -11,6 +10,16 @@ especially in machine learning workflows where datasets are frequently updated.
 For example, you can `create`, `update`,
 and `delete` or `list` tags.
 
+The `reference` parameter (used in `create`, `update`, and `checkout_version`) accepts:
+
+- An **integer**: version number in the **current branch** (e.g., `1`)
+- A **string**: tag name (e.g., `"stable"`)
+- A **tuple** `(branch_name, version)`: a specific version in a named branch
+  - `(None, 2)` means version 2 on the main branch
+  - `("main", 2)` means version 2 on the main branch (explicit)
+  - `("experiment", 3)` means version 3 on the experiment branch
+  - `("branch-name", None)` means the latest version on that branch
+
 !!! note
 
     Creating or deleting tags does not generate new dataset versions.
@@ -18,15 +27,17 @@ and `delete` or `list` tags.
 
 ```python
 import lance
+import pyarrow as pa
+
 ds = lance.dataset("./tags.lance")
 print(len(ds.versions()))
 # 2
 print(ds.tags.list())
 # {}
-ds.tags.create("v1-prod", 1)
+ds.tags.create("v1-prod", (None, 1))
 print(ds.tags.list())
 # {'v1-prod': {'version': 1, 'manifest_size': ...}}
-ds.tags.update("v1-prod", 2)
+ds.tags.update("v1-prod", (None, 2))
 print(ds.tags.list())
 # {'v1-prod': {'version': 2, 'manifest_size': ...}}
 ds.tags.delete("v1-prod")
@@ -34,10 +45,10 @@ print(ds.tags.list())
 # {}
 print(ds.tags.list_ordered())
 # []
-ds.tags.create("v1-prod", 1)
+ds.tags.create("v1-prod", (None, 1))
 print(ds.tags.list_ordered())
 # [('v1-prod', {'version': 1, 'manifest_size': ...})]
-ds.tags.update("v1-prod", 2)
+ds.tags.update("v1-prod", (None, 2))
 print(ds.tags.list_ordered())
 # [('v1-prod', {'version': 2, 'manifest_size': ...})]
 ds.tags.delete("v1-prod")
@@ -53,57 +64,53 @@ print(ds.tags.list_ordered())
     To remove a version that has been tagged, you must first `LanceDataset.tags.delete()`
     the associated tag. 
 
----
+## Branches
 
-### Branches
+Branches manage parallel lines of dataset evolution. You can create a branch from an existing version or tag, read and write to it independently, and checkout different branches. You can `create`, `delete`, `list`, and `checkout` branches.
 
-Branches are used to manage parallel lines of dataset evolution.
-Branches let you create an independent line from an existing version or tag, read/write on them and switch between them.
-We can `create`, `delete`, `list` and `checkout` branches in a dataset. 
+The `reference` parameter works the same as for Tags (see above).
 
 !!! note
 
     Creating or deleting branches does not generate new dataset versions.
     New versions are created by writes (append/overwrite/index operations).
 
-    Each branch has a linear history of versions and the version number is strictly increased, which means 
-    the version number of different branches could overlap. We need to use (branch, version_number) as a global 
-    version identifier for cases like checkout, tags.create.
+    Each branch maintains its own linear version history, so version numbers may overlap across branches. Use `(branch_name, version_number)` tuples as global identifiers for operations like `checkout_version` and `tags.create`.
 
     "main" is a reserved branch name. Lance uses "main" to identify the default branch.
 
-#### Create and check out branches
+### Create and checkout branches
 ```python
 import lance
+import pyarrow as pa
 
 # Open dataset
 ds = lance.dataset("/tmp/test.lance")
 
-# Create branch from latest version
+# Create branch from latest version (default: current branch's latest)
 experiment_branch = ds.create_branch("experiment")
 experimental_data = pa.Table.from_pydict({"a": [11], "b": [12]})
-branch2 = lance.write_dataset(experimental_data, experiment_branch, mode="append")
+lance.write_dataset(experimental_data, experiment_branch, mode="append")
 
 # Create tag on the latest version of the experimental branch
-ds.tags().create("experiment-rc", "experiment")
+ds.tags.create("experiment-rc", ("experiment", None))
 
-# Checkout tag from the main branch
+# Checkout by tag name
 experiment_rc = ds.checkout_version("experiment-rc")
-# Or we can checkout the latest version of the experimental branch
+# Checkout the latest version of the experimental branch by tuple
 experiment_latest = ds.checkout_version(("experiment", None))
 
-# Create a new branch from the tag on experiment branch
+# Create a new branch from a tag
 new_experiment = ds.create_branch("new-experiment", "experiment-rc")
 ```
 
-#### List branches
+### List branches
 ```python
 print(ds.branches.list())
-# {'experiment': {'parent_branch': None, 'parent_version': 1, 'create_at': ..., 'manifest_size': ...}, ...}
-# {'new-experiment': {'parent_branch': 'experiment', 'parent_version': 2, 'create_at': ..., 'manifest_size': ...}, ...}
+# {'experiment': {...}, 'new-experiment': {...}}
 ```
 
-#### Delete a branch
+### Delete a branch
 ```python
 # Ensure the branch is no longer needed before deletion
 ds.branches.delete("experiment")
@@ -113,8 +120,6 @@ print(ds.branches.list_ordered(order="desc"))
 
 !!! note
 
-    Branches establish references between files. Lance ensures that the cleanup process does not delete files 
-    that are still referenced.
+    Branches hold references to data files. Lance ensures that cleanup does not delete files still referenced by any branch.
 
-    In practice, it is advisable to configure branches with appropriate cleanup strategies to allow referenced files 
-    to be cleaned up in a timely manner.
+    Delete unused branches to allow their referenced files to be cleaned up by `cleanup_old_versions()`.

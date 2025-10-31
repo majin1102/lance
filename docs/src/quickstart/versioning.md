@@ -1,6 +1,6 @@
 ---
 title: Versioning
-description: Learn how to version your Lance datasets with append, overwrite, and tag features
+description: Learn how to version your Lance datasets with append, overwrite, tags, and branches
 ---
 
 # Versioning Your Datasets with Lance
@@ -75,7 +75,7 @@ lance.dataset('/tmp/test.lance', version=2).to_table().to_pandas()
 
 ## Tag Your Important Versions
 
-Create named tags for important versions, making it easier to reference specific versions by meaningful names. To create tags for relevant versions, do this:
+Create named tags for important versions, making it easier to reference them by meaningful names.
 
 ```python
 dataset.tags.create("stable", 2)
@@ -89,36 +89,22 @@ Tags can be checked out like versions:
 lance.dataset('/tmp/test.lance', version="stable").to_table().to_pandas()
 ```
 
+For advanced tag operations (e.g., tagging versions on specific branches), see [Tags and Branches](../guide/tags_and_branches.md).
+
 ## Work with Branches
 
-Use branches to manage parallel lines of dataset evolution. Create a branch from a version or tag, write on that branch, and create a new tag on that branch.
+Branches manage parallel lines of dataset evolution. You can create branches from existing versions or tags, read and write to them independently, and checkout different branches.
 
 ```python
-import lance
-
-# Open dataset
-ds = lance.dataset("/tmp/test.lance")
-
-# Create branch dataset from current latest version
+# Create branch from current latest version
 experiment_branch = ds.create_branch("experiment")
 
-# Write on the branch (affects only that branch's history)
-from pandas import DataFrame
-import pyarrow as pa
-
-tbl = pa.Table.from_pandas(DataFrame({"a": [42]}))
+# Write to the branch (affects only that branch's history)
+tbl = pa.Table.from_pandas(pd.DataFrame({"a": [42]}))
 lance.write_dataset(tbl, experiment_branch, mode="append")
 ```
 
-## Cross-Branch Checkout and create global tags
-
-```python
-# Checkout branch 'experiment' by using a global version tuple
-experiment_branch = ds.checkout_version(("experiment", 2))
-
-# Create a tag on the latest branch version and check out by tag
-ds.tags.create("experiment-stable", ("experiment", None))
-```
+For more details, see [Tags and Branches](../guide/tags_and_branches.md).
 
 ## Next Steps
 
