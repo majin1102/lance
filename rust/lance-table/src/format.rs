@@ -9,6 +9,7 @@ mod fragment;
 mod index;
 mod manifest;
 mod path_spec;
+mod transaction;
 
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
@@ -21,6 +22,7 @@ pub use manifest::{
     is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, DETACHED_VERSION_MASK,
 };
+pub use transaction::Transaction;
 
 use lance_core::{Error, Result};
 

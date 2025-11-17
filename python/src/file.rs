@@ -21,17 +21,12 @@ use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::ReaderProjection;
-use lance_file::v2::LanceEncodingsIo;
-use lance_file::{
-    v2::{
-        reader::{
-            BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
-        },
-        writer::{FileWriter, FileWriterOptions},
-    },
-    version::LanceFileVersion,
+use lance_file::reader::{
+    BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
+    ReaderProjection,
 };
+use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::{version::LanceFileVersion, LanceEncodingsIo};
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -91,7 +86,7 @@ impl LancePageMetadata {
             .collect();
         Self {
             buffers,
-            encoding: lance_file::v2::reader::describe_encoding(inner),
+            encoding: lance_file::reader::describe_encoding(inner),
         }
     }
 }
@@ -237,17 +232,23 @@ pub struct LanceFileWriter {
 }
 
 impl LanceFileWriter {
+    #[allow(clippy::too_many_arguments)]
     async fn open(
         uri_or_path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        let (object_store, path) =
-            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        let (object_store, path) = object_store_from_uri_or_path_with_provider(
+            uri_or_path,
+            storage_options,
+            storage_options_provider,
+        )
+        .await?;
         Self::open_with_store(
             object_store,
             path,
@@ -295,16 +296,23 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None, max_page_bytes=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, storage_options_provider=None, keep_original_array=None, max_page_bytes=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
+        // Convert Python StorageOptionsProvider to Rust trait object
+        let provider = storage_options_provider
+            .map(crate::storage_options::py_object_to_storage_options_provider)
+            .transpose()?;
+
         rt().block_on(
             None,
             Self::open(
@@ -313,6 +321,7 @@ impl LanceFileWriter {
                 data_cache_bytes,
                 version,
                 storage_options,
+                provider,
                 keep_original_array,
                 max_page_bytes,
             ),
@@ -385,6 +394,14 @@ pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
+    object_store_from_uri_or_path_with_provider(uri_or_path, storage_options, None).await
+}
+
+pub async fn object_store_from_uri_or_path_with_provider(
+    uri_or_path: impl AsRef<str>,
+    storage_options: Option<HashMap<String, String>>,
+    storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+) -> PyResult<(Arc<ObjectStore>, Path)> {
     if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
         if url.scheme().len() > 1 {
             let path = object_store::path::Path::parse(url.path()).map_err(|e| {
@@ -395,12 +412,15 @@ pub async fn object_store_from_uri_or_path(
 
             let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
             let object_store_params =
-                storage_options
-                    .as_ref()
-                    .map(|storage_options| ObjectStoreParams {
-                        storage_options: Some(storage_options.clone()),
+                if storage_options.is_some() || storage_options_provider.is_some() {
+                    Some(ObjectStoreParams {
+                        storage_options: storage_options.clone(),
+                        storage_options_provider,
                         ..Default::default()
-                    });
+                    })
+                } else {
+                    None
+                };
 
             let (object_store, dir_path) = ObjectStore::from_uri_and_params(
                 object_store_registry,
