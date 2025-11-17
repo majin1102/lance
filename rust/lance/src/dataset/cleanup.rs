@@ -644,7 +644,7 @@ impl<'a> CleanupTask<'a> {
                                     .remove(&relative_del_path);
                                 inspection
                                     .referenced_files
-                                    .data_paths
+                                    .delete_paths
                                     .insert(relative_del_path);
                             }
                             is_referenced = true;
