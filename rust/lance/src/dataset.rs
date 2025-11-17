@@ -35,15 +35,12 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
-use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
-    MAJOR_VERSION, MINOR_VERSION,
-};
+use lance_table::format::{DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, PathKind, PathSpec, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
     ManifestNamingScheme,
 };
-use lance_table::io::manifest::{read_manifest, write_manifest};
+use lance_table::io::manifest::{read_manifest, read_manifest_indexes, write_manifest};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -201,6 +198,98 @@ impl From<&Manifest> for Version {
             timestamp: m.timestamp(),
             metadata: m.summary().into(),
         }
+    }
+}
+
+impl Dataset {
+    async fn collect_paths(&self) -> Result<Vec<PathSpec>> {
+        let mut path_specs = Vec::new();
+        for fragment in self.manifest.fragments.iter() {
+            // Data files: ensure dataset-relative path prefixed with "data/"
+            for data_file in fragment.files.iter() {
+                let data_root = if let Some(base_id) = data_file.base_id {
+                    let base_path = self.manifest.base_paths.get(&base_id)
+                        .ok_or_else(|| Error::Internal{
+                            message: format!("base_id {} not found", base_id),
+                            location: location!(),
+                        })?;
+                    if base_path.is_dataset_root {
+                        Path::from(base_path.path.as_str()).child("data")
+                    } else {
+                        Path::from(base_path.path.as_str())
+                    }
+                } else {
+                    self.base.child("data")
+                };
+                path_specs.push(PathSpec {
+                    path_kind: PathKind::Data,
+                    relative_path: data_file.path.clone(),
+                    base_path: data_root.clone(),
+                });
+            }
+            // Deletion file under _deletions/
+            if let Some(del) = &fragment.deletion_file {
+                let deletion_root = if let Some(base_id) = del.base_id {
+                    let base_path = self.manifest.base_paths.get(&base_id)
+                        .ok_or_else(|| Error::Internal{
+                            message: format!("base_id {} not found", base_id),
+                            location: location!(),
+                        })?;
+                    if base_path.is_dataset_root {
+                        Path::from(base_path.path.as_str()).child("_deletions")
+                    } else {
+                        Path::from(base_path.path.as_str())
+                    }
+                } else {
+                    self.base.child("_deletions")
+                };
+                path_specs.push(PathSpec {
+                    path_kind: PathKind::Deletion,
+                    relative_path: format!(
+                        "_deletions/{}-{}-{}.{}",
+                        fragment.id, del.read_version, del.id, del.file_type.suffix()
+                    ),
+                    base_path: deletion_root.clone(),
+                });
+            }
+        }
+
+        // Load indices for the source dataset
+        let indices = read_manifest_indexes(
+            self.object_store.as_ref(),
+            &self.manifest_location,
+            &self.manifest,
+        ).await?;
+
+        for index in &indices {
+            // Index directory is <root>/_indices/{uuid}
+            let index_root = if let Some(base_id) = index.base_id {
+                let base_path = self.manifest.base_paths.get(&base_id)
+                    .ok_or_else(|| Error::Internal{
+                        message: format!("base_id {} not found", base_id),
+                        location: location!(),
+                    })?;
+                if base_path.is_dataset_root {
+                    Path::from(base_path.path.as_str()).child("_indices")
+                } else {
+                    Path::from(base_path.path.as_str())
+                }
+            } else {
+                self.base.child("_indices")
+            };
+            let index_dir = index_root.child(index.uuid.to_string());
+            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            while let Some(meta) = stream.next().await.transpose()? {
+                if let Some(filename) = meta.location.filename() {
+                    path_specs.push(PathSpec {
+                        path_kind: PathKind::Index,
+                        relative_path: format!("{}/{}", index.uuid, filename),
+                        base_path: index_dir.clone(),
+                    });
+                }
+            }
+        }
+        Ok(path_specs)
     }
 }
 
@@ -1964,6 +2053,92 @@ impl Dataset {
         builder.execute(transaction).await
     }
 
+    /// Deep clone the target version into a new dataset at target_path.
+    /// This performs a server-side copy of all relevant dataset files (data files,
+    /// deletion files, and any external row-id files) into the target dataset
+    /// without loading data into memory.
+    ///
+    /// Parameters:
+    /// - `target_path`: the URI string to clone the dataset into.
+    /// - `version`: the version cloned from, could be a version number, branch head, or tag.
+    /// - `store_params`: the object store params to use for the new dataset.
+    pub async fn deep_clone(
+        &mut self,
+        target_path: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        use futures::StreamExt;
+
+        // Resolve source dataset and its manifest using checkout_version
+        let src_ds = self.checkout_version(version).await?;
+        let path_specs = self.collect_paths().await?;
+
+        // Prepare target object store and base path
+        let (target_store, target_base) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            target_path,
+            &store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+
+        // Prevent cloning into an existing target dataset
+        if self
+            .commit_handler
+            .resolve_latest_location(&target_base, &target_store)
+            .await
+            .is_ok()
+        {
+            return Err(Error::DatasetAlreadyExists {
+                uri: target_path.to_string(),
+                location: location!(),
+            });
+        }
+
+        // Copy all collected paths (data, deletions, indices, row-id externals)
+        let io_parallelism = self.object_store.io_parallelism();
+        let copy_futures = path_specs
+            .iter()
+            .map(|spec| {
+                let store = target_store.clone();
+                let copy_pair = spec.produce_copy_pair(&target_base);
+                async move {
+                    if let Some((src_path, dst_path)) = copy_pair {
+                        store.copy(&src_path, &dst_path).await.map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
+        futures::stream::iter(copy_futures)
+            .buffer_unordered(io_parallelism)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        // Record a Clone operation and commit via CommitBuilder
+        let ref_name = src_ds.manifest.branch.clone();
+        let ref_version = src_ds.manifest_location.version;
+        let clone_op = Operation::Clone {
+            is_shallow: false,
+            ref_name,
+            ref_version,
+            ref_path: src_ds.uri().to_string(),
+            branch_name: None,
+        };
+        let txn = Transaction::new(ref_version, clone_op, None, None);
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+            .with_store_params(store_params.clone().unwrap_or_default())
+            .with_object_store(target_store.clone())
+            .with_commit_handler(self.commit_handler.clone())
+            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+        let new_ds = builder.execute(txn).await?;
+        Ok(new_ds)
+    }
+
     async fn resolve_reference(&self, reference: refs::Ref) -> Result<(Option<String>, u64)> {
         match reference {
             refs::Ref::Version(branch, version_number) => {
@@ -3346,6 +3521,140 @@ mod tests {
         // Final assertions
         assert_eq!(final_cloned_rows, 80);
         assert_eq!(final_cloned.version().version, original_version + 1);
+    }
+
+    // Helper: recursively count files under a dataset directory (data/_indices/_deletions)
+    async fn count_files(store: &ObjectStore, root: &Path, prefix: &str) -> usize {
+        use futures::StreamExt;
+        let dir = root.child(prefix);
+        let mut stream = store.read_dir_all(&dir, None);
+        let mut count: usize = 0;
+        while stream.next().await.transpose().unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_deep_clone(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // Setup source and target dirs
+        let test_dir = TempStdDir::default();
+        let base_dir = test_dir.join("base_dc");
+        let test_uri = base_dir.to_str().unwrap();
+        let clone_dir = test_dir.join("clone_dc");
+        let cloned_uri = clone_dir.to_str().unwrap();
+
+        // Generate test data
+        let data_reader = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("val", array::fill_utf8("deep".to_string()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+
+        // Create source dataset
+        let mut dataset = Dataset::write(
+            data_reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                max_rows_per_group: 16,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create a scalar index to validate index copy
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create a deletion file by deleting some rows
+        dataset.delete("id < 10").await.unwrap();
+
+        let original_version = dataset.version().version;
+        dataset
+            .tags()
+            .create("dc_tag", original_version)
+            .await
+            .unwrap();
+
+        // Perform deep clone
+        let cloned_dataset = dataset
+            .deep_clone(cloned_uri, "dc_tag", None)
+            .await
+            .unwrap();
+
+        // Validate target dataset rows
+        let batches = cloned_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+        assert_eq!(cloned_dataset.version().version, original_version);
+        assert!(cloned_dataset.manifest().base_paths.is_empty());
+
+        // Validate internal file counts are equal between source and cloned datasets
+        let src_store = dataset.object_store();
+        let src_root = dataset.base.clone();
+        let dst_store = cloned_dataset.object_store();
+        let dst_root = cloned_dataset.base.clone();
+
+        let src_data = count_files(src_store, &src_root, "data").await;
+        let dst_data = count_files(dst_store, &dst_root, "data").await;
+        assert_eq!(src_data, dst_data);
+
+        let src_idx = count_files(src_store, &src_root, "_indices").await;
+        let dst_idx = count_files(dst_store, &dst_root, "_indices").await;
+        assert_eq!(src_idx, dst_idx);
+
+        let src_del = count_files(src_store, &src_root, "_deletions").await;
+        let dst_del = count_files(dst_store, &dst_root, "_deletions").await;
+        assert_eq!(src_del, dst_del);
+
+        // Validate index exists in cloned dataset
+        let cloned_indices = cloned_dataset.load_indices().await.unwrap();
+        assert!(!cloned_indices.is_empty());
+        assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
+
+        // Verify base_id cleared in cloned manifest and indices
+        for frag in cloned_dataset.manifest().fragments.iter() {
+            for df in &frag.files {
+                assert!(df.base_id.is_none());
+            }
+            if let Some(del) = &frag.deletion_file {
+                assert!(del.base_id.is_none());
+            }
+        }
+        for idx in cloned_indices.iter() {
+            assert!(idx.base_id.is_none());
+        }
+
+        // Attempt cloning again to the same target should error
+        let res = dataset.deep_clone(cloned_uri, "dc_tag", None).await;
+        assert!(matches!(res, Err(Error::DatasetAlreadyExists { .. })));
+
+        // Invalid tag should error
+        let res_invalid = dataset
+            .deep_clone(&format!("{}/clone_invalid", test_uri), "no_such_tag", None)
+            .await;
+        assert!(res_invalid.is_err());
     }
 
     #[rstest]
@@ -9190,6 +9499,162 @@ mod tests {
             .await
             .unwrap();
         assert!(branches.is_empty());
+    }
+
+    // Deep clone branch: basic functionality
+    #[tokio::test]
+    async fn test_deep_clone_branch_basic() {
+        let tempdir = TempDir::default();
+        let test_uri = tempdir.path_str();
+
+        // Create main dataset
+        let data_main = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        let mut main_ds = Dataset::write(
+            data_main,
+            &test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create branch and append
+        let mut branch_ds = main_ds
+            .create_branch("feature/deep", main_ds.version().version, None)
+            .await
+            .unwrap();
+        let data_branch = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(50, 1))
+            .into_reader_rows(RowCount::from(25), BatchCount::from(1));
+        branch_ds = Dataset::write(
+            data_branch,
+            branch_ds.uri(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Deep clone from branch head into a new dataset
+        let target = format!("{}/deep_clone_branch_basic", test_uri);
+        let cloned = main_ds
+            .deep_clone(&target, ("feature/deep", None), None)
+            .await
+            .unwrap();
+
+        // Verify: row count matches branch, base paths cleared
+        assert_eq!(
+            cloned.count_rows(None).await.unwrap(),
+            branch_ds.count_rows(None).await.unwrap()
+        );
+        assert_eq!(cloned.manifest.base_paths.len(), 0);
+        assert!(cloned
+            .manifest
+            .fragments
+            .iter()
+            .all(|f| f.files.iter().all(|df| df.base_id.is_none())));
+    }
+
+    // Deep clone should error on non-existent branch
+    #[tokio::test]
+    async fn test_deep_clone_invalid_branch() {
+        let tempdir = TempStrDir::default();
+
+        // Create main dataset
+        let data_main = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut ds = Dataset::write(
+            data_main,
+            &tempdir,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Attempt deep clone from non-existent branch
+        let target = format!("{}/deep_clone_invalid_branch", tempdir.as_str());
+        let res = ds
+            .deep_clone(&target, ("non-existent-branch", None), None)
+            .await;
+        assert!(res.is_err());
+    }
+
+    // Deep clone snapshot stability: changes after clone do not affect clone
+    #[tokio::test]
+    async fn test_deep_clone_branch_snapshot_stability() {
+        let tempdir = TempStrDir::default();
+
+        // Create main dataset
+        let data_main = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(40), BatchCount::from(1));
+        let mut main_ds = Dataset::write(
+            data_main,
+            &tempdir,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create branch and append some rows
+        let mut branch_ds = main_ds
+            .create_branch("feature/deep", main_ds.version().version, None)
+            .await
+            .unwrap();
+        let data_branch_a = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(40, 1))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        branch_ds = Dataset::write(
+            data_branch_a,
+            branch_ds.uri(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let rows_before_clone = branch_ds.count_rows(None).await.unwrap();
+
+        // Deep clone at current branch head
+        let snap_target = format!("{}/deep_clone_snap", tempdir.as_str());
+        let snap = main_ds
+            .deep_clone(&snap_target, ("feature/deep", None), None)
+            .await
+            .unwrap();
+
+        // Advance branch after cloning
+        let data_branch_b = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(50, 1))
+            .into_reader_rows(RowCount::from(5), BatchCount::from(1));
+        let _ = Dataset::write(
+            data_branch_b,
+            branch_ds.uri(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify cloned snapshot is stable
+        assert_eq!(snap.count_rows(None).await.unwrap(), rows_before_clone);
+        assert_eq!(snap.manifest.base_paths.len(), 0);
     }
 
     #[tokio::test]

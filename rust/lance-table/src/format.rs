@@ -8,12 +8,14 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+mod path_spec;
 
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
 pub use fragment::*;
 pub use index::IndexMetadata;
+pub use path_spec::*;
 
 pub use manifest::{
     is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
