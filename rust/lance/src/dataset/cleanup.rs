@@ -1640,8 +1640,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_preserves_unrelated_dirs_and_files() {
-        // Ensure cleanup does not delete unrelated directories/files under the dataset root
+    async fn cleanup_preserves_unmanaged_dirs_and_files() {
+        // Ensure cleanup does not delete unmanaged directories/files under the dataset root
         // Uses MockDatasetFixture and run_cleanup_with_override to match other tests' style
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -1652,7 +1652,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Create unrelated directories/files under dataset root
+        // Create unmanaged directories/files under dataset root
         let img = base.child("images").child("clip.mp4");
         let misc = base.child("misc").child("notes.txt");
         let branch_file = base.child("tree").child("branchA").child("data.bin");
@@ -1664,7 +1664,7 @@ mod tests {
         let tmp_manifest = base.child("_versions").child(".tmp").child("orphan");
         os.put(&tmp_manifest, b"tmp").await.unwrap();
 
-        let removed = fixture
+        fixture
             .run_cleanup_with_override(utc_now(), Some(true), Some(false))
             .await
             .unwrap();
@@ -1675,6 +1675,5 @@ mod tests {
         assert!(os.exists(&img).await.unwrap());
         assert!(os.exists(&misc).await.unwrap());
         assert!(os.exists(&branch_file).await.unwrap());
-        let _ = removed; // do not assert exact bytes here
     }
 }
