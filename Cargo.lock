@@ -1533,15 +1533,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
-name = "convert_case"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
-dependencies = [
- "unicode-segmentation",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2547,7 +2538,7 @@ dependencies = [
  "object_store",
  "pbjson-types",
  "prost",
- "substrait 0.58.0",
+ "substrait",
  "tokio",
  "url",
  "uuid",
@@ -3169,7 +3160,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4168,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4254,7 +4245,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4272,7 +4263,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrayref",
  "paste",
@@ -4281,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4319,7 +4310,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4343,14 +4334,13 @@ dependencies = [
  "pin-project",
  "prost",
  "snafu",
- "substrait-expr",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4369,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4416,7 +4406,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4442,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4484,7 +4474,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "approx",
  "arrow",
@@ -4557,7 +4547,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4603,7 +4593,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4624,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4638,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4683,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4729,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4738,7 +4728,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4749,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "clap",
  "lance-core",
@@ -7695,28 +7685,6 @@ dependencies = [
 
 [[package]]
 name = "substrait"
-version = "0.50.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1772d041c37cc7e6477733c76b2acf4ee36bd52b2ae4d9ea0ec9c87d003db32"
-dependencies = [
- "heck",
- "prettyplease",
- "prost",
- "prost-build",
- "prost-types",
- "regress",
- "schemars",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "syn 2.0.111",
- "typify 0.2.0",
- "walkdir",
-]
-
-[[package]]
-name = "substrait"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de6d24c270c6c672a86c183c3a8439ba46c1936f93cf7296aa692de3b0ff0228"
@@ -7736,49 +7704,8 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "syn 2.0.111",
- "typify 0.4.3",
+ "typify",
  "walkdir",
-]
-
-[[package]]
-name = "substrait-expr"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d091cf06bc7808bd81eb01f5f5b77b2b14288bb022501a2dcad78633c65262f"
-dependencies = [
- "once_cell",
- "prost",
- "substrait 0.50.4",
- "substrait-expr-funcgen",
- "substrait-expr-macros",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "substrait-expr-funcgen"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee762399b891e8c84b9777e67a4c3193bc499c176c18d22f39341df61166092"
-dependencies = [
- "convert_case",
- "prettyplease",
- "proc-macro2",
- "quote",
- "serde_yaml",
- "substrait 0.50.4",
- "syn 2.0.111",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "substrait-expr-macros"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e42af5525699cb9924c8fdd3aa233d2b067efde29f68c00090ca0c8eada8269"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.111",
 ]
 
 [[package]]
@@ -8541,42 +8468,12 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "typify"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c644dda9862f0fef3a570d8ddb3c2cfb1d5ac824a1f2ddfa7bc8f071a5ad8a"
-dependencies = [
- "typify-impl 0.2.0",
- "typify-macro 0.2.0",
-]
-
-[[package]]
-name = "typify"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7144144e97e987c94758a3017c920a027feac0799df325d6df4fc8f08d02068e"
 dependencies = [
- "typify-impl 0.4.3",
- "typify-macro 0.4.3",
-]
-
-[[package]]
-name = "typify-impl"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d59ab345b6c0d8ae9500b9ff334a4c7c0d316c1c628dc55726b95887eb8dbd11"
-dependencies = [
- "heck",
- "log",
- "proc-macro2",
- "quote",
- "regress",
- "schemars",
- "semver",
- "serde",
- "serde_json",
- "syn 2.0.111",
- "thiserror 1.0.69",
- "unicode-ident",
+ "typify-impl",
+ "typify-macro",
 ]
 
 [[package]]
@@ -8601,23 +8498,6 @@ dependencies = [
 
 [[package]]
 name = "typify-macro"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "785e2cdcef0df8160fdd762ed548a637aaec1e83704fdbc14da0df66013ee8d0"
-dependencies = [
- "proc-macro2",
- "quote",
- "schemars",
- "semver",
- "serde",
- "serde_json",
- "serde_tokenstream",
- "syn 2.0.111",
- "typify-impl 0.2.0",
-]
-
-[[package]]
-name = "typify-macro"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9708a3ceb6660ba3f8d2b8f0567e7d4b8b198e2b94d093b8a6077a751425de9e"
@@ -8630,7 +8510,7 @@ dependencies = [
  "serde_json",
  "serde_tokenstream",
  "syn 2.0.111",
- "typify-impl 0.4.3",
+ "typify-impl",
 ]
 
 [[package]]
