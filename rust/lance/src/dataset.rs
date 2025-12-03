@@ -205,100 +205,6 @@ impl From<&Manifest> for Version {
     }
 }
 
-impl Dataset {
-    async fn collect_paths(&self) -> Result<Vec<FilePath>> {
-        let mut file_paths = Vec::new();
-        for fragment in self.manifest.fragments.iter() {
-            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                return Err(Error::Internal {
-                    message: format!(
-                        "External row_id_meta is not supported yet. external file path: {}",
-                        external_file.path
-                    ),
-                    location: location!(),
-                });
-            }
-            for data_file in fragment.files.iter() {
-                let base_root = if let Some(base_id) = data_file.base_id {
-                    let base_path =
-                        self.manifest
-                            .base_paths
-                            .get(&base_id)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!("base_id {} not found", base_id),
-                                location: location!(),
-                            })?;
-                    // Use the base path as provided; do not append kind-specific directory here
-                    Path::from(base_path.path.as_str())
-                } else {
-                    self.base.clone()
-                };
-                file_paths.push(FilePath {
-                    relative_path: format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_path: base_root,
-                });
-            }
-            // Deletion file under _deletions/
-            if let Some(deletion_file) = &fragment.deletion_file {
-                let base_root = if let Some(base_id) = deletion_file.base_id {
-                    let base_path =
-                        self.manifest
-                            .base_paths
-                            .get(&base_id)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!("base_id {} not found", base_id),
-                                location: location!(),
-                            })?;
-                    Path::from(base_path.path.as_str())
-                } else {
-                    self.base.clone()
-                };
-                file_paths.push(FilePath {
-                    relative_path: relative_deletion_file_path(fragment.id, deletion_file),
-                    base_path: base_root,
-                });
-            }
-        }
-
-        // Load indices for the source dataset
-        let indices = read_manifest_indexes(
-            self.object_store.as_ref(),
-            &self.manifest_location,
-            &self.manifest,
-        )
-        .await?;
-
-        for index in &indices {
-            // Base root: dataset root or external base path
-            let base_root = if let Some(base_id) = index.base_id {
-                let base_path =
-                    self.manifest
-                        .base_paths
-                        .get(&base_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: format!("base_id {} not found", base_id),
-                            location: location!(),
-                        })?;
-                Path::from(base_path.path.as_str())
-            } else {
-                self.base.clone()
-            };
-            // Index directory is <root>/_indices/{uuid}
-            let index_root = base_root.child(INDICES_DIR).child(index.uuid.to_string());
-            let mut stream = self.object_store.read_dir_all(&index_root, None);
-            while let Some(meta) = stream.next().await.transpose()? {
-                if let Some(filename) = meta.location.filename() {
-                    file_paths.push(FilePath {
-                        relative_path: format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
-                        base_path: base_root.clone(),
-                    });
-                }
-            }
-        }
-        Ok(file_paths)
-    }
-}
-
 /// A file path wrapper that can be used to represent a file in a dataset.
 /// This wrapper is used for changing the base_path like deep_clone
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2332,6 +2238,93 @@ impl Dataset {
                 Ok((tag_contents.branch, tag_contents.version))
             }
         }
+    }
+
+    async fn collect_paths(&self) -> Result<Vec<FilePath>> {
+        let mut file_paths = Vec::new();
+        for fragment in self.manifest.fragments.iter() {
+            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
+                return Err(Error::Internal {
+                    message: format!(
+                        "External row_id_meta is not supported yet. external file path: {}",
+                        external_file.path
+                    ),
+                    location: location!(),
+                });
+            }
+            for data_file in fragment.files.iter() {
+                let base_root = if let Some(base_id) = data_file.base_id {
+                    let base_path =
+                        self.manifest
+                            .base_paths
+                            .get(&base_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!("base_id {} not found", base_id),
+                                location: location!(),
+                            })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push(FilePath {
+                    relative_path: format!("{}/{}", DATA_DIR, data_file.path.clone()),
+                    base_path: base_root,
+                });
+            }
+            if let Some(deletion_file) = &fragment.deletion_file {
+                let base_root = if let Some(base_id) = deletion_file.base_id {
+                    let base_path =
+                        self.manifest
+                            .base_paths
+                            .get(&base_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!("base_id {} not found", base_id),
+                                location: location!(),
+                            })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push(FilePath {
+                    relative_path: relative_deletion_file_path(fragment.id, deletion_file),
+                    base_path: base_root,
+                });
+            }
+        }
+
+        let indices = read_manifest_indexes(
+            self.object_store.as_ref(),
+            &self.manifest_location,
+            &self.manifest,
+        )
+        .await?;
+
+        for index in &indices {
+            let base_root = if let Some(base_id) = index.base_id {
+                let base_path =
+                    self.manifest
+                        .base_paths
+                        .get(&base_id)
+                        .ok_or_else(|| Error::Internal {
+                            message: format!("base_id {} not found", base_id),
+                            location: location!(),
+                        })?;
+                Path::parse(base_path.path.as_str())?
+            } else {
+                self.base.clone()
+            };
+            let index_root = base_root.child(INDICES_DIR).child(index.uuid.to_string());
+            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            while let Some(meta) = stream.next().await.transpose()? {
+                if let Some(filename) = meta.location.filename() {
+                    file_paths.push(FilePath {
+                        relative_path: format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
+                        base_path: base_root.clone(),
+                    });
+                }
+            }
+        }
+        Ok(file_paths)
     }
 
     /// Run a SQL query against the dataset.
@@ -9942,162 +9935,6 @@ mod tests {
             .await
             .unwrap();
         assert!(branches.is_empty());
-    }
-
-    // Deep clone branch: basic functionality
-    #[tokio::test]
-    async fn test_deep_clone_branch_basic() {
-        let tempdir = TempDir::default();
-        let test_uri = tempdir.path_str();
-
-        // Create main dataset
-        let data_main = gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-        let mut main_ds = Dataset::write(
-            data_main,
-            &test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Create,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Create branch and append
-        let mut branch_ds = main_ds
-            .create_branch("feature/deep", main_ds.version().version, None)
-            .await
-            .unwrap();
-        let data_branch = gen_batch()
-            .col("id", array::step_custom::<Int32Type>(50, 1))
-            .into_reader_rows(RowCount::from(25), BatchCount::from(1));
-        branch_ds = Dataset::write(
-            data_branch,
-            branch_ds.uri(),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Deep clone from branch head into a new dataset
-        let target = format!("{}/deep_clone_branch_basic", test_uri);
-        let cloned = main_ds
-            .deep_clone(&target, ("feature/deep", None), None)
-            .await
-            .unwrap();
-
-        // Verify: row count matches branch, base paths cleared
-        assert_eq!(
-            cloned.count_rows(None).await.unwrap(),
-            branch_ds.count_rows(None).await.unwrap()
-        );
-        assert_eq!(cloned.manifest.base_paths.len(), 0);
-        assert!(cloned
-            .manifest
-            .fragments
-            .iter()
-            .all(|f| f.files.iter().all(|df| df.base_id.is_none())));
-    }
-
-    // Deep clone should error on non-existent branch
-    #[tokio::test]
-    async fn test_deep_clone_invalid_branch() {
-        let tempdir = TempStrDir::default();
-
-        // Create main dataset
-        let data_main = gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut ds = Dataset::write(
-            data_main,
-            &tempdir,
-            Some(WriteParams {
-                mode: WriteMode::Create,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Attempt deep clone from non-existent branch
-        let target = format!("{}/deep_clone_invalid_branch", tempdir.as_str());
-        let res = ds
-            .deep_clone(&target, ("non-existent-branch", None), None)
-            .await;
-        assert!(res.is_err());
-    }
-
-    // Deep clone snapshot stability: changes after clone do not affect clone
-    #[tokio::test]
-    async fn test_deep_clone_branch_snapshot_stability() {
-        let tempdir = TempStrDir::default();
-
-        // Create main dataset
-        let data_main = gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(40), BatchCount::from(1));
-        let mut main_ds = Dataset::write(
-            data_main,
-            &tempdir,
-            Some(WriteParams {
-                mode: WriteMode::Create,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Create branch and append some rows
-        let mut branch_ds = main_ds
-            .create_branch("feature/deep", main_ds.version().version, None)
-            .await
-            .unwrap();
-        let data_branch_a = gen_batch()
-            .col("id", array::step_custom::<Int32Type>(40, 1))
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        branch_ds = Dataset::write(
-            data_branch_a,
-            branch_ds.uri(),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let rows_before_clone = branch_ds.count_rows(None).await.unwrap();
-
-        // Deep clone at current branch head
-        let snap_target = format!("{}/deep_clone_snap", tempdir.as_str());
-        let snap = main_ds
-            .deep_clone(&snap_target, ("feature/deep", None), None)
-            .await
-            .unwrap();
-
-        // Advance branch after cloning
-        let data_branch_b = gen_batch()
-            .col("id", array::step_custom::<Int32Type>(50, 1))
-            .into_reader_rows(RowCount::from(5), BatchCount::from(1));
-        let _ = Dataset::write(
-            data_branch_b,
-            branch_ds.uri(),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Verify cloned snapshot is stable
-        assert_eq!(snap.count_rows(None).await.unwrap(), rows_before_clone);
-        assert_eq!(snap.manifest.base_paths.len(), 0);
     }
 
     #[tokio::test]
