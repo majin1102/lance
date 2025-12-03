@@ -2282,9 +2282,7 @@ impl Dataset {
                 let store = Arc::clone(&target_store);
                 let src_path = file.absolute_path();
                 let target_path = file.absolute_path_with_base(&target_base);
-                async move {
-                    store.copy(&src_path, &target_path).await.map(|_| ())
-                }
+                async move { store.copy(&src_path, &target_path).await.map(|_| ()) }
             })
             .collect::<Vec<_>>();
 
