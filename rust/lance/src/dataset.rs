@@ -2963,4 +2963,5 @@ impl Projectable for Dataset {
     }
 }
 
+#[cfg(test)]
 mod tests;
