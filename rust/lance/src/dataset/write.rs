@@ -42,7 +42,7 @@ use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
 
-fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
+pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
     if storage_version >= LanceFileVersion::V2_2 {
         BlobVersion::V2
     } else {
@@ -589,9 +589,7 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let allow_blob_version_change =
-        dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
-    let (mut schema, storage_version) = if let Some(dataset) = dataset {
+    let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
@@ -639,7 +637,19 @@ pub async fn write_fragments_internal(
     };
 
     let target_blob_version = blob_version_for(storage_version);
-    schema.apply_blob_version(target_blob_version, allow_blob_version_change)?;
+    if let Some(dataset) = dataset {
+        let existing_version = dataset.blob_version();
+        if existing_version != target_blob_version {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Blob column version mismatch. Existing dataset uses {:?} but requested write requires {:?}. Changing blob version is not allowed",
+                    existing_version, target_blob_version
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+    }
 
     let fragments = do_write_fragments(
         object_store,
