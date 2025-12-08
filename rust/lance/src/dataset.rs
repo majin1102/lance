@@ -208,30 +208,6 @@ impl From<&Manifest> for Version {
     }
 }
 
-/// A file path wrapper that can be used to represent a file in a dataset.
-/// This wrapper is used for changing the base_path like deep_clone
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilePath {
-    pub relative_path: String,
-    pub base_path: Path,
-}
-
-impl FilePath {
-    fn absolute_path_with_base(&self, base: &Path) -> Path {
-        let mut path = base.clone();
-        for seg in self.relative_path.split('/') {
-            if !seg.is_empty() {
-                path = path.child(seg);
-            }
-        }
-        path
-    }
-
-    fn absolute_path(&self) -> Path {
-        self.absolute_path_with_base(&self.base_path)
-    }
-}
-
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
@@ -2185,7 +2161,7 @@ impl Dataset {
 
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
-        let path_specs = self.collect_paths().await?;
+        let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
         let (target_store, target_base) = ObjectStore::from_uri_and_params(
@@ -2208,13 +2184,29 @@ impl Dataset {
             });
         }
 
+        let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
+            let mut path = base.clone();
+            for seg in relative_path.split('/') {
+                if !seg.is_empty() {
+                    path = path.child(seg);
+                }
+            }
+            path
+        };
+
+        /// TODO: Leverage object store bulk copy for efficient deep_clone
+        ///
+        /// All cloud storage providers support batch copy APIs that would provide significant
+        /// performance improvements. We use single file copy before we have upstream support.
+        ///
+        /// Tracked by: https://github.com/lance-format/lance/issues/5435
         let io_parallelism = self.object_store.io_parallelism();
-        let copy_futures = path_specs
+        let copy_futures = src_paths
             .iter()
-            .map(|file| {
+            .map(|(relative_path, base)| {
                 let store = Arc::clone(&target_store);
-                let src_path = file.absolute_path();
-                let target_path = file.absolute_path_with_base(&target_base);
+                let src_path = build_absolute_path(relative_path, base);
+                let target_path = build_absolute_path(relative_path, &target_base);
                 async move { store.copy(&src_path, &target_path).await.map(|_| ()) }
             })
             .collect::<Vec<_>>();
@@ -2267,8 +2259,9 @@ impl Dataset {
         }
     }
 
-    async fn collect_paths(&self) -> Result<Vec<FilePath>> {
-        let mut file_paths = Vec::new();
+    /// Collect all (relative_path, path) of the dataset files.
+    async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
+        let mut file_paths: Vec<(String, Path)> = Vec::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
                 return Err(Error::Internal {
@@ -2293,10 +2286,10 @@ impl Dataset {
                 } else {
                     self.base.clone()
                 };
-                file_paths.push(FilePath {
-                    relative_path: format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_path: base_root,
-                });
+                file_paths.push((
+                    format!("{}/{}", DATA_DIR, data_file.path.clone()),
+                    base_root,
+                ));
             }
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
@@ -2312,10 +2305,10 @@ impl Dataset {
                 } else {
                     self.base.clone()
                 };
-                file_paths.push(FilePath {
-                    relative_path: relative_deletion_file_path(fragment.id, deletion_file),
-                    base_path: base_root,
-                });
+                file_paths.push((
+                    relative_deletion_file_path(fragment.id, deletion_file),
+                    base_root,
+                ));
             }
         }
 
@@ -2344,10 +2337,10 @@ impl Dataset {
             let mut stream = self.object_store.read_dir_all(&index_root, None);
             while let Some(meta) = stream.next().await.transpose()? {
                 if let Some(filename) = meta.location.filename() {
-                    file_paths.push(FilePath {
-                        relative_path: format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
-                        base_path: base_root.clone(),
-                    });
+                    file_paths.push((
+                        format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
+                        base_root.clone(),
+                    ));
                 }
             }
         }
