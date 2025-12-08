@@ -347,7 +347,7 @@ impl<'a> CleanupTask<'a> {
         let old_manifests = inspection.old_manifests.clone();
         let num_old_manifests = old_manifests.len();
 
-        // Ideally this collect shouldn't be needed here but it sseems necessary
+        // Ideally this collect shouldn't be needed here but it seems necessary
         // to avoid https://github.com/rust-lang/rust/issues/102211
         let manifest_bytes_removed = stream::iter(old_manifests.keys())
             .map(|path| self.dataset.object_store.size(path))
