@@ -612,7 +612,7 @@ async fn test_deep_clone(
     let clone_dir = test_dir.join("clone_ds_old_ver");
     let cloned_ds = clone_dir.to_str().unwrap();
     let cloned_dataset = branch
-        .deep_clone(cloned_ds, original_version - 1, None)
+        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
         .await
         .unwrap();
     let store = branch.object_store();
