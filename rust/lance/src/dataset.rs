@@ -2194,12 +2194,12 @@ impl Dataset {
             path
         };
 
-        /// TODO: Leverage object store bulk copy for efficient deep_clone
-        ///
-        /// All cloud storage providers support batch copy APIs that would provide significant
-        /// performance improvements. We use single file copy before we have upstream support.
-        ///
-        /// Tracked by: https://github.com/lance-format/lance/issues/5435
+        // TODO: Leverage object store bulk copy for efficient deep_clone
+        //
+        // All cloud storage providers support batch copy APIs that would provide significant
+        // performance improvements. We use single file copy before we have upstream support.
+        //
+        // Tracked by: https://github.com/lance-format/lance/issues/5435
         let io_parallelism = self.object_store.io_parallelism();
         let copy_futures = src_paths
             .iter()
