@@ -474,16 +474,32 @@ impl Branches<'_> {
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        let all_branches = self.list().await?;
+        let branch_id = all_branches
+            .get(branch)
+            .map(|contents| contents.identifier.clone());
+        if let Some(branch_id) = branch_id {
+            let referenced_versions = branch_id.collect_referenced_versions(&all_branches);
+            if !referenced_versions.is_empty() {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "Branch {} is referenced by {:?} versions, can not delete",
+                        branch, referenced_versions
+                    ),
+                });
+            }
+        } else if !force {
+            return Err(Error::RefNotFound {
+                message: format!("Branch {} does not exist", branch),
+            });
+        } else {
+            log::warn!("BranchContents of {} does not exist", branch);
+        }
+
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
             self.object_store().delete(&branch_file).await?;
-        } else if force {
-            log::warn!("BranchContents of {} does not exist", branch);
-        } else {
-            return Err(Error::RefNotFound {
-                message: format!("Branch {} does not exist", branch),
-            });
         }
 
         // Clean up branch directories
@@ -710,6 +726,24 @@ impl BranchIdentifier {
         (self.version_mapping.len() > next_idx && self.version_mapping[..next_idx] == *ref_mapping)
             .then(|| self.version_mapping[next_idx].0)
             .filter(|&version| version > 0)
+    }
+
+    pub fn collect_referenced_versions(
+        &self,
+        branches: &HashMap<String, BranchContents>,
+    ) -> Vec<(String, u64)> {
+        let mut branch_ids = branches
+            .clone()
+            .into_iter()
+            .map(|(name, branch)| (branch.identifier, name))
+            .collect::<Vec<_>>();
+        // Sort by BranchIdentifier desc to implement post-order traversal.
+        branch_ids.sort_by(|a, b| b.cmp(a));
+        branch_ids
+            .iter()
+            .map(|(branch_id, name)| (name, branch_id.find_referenced_version(self)))
+            .filter_map(|(name, opt_version)| opt_version.map(|v| (name.clone(), v)))
+            .collect()
     }
 }
 
@@ -1172,24 +1206,6 @@ mod tests {
         contents
     }
 
-    fn collect_children_for_branch(
-        root_id: &BranchIdentifier,
-        branches: &HashMap<String, BranchContents>,
-    ) -> Vec<(String, u64)> {
-        let mut branch_ids = branches
-            .clone()
-            .into_iter()
-            .map(|(name, branch)| (branch.identifier, name))
-            .collect::<Vec<_>>();
-        // Sort by BranchIdentifier desc to implement post-order traversal.
-        branch_ids.sort_by(|a, b| b.cmp(a));
-        branch_ids
-            .iter()
-            .map(|(branch_id, name)| (name, branch_id.find_referenced_version(root_id)))
-            .filter_map(|(name, opt_version)| opt_version.map(|v| (name.clone(), v)))
-            .collect()
-    }
-
     #[test]
     fn test_collect_children_for_branch3() {
         let all_branches = build_mock_branch_contents();
@@ -1198,14 +1214,16 @@ mod tests {
             .unwrap()
             .identifier
             .clone();
-        assert!(collect_children_for_branch(&root_id, &all_branches).is_empty());
+        assert!(root_id
+            .collect_referenced_versions(&all_branches)
+            .is_empty());
     }
 
     #[test]
     fn test_collect_children_for_branch2() {
         let all_branches = build_mock_branch_contents();
         let root_id = all_branches.get("dev/branch2").unwrap().identifier.clone();
-        let children = collect_children_for_branch(&root_id, &all_branches);
+        let children = root_id.collect_referenced_versions(&all_branches);
 
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].0.as_str(), "feature/nathan/branch3");
@@ -1216,11 +1234,11 @@ mod tests {
     fn test_collect_children_for_branch1() {
         let all_branches = build_mock_branch_contents();
         let root_id = all_branches.get("branch1").unwrap().identifier.clone();
-        let children = collect_children_for_branch(&root_id, &all_branches);
+        let children = root_id.collect_referenced_versions(&all_branches);
 
         assert_eq!(children.len(), 2);
-        assert_eq!(children[0].0.as_str(), "dev/branch2");
-        assert_eq!(children[1].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[0].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[1].0.as_str(), "dev/branch2");
         assert_eq!(children[0].1, 2);
         assert_eq!(children[1].1, 2);
     }
@@ -1229,7 +1247,7 @@ mod tests {
     fn test_collect_children_for_main() {
         let all_branches = build_mock_branch_contents();
         let root_id = BranchIdentifier::main();
-        let children = collect_children_for_branch(&root_id, &all_branches);
+        let children = root_id.collect_referenced_versions(&all_branches);
 
         assert_eq!(children.len(), 4);
         assert_eq!(children[0].0.as_str(), "branch4");
