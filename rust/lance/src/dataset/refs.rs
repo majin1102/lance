@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 use std::io::ErrorKind;
+use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
 
@@ -382,6 +383,15 @@ impl Branches<'_> {
         Ok(branch_contents)
     }
 
+    pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
+        if let Some(branch_name) = branch {
+            let branch_contents = self.get(branch_name).await?;
+            Ok(branch_contents.identifier)
+        } else {
+            Ok(BranchIdentifier::main())
+        }
+    }
+
     // Only create branch metadata
     pub(crate) async fn create(
         &self,
@@ -421,8 +431,24 @@ impl Branches<'_> {
             });
         };
 
+        let parent_branch_id = if let Some(ref parent_branch) = source_branch {
+            let parent_file = branch_contents_path(&root_location.path, parent_branch);
+            if self.object_store().exists(&parent_file).await? {
+                BranchContents::from_path(&parent_file, self.object_store())
+                    .await?
+                    .identifier
+            } else {
+                return Err(Error::RefNotFound {
+                    message: format!("Parent branch {} does not exist", branch_name),
+                });
+            }
+        } else {
+            BranchIdentifier::main()
+        };
+
         let branch_contents = BranchContents {
             parent_branch: source_branch,
+            identifier: BranchIdentifier::new(&parent_branch_id, version_number),
             parent_version: version_number,
             create_at: chrono::Utc::now().timestamp() as u64,
             manifest_size: if let Some(size) = manifest_file.size {
@@ -621,9 +647,75 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
+    #[serde(default = "null_branch_identifier")]
+    pub identifier: BranchIdentifier,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
     pub manifest_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BranchIdentifier {
+    pub version_mapping: Vec<(u64, String)>,
+}
+
+impl BranchIdentifier {
+    pub fn new(parent: &Self, parent_version: u64) -> Self {
+        let mut version_mapping = parent.version_mapping.clone();
+        version_mapping.push((parent_version, Uuid::new_v4().simple().to_string()));
+        Self { version_mapping }
+    }
+
+    pub fn null() -> Self {
+        Self {
+            version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
+        }
+    }
+
+    pub fn main() -> Self {
+        Self {
+            version_mapping: vec![],
+        }
+    }
+
+    pub fn parse(identifier: &str) -> Result<Self> {
+        let parts: Vec<&str> = identifier.split(':').collect();
+        if parts.len() % 2 != 0 {
+            return Err(Error::InvalidRef {
+                message: format!(
+                    "Invalid branch identifier: {}, format should be 'ver1:uuid1:ver2:uuid2:...:final_uuid'",
+                    parts.len()
+                ),
+            });
+        }
+
+        let version_mapping = parts
+            .chunks_exact(2)
+            .map(|chunk| {
+                let version = chunk[0].parse::<u64>().map_err(|e| Error::InvalidRef {
+                    message: format!("Invalid version number '{}': {}", chunk[0], e),
+                })?;
+                let uuid = chunk[1].to_string();
+                Ok((version, uuid))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self { version_mapping })
+    }
+
+    pub fn find_referenced_version(&self, referenced_branch: &Self) -> Option<u64> {
+        let ref_mapping = &referenced_branch.version_mapping;
+        let next_idx = ref_mapping.len();
+
+        (self.version_mapping.len() > next_idx && self.version_mapping[..next_idx] == *ref_mapping)
+            .then(|| self.version_mapping[next_idx].0)
+            .filter(|&version| version > 0)
+    }
+}
+
+// This is used to provide backwards compatibility for branches don't have an identifier
+pub fn null_branch_identifier() -> BranchIdentifier {
+    BranchIdentifier::null()
 }
 
 pub fn base_tags_path(base_path: &Path) -> Path {
@@ -643,17 +735,18 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
 }
 
-pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
+pub fn standardize_branch(branch: Option<&str>) -> Option<String> {
     match branch {
-        None => MAIN_BRANCH.to_string(),
-        Some(name) => name.to_string(),
+        None => None,
+        Some("main") => None,
+        Some(name) => Some(name.to_string()),
     }
 }
 
-pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
+pub fn normalize_branch(branch: Option<&str>) -> String {
     match branch {
-        MAIN_BRANCH => None,
-        name => Some(name.to_string()),
+        None => "main".to_string(),
+        Some(name) => name.to_string(),
     }
 }
 
@@ -941,6 +1034,7 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
+            identifier: null_branch_identifier(),
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
@@ -1032,5 +1126,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build a reusable mocked BranchContents map mirroring cleanup::lineage_tests::build_lineage_datasets.
+    ///
+    /// Structure:
+    //    main:v1 ──▶ branch1:v1 ──▶ dev/branch2:v2 ──▶ feature/nathan/branch3:v3
+    //        │
+    //    (main:v2) ──▶ branch4:v2
+    ///
+    /// Notes:
+    /// - The "main" root is virtual (no BranchContents entry).
+    /// - Version numbers are representative and monotonically increasing along the chain.
+    /// - Tests reuse this builder to ensure consistent lineage and deterministic assertions.
+    fn build_mock_branch_contents() -> HashMap<String, BranchContents> {
+        fn build(
+            parent_name: Option<&str>,
+            parent_branch: Option<&BranchContents>,
+            parent_ver: u64,
+        ) -> BranchContents {
+            let parent_branch_id = if let Some(parent_branch) = parent_branch {
+                parent_branch.identifier.clone()
+            } else {
+                BranchIdentifier::main()
+            };
+            BranchContents {
+                parent_branch: parent_name.map(String::from),
+                identifier: BranchIdentifier::new(&parent_branch_id, parent_ver),
+                parent_version: parent_ver,
+                create_at: 0,
+                manifest_size: 1,
+            }
+        }
+        let mut contents = HashMap::new();
+        contents.insert("branch1".to_string(), build(None, None, 1));
+        contents.insert(
+            "dev/branch2".to_string(),
+            build(Some("branch1"), contents.get("branch1"), 2),
+        );
+        contents.insert(
+            "feature/nathan/branch3".to_string(),
+            build(Some("dev/branch2"), contents.get("dev/branch2"), 3),
+        );
+        contents.insert("branch4".to_string(), build(None, None, 5));
+        contents
+    }
+
+    fn collect_children_for_branch(
+        root_id: &BranchIdentifier,
+        branches: &HashMap<String, BranchContents>,
+    ) -> Vec<(String, u64)> {
+        let mut branch_ids = branches
+            .clone()
+            .into_iter()
+            .map(|(name, branch)| (branch.identifier, name))
+            .collect::<Vec<_>>();
+        // Sort by BranchIdentifier desc to implement post-order traversal.
+        branch_ids.sort_by(|a, b| b.cmp(a));
+        branch_ids
+            .iter()
+            .map(|(branch_id, name)| (name, branch_id.find_referenced_version(root_id)))
+            .filter_map(|(name, opt_version)| opt_version.map(|v| (name.clone(), v)))
+            .collect()
+    }
+
+    #[test]
+    fn test_collect_children_for_branch3() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = all_branches
+            .get("feature/nathan/branch3")
+            .unwrap()
+            .identifier
+            .clone();
+        assert!(collect_children_for_branch(&root_id, &all_branches).is_empty());
+    }
+
+    #[test]
+    fn test_collect_children_for_branch2() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = all_branches.get("dev/branch2").unwrap().identifier.clone();
+        let children = collect_children_for_branch(&root_id, &all_branches);
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[0].1, 3);
+    }
+
+    #[test]
+    fn test_collect_children_for_branch1() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = all_branches.get("branch1").unwrap().identifier.clone();
+        let children = collect_children_for_branch(&root_id, &all_branches);
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].0.as_str(), "dev/branch2");
+        assert_eq!(children[1].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[0].1, 2);
+        assert_eq!(children[1].1, 2);
+    }
+
+    #[test]
+    fn test_collect_children_for_main() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = BranchIdentifier::main();
+        let children = collect_children_for_branch(&root_id, &all_branches);
+
+        assert_eq!(children.len(), 4);
+        assert_eq!(children[0].0.as_str(), "branch4");
+        assert_eq!(children[1].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[2].0.as_str(), "dev/branch2");
+        assert_eq!(children[3].0.as_str(), "branch1");
+        assert_eq!(children[0].1, 5);
+        assert_eq!(children[1].1, 1);
+        assert_eq!(children[2].1, 1);
+        assert_eq!(children[3].1, 1);
     }
 }

@@ -62,7 +62,7 @@ use std::{
 };
 use tracing::{debug, info, instrument, Span};
 
-use super::refs::{normalize_branch, TagContents};
+use super::refs::TagContents;
 use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
@@ -574,76 +574,52 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
-        let current_branch = &self.dataset.manifest.branch;
-        let branch_lineages = self.dataset.branches().collect_lineage().await?;
+        let current_branch_id = self.dataset.branch_identifier().await?;
+        let mut branches = self
+            .dataset
+            .branches()
+            .list()
+            .await?
+            .into_iter()
+            .map(|(name, branch)| (branch.identifier, name))
+            .collect::<Vec<_>>();
+        // Sort by BranchIdentifier desc to implement post-order traversal.
+        branches.sort_by(|a, b| b.cmp(a));
 
-        // branch name to the referenced version from the current branch
-        let mut referenced_versions: HashMap<&str, u64> = HashMap::new();
+        let children: Vec<(String, u64)> = branches
+            .iter()
+            .map(|(branch_id, name)| (name, branch_id.find_referenced_version(&current_branch_id)))
+            .filter_map(|(name, opt_version)| opt_version.map(|v| (name.clone(), v)))
+            .collect();
+
         // We need to use vec so we can clean them in the correct order
         let mut referenced_branches: Vec<(String, u64)> = Vec::new();
         // Build referenced version map by traversing the branch lineage
-        for branch_lineage in branch_lineages.pre_order_iter_from(current_branch.as_deref())? {
-            let parent_branch = normalize_branch(branch_lineage.branch.as_deref());
-            for child_lineage in branch_lineage.children.iter() {
-                if let (Some(branch), Some(parent_version)) = (
-                    child_lineage.branch.as_ref(),
-                    child_lineage.parent_version_number,
-                ) {
-                    if let Some(ref_version) = referenced_versions.get(parent_branch.as_str()) {
-                        referenced_versions.insert(branch, *ref_version);
-                    } else {
-                        referenced_versions.insert(branch, parent_version);
-                    };
+        for (branch_name, referenced_version) in children.iter() {
+            let manifest_location = self
+                .dataset
+                .commit_handler
+                .resolve_version_location(
+                    &self.dataset.base,
+                    *referenced_version,
+                    &self.dataset.object_store.inner,
+                )
+                .await?;
+            let manifest = read_manifest(
+                &self.dataset.object_store,
+                &manifest_location.path,
+                manifest_location.size,
+            )
+            .await;
+
+            // If the parent manifest has been cleaned, or the parent manifest should be clean
+            // we should check the referenced branch to make sure the referenced files could be retained
+            if let Ok(manifest) = manifest {
+                if self.policy.should_clean(&manifest) {
+                    referenced_branches.push((branch_name.clone(), *referenced_version));
                 }
             }
         }
-
-        // Prone branches not necessary to be involved in the cleanup process
-        for branch_lineage in branch_lineages.post_order_iter_from(current_branch.as_deref())? {
-            if branch_lineage.deleted {
-                continue;
-            }
-            if let Some(branch) = branch_lineage.branch.as_ref() {
-                if Some(branch) == self.dataset.manifest.branch.as_ref() {
-                    continue;
-                }
-                if let Some(ref_version) = referenced_versions.get(branch.as_str()) {
-                    let manifest_location = self
-                        .dataset
-                        .commit_handler
-                        .resolve_version_location(
-                            &self.dataset.base,
-                            *ref_version,
-                            &self.dataset.object_store.inner,
-                        )
-                        .await?;
-                    let manifest = read_manifest(
-                        &self.dataset.object_store,
-                        &manifest_location.path,
-                        manifest_location.size,
-                    )
-                    .await;
-
-                    // If the parent manifest has been cleaned, or the parent manifest should be clean
-                    // we should check the referenced branch to make sure the referenced files could be retained
-                    if let Ok(manifest) = manifest {
-                        if self.policy.should_clean(&manifest) {
-                            referenced_branches.push((branch.clone(), *ref_version));
-                        }
-                    }
-                } else {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "Branch {} is not referenced by any version from {}",
-                            branch,
-                            normalize_branch(current_branch.as_deref())
-                        ),
-                        location: location!(),
-                    });
-                }
-            }
-        }
-
         Ok(referenced_branches)
     }
 
