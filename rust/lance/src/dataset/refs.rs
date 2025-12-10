@@ -741,8 +741,11 @@ impl BranchIdentifier {
         branch_ids.sort_by(|a, b| b.cmp(a));
         branch_ids
             .into_iter()
-            .map(|(branch_id, name)| (name, branch_id.find_referenced_version(self)))
-            .filter_map(|(name, opt_version)| opt_version.map(|v| (name, v)))
+            .filter_map(|(branch_id, name)| {
+                branch_id
+                    .find_referenced_version(self)
+                    .map(|version| (name, version))
+            })
             .collect()
     }
 }

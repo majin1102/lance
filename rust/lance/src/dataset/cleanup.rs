@@ -3140,70 +3140,6 @@ mod lineage_tests {
     }
 
     #[tokio::test]
-    async fn auto_clean_referenced_branches_with_delete_branch1() {
-        let mut setup = build_lineage_datasets().await.unwrap();
-
-        setup.branch2.compact().await.unwrap();
-        setup.branch3.compact().await.unwrap();
-        setup.branch4.compact().await.unwrap();
-        setup
-            .main
-            .dataset
-            .branches()
-            .delete("branch1", true)
-            .await
-            .unwrap();
-
-        setup.main.compact().await.unwrap();
-        setup.main.run_cleanup().await.unwrap();
-        // Branch2, branch3 and branch4 hold references from main:
-        // - 1 manifest file
-        // - 2 data files
-        // - 1 deletion file
-        // Branch4, branch3 and branch4 hold references from main:
-        // - 1 manifest file
-        // - 3 data files
-        // - 1 deletion file
-        // - 4 index files
-        assert_eq!(setup.main.num_manifest_files, 3);
-        assert_eq!(setup.main.num_data_files, 4);
-        assert_eq!(setup.main.num_tx_files, 1);
-        assert_eq!(setup.main.num_delete_files, 2);
-        assert_eq!(setup.main.num_index_files, 8);
-
-        setup.enable_auto_cleanup().await.unwrap();
-        setup
-            .main
-            .run_cleanup_with_referenced_branches()
-            .await
-            .unwrap();
-        setup.branch2.refresh().await.unwrap();
-        setup.branch3.refresh().await.unwrap();
-        setup.branch4.refresh().await.unwrap();
-        // All cleaned up
-        assert_eq!(setup.main.num_manifest_files, 1);
-        assert_eq!(setup.main.num_data_files, 1);
-        assert_eq!(setup.main.num_tx_files, 1);
-        assert_eq!(setup.main.num_delete_files, 0);
-        assert_eq!(setup.main.num_index_files, 4);
-        assert_eq!(setup.branch2.num_manifest_files, 1);
-        assert_eq!(setup.branch2.num_data_files, 1);
-        assert_eq!(setup.branch2.num_tx_files, 1);
-        assert_eq!(setup.branch2.num_delete_files, 0);
-        assert_eq!(setup.branch2.num_index_files, 4);
-        assert_eq!(setup.branch3.num_manifest_files, 1);
-        assert_eq!(setup.branch3.num_data_files, 1);
-        assert_eq!(setup.branch3.num_tx_files, 1);
-        assert_eq!(setup.branch3.num_delete_files, 0);
-        assert_eq!(setup.branch3.num_index_files, 4);
-        assert_eq!(setup.branch4.num_manifest_files, 1);
-        assert_eq!(setup.branch4.num_data_files, 1);
-        assert_eq!(setup.branch4.num_tx_files, 1);
-        assert_eq!(setup.branch4.num_delete_files, 0);
-        assert_eq!(setup.branch4.num_index_files, 4);
-    }
-
-    #[tokio::test]
     async fn auto_clean_referenced_branches_with_tags() {
         let mut setup = build_lineage_datasets().await.unwrap();
 
@@ -3222,17 +3158,10 @@ mod lineage_tests {
             .await
             .unwrap();
 
+        setup.branch1.compact().await.unwrap();
         setup.branch2.compact().await.unwrap();
         setup.branch3.compact().await.unwrap();
         setup.branch4.compact().await.unwrap();
-        setup
-            .main
-            .dataset
-            .branches()
-            .delete("branch1", true)
-            .await
-            .unwrap();
-
         setup.main.compact().await.unwrap();
         setup.enable_auto_cleanup().await.unwrap();
         setup
@@ -3240,6 +3169,7 @@ mod lineage_tests {
             .run_cleanup_with_referenced_branches()
             .await
             .unwrap();
+        setup.branch1.refresh().await.unwrap();
         setup.branch2.refresh().await.unwrap();
         setup.branch3.refresh().await.unwrap();
         setup.branch4.refresh().await.unwrap();
@@ -3250,18 +3180,18 @@ mod lineage_tests {
         assert_eq!(setup.main.num_tx_files, 2);
         assert_eq!(setup.main.num_delete_files, 2);
         assert_eq!(setup.main.num_index_files, 8);
+        // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and 4 index files
+        assert_eq!(setup.branch2.num_manifest_files, 2);
+        assert_eq!(setup.branch2.num_data_files, 2);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 1);
+        assert_eq!(setup.branch2.num_index_files, 4);
         // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.num_manifest_files, 2);
         assert_eq!(setup.branch2.num_data_files, 2);
         assert_eq!(setup.branch2.num_tx_files, 1);
         assert_eq!(setup.branch2.num_delete_files, 1);
         assert_eq!(setup.branch2.num_index_files, 4);
-        // Branch3 tag holds 1 tx file, 1 data files, 1 deletion files and 4 index files
-        assert_eq!(setup.branch3.num_manifest_files, 2);
-        assert_eq!(setup.branch3.num_data_files, 2);
-        assert_eq!(setup.branch3.num_tx_files, 2);
-        assert_eq!(setup.branch3.num_delete_files, 1);
-        assert_eq!(setup.branch3.num_index_files, 8);
         assert_eq!(setup.branch4.num_manifest_files, 1);
         assert_eq!(setup.branch4.num_data_files, 1);
         assert_eq!(setup.branch4.num_tx_files, 1);
@@ -3280,6 +3210,7 @@ mod lineage_tests {
             .run_cleanup_with_referenced_branches()
             .await
             .unwrap();
+        setup.branch1.refresh().await.unwrap();
         setup.branch2.refresh().await.unwrap();
         setup.branch3.refresh().await.unwrap();
         setup.branch4.refresh().await.unwrap();
@@ -3289,6 +3220,11 @@ mod lineage_tests {
         assert_eq!(setup.main.num_tx_files, 2);
         assert_eq!(setup.main.num_delete_files, 2);
         assert_eq!(setup.main.num_index_files, 8);
+        assert_eq!(setup.branch1.num_manifest_files, 1);
+        assert_eq!(setup.branch1.num_data_files, 1);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 0);
+        assert_eq!(setup.branch1.num_index_files, 4);
         assert_eq!(setup.branch2.num_manifest_files, 1);
         assert_eq!(setup.branch2.num_data_files, 1);
         assert_eq!(setup.branch2.num_tx_files, 1);
