@@ -575,22 +575,8 @@ impl<'a> CleanupTask<'a> {
 
     async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
         let current_branch_id = self.dataset.branch_identifier().await?;
-        let mut branches = self
-            .dataset
-            .branches()
-            .list()
-            .await?
-            .into_iter()
-            .map(|(name, branch)| (branch.identifier, name))
-            .collect::<Vec<_>>();
-        // Sort by BranchIdentifier desc to implement post-order traversal.
-        branches.sort_by(|a, b| b.cmp(a));
-
-        let children: Vec<(String, u64)> = branches
-            .iter()
-            .map(|(branch_id, name)| (name, branch_id.find_referenced_version(&current_branch_id)))
-            .filter_map(|(name, opt_version)| opt_version.map(|v| (name.clone(), v)))
-            .collect();
+        let all_branches = self.dataset.branches().list().await?;
+        let children = current_branch_id.collect_referenced_versions(&all_branches);
 
         // We need to use vec so we can clean them in the correct order
         let mut referenced_branches: Vec<(String, u64)> = Vec::new();

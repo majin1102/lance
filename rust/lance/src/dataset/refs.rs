@@ -728,21 +728,21 @@ impl BranchIdentifier {
             .filter(|&version| version > 0)
     }
 
+    /// Collect all (branch_name, referenced_version) tuples in deep-first order.
     pub fn collect_referenced_versions(
         &self,
         branches: &HashMap<String, BranchContents>,
     ) -> Vec<(String, u64)> {
         let mut branch_ids = branches
-            .clone()
-            .into_iter()
-            .map(|(name, branch)| (branch.identifier, name))
+            .iter()
+            .map(|(name, branch)| (branch.identifier.clone(), name.clone()))
             .collect::<Vec<_>>();
         // Sort by BranchIdentifier desc to implement post-order traversal.
         branch_ids.sort_by(|a, b| b.cmp(a));
         branch_ids
-            .iter()
+            .into_iter()
             .map(|(branch_id, name)| (name, branch_id.find_referenced_version(self)))
-            .filter_map(|(name, opt_version)| opt_version.map(|v| (name.clone(), v)))
+            .filter_map(|(name, opt_version)| opt_version.map(|v| (name, v)))
             .collect()
     }
 }
