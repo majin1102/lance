@@ -1608,14 +1608,14 @@ public class DatasetTest {
 
                   // Step 6. use checkout_branch to checkout branch1
                   try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch1"))) {
-                    assertEquals(4, branch2V4New.version());
-                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                    assertEquals(3, branch2V4New.version());
+                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
                   }
 
                   // Step 7. use checkout reference to checkout branch2
-                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch1", 3))) {
-                    assertEquals(3, branch2V4New.version());
-                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch1", 2))) {
+                    assertEquals(2, branch2V4New.version());
+                    assertEquals(5, branch2V4New.countRows()); // A(5)
                   }
                 }
               }
