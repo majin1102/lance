@@ -520,6 +520,9 @@ impl DatasetBuilder {
                 }
                 (branch, version_number)
             }
+            // We don't have a current branch context, just specify the branch as main
+            // But the real branch will be specified by uri
+            Some(Ref::VersionNumber(version_number)) => (None, Some(version_number)),
             // Here we assume the uri and path is the root.
             // If tag not found, we need to delay checkout after loading by uri
             Some(Ref::Tag(tag_name)) => {

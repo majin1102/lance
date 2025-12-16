@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::refs::Ref::{Tag, Version};
+use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use snafu::location;
@@ -22,9 +22,13 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::io::ErrorKind;
 
+pub const MAIN_BRANCH: &str = "main";
+
 /// Lance Ref
 #[derive(Debug, Clone)]
 pub enum Ref {
+    // Version number points of the current branch
+    VersionNumber(u64),
     // This is a global version identifier present as (branch_name, version_number)
     // if branch_name is None, it points to the main branch
     // if version_number is None, it points to the latest version
@@ -35,7 +39,7 @@ pub enum Ref {
 
 impl From<u64> for Ref {
     fn from(reference: u64) -> Self {
-        Version(current_branch(), Some(reference))
+        VersionNumber(reference)
     }
 }
 
@@ -67,12 +71,12 @@ impl fmt::Display for Ref {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Version(branch, version_number) => {
-                let branch_name = branch.as_deref().unwrap_or("main");
                 let version_str = version_number
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "latest".to_string());
-                write!(f, "{}:{}", branch_name, version_str)
+                write!(f, "{}:{}", normalize_branch(branch.as_deref()), version_str)
             }
+            VersionNumber(version_number) => write!(f, "{}", version_number),
             Tag(tag_name) => write!(f, "{}", tag_name),
         }
     }
@@ -268,13 +272,16 @@ impl Tags<'_> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
             Version(branch, version_number) => (branch, version_number),
+            VersionNumber(version_number) => {
+                (self.refs.base_location.branch.clone(), Some(version_number))
+            }
             Tag(tag_name) => {
                 let tag_content = self.get(tag_name.as_str()).await?;
                 (tag_content.branch, Some(tag_content.version))
             }
         };
 
-        let branch_location = self.refs.base_location.find_branch(branch.clone())?;
+        let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
                 .commit_handler
@@ -313,6 +320,10 @@ impl Tags<'_> {
 }
 
 impl Branches<'_> {
+    pub(crate) fn is_main_branch(branch: Option<&str>) -> bool {
+        branch == Some(MAIN_BRANCH)
+    }
+
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_branches_contents_path(&root_location.path);
@@ -371,7 +382,8 @@ impl Branches<'_> {
         Ok(branch_contents)
     }
 
-    pub async fn create(
+    // Only create branch metadata
+    pub(crate) async fn create(
         &self,
         branch_name: &str,
         version_number: u64,
@@ -388,7 +400,10 @@ impl Branches<'_> {
             });
         }
 
-        let branch_location = self.refs.base_location.find_branch(source_branch.clone())?;
+        let branch_location = self
+            .refs
+            .base_location
+            .find_branch(source_branch.as_deref())?;
         // Verify the source version exists
         let manifest_file = self
             .refs
@@ -524,7 +539,7 @@ impl Branches<'_> {
         if let Some(sub_dir) = unused_dir.split('/').next() {
             let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
             // Use base_location to generate the cleanup path
-            let absolute_dir = base_location.find_branch(Some(relative_dir))?;
+            let absolute_dir = base_location.find_branch(Some(relative_dir).as_deref())?;
             Ok(Some(absolute_dir.path))
         } else {
             Ok(None)
@@ -566,8 +581,11 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
 }
 
-pub(crate) fn current_branch() -> Option<String> {
-    Some(String::new())
+pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
+    match branch {
+        None => MAIN_BRANCH.to_string(),
+        Some(name) => name.to_string(),
+    }
 }
 
 async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
@@ -826,9 +844,8 @@ mod tests {
         // Test From<u64> for Ref
         let version_ref: Ref = 42u64.into();
         match version_ref {
-            Version(branch, v) => {
-                assert_eq!(v, Some(42));
-                assert_eq!(branch, None)
+            VersionNumber(version_number) => {
+                assert_eq!(version_number, 42);
             }
             _ => panic!("Expected Version variant"),
         }
@@ -935,7 +952,7 @@ mod tests {
                     branch_to_delete
                 );
                 let expected_full_path = base_location
-                    .find_branch(Some(expected_relative.to_string()))
+                    .find_branch(Some(expected_relative))
                     .unwrap()
                     .path;
                 assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());

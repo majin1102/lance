@@ -1620,21 +1620,9 @@ impl Dataset {
 
     fn update_tag(&self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
         let reference = self.transform_ref(py, reference)?;
-        let (version_number, branch) = match reference {
-            Ref::Version(branch, version_number) => (version_number, branch),
-            Ref::Tag(tag_name) => {
-                let tag_content = rt()
-                    .block_on(None, self.ds.tags().get(tag_name.as_str()))?
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                (Some(tag_content.version), tag_content.branch)
-            }
-        };
         rt().block_on(
             None,
-            self.ds
-                .as_ref()
-                .tags()
-                .update(tag.as_str(), Ref::Version(branch, version_number)),
+            self.ds.as_ref().tags().update(tag.as_str(), reference),
         )?
         .infer_error()?;
         Ok(())
@@ -2858,9 +2846,7 @@ impl Dataset {
                         tuple.extract::<(Option<String>, Option<u64>)>()?;
                     Ok(Ref::Version(branch_name, version_number))
                 } else {
-                    Err(PyValueError::new_err(
-                        "Version must be a (int, str) tuple",
-                    ))
+                    Err(PyValueError::new_err("Version must be a (int, str) tuple"))
                 }
             } else {
                 Err(PyValueError::new_err(
