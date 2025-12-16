@@ -129,9 +129,9 @@ pub use write::{
     WriteDestination, WriteMode, WriteParams,
 };
 
-pub const INDICES_DIR: &str = "_indices";
-pub const DATA_DIR: &str = "data";
-pub const TRANSACTIONS_DIR: &str = "_transactions";
+pub(crate) const INDICES_DIR: &str = "_indices";
+pub(crate) const DATA_DIR: &str = "data";
+pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
 
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
