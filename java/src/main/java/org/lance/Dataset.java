@@ -1268,6 +1268,20 @@ public class Dataset implements Closeable {
       }
     }
 
+
+    /**
+     * Creates a new tag on the specified branch.
+     * This method will be removed in version 2.0.0. Use {@link #create(String, Ref)} instead.
+     *
+     * @param tag            the name of the tag to create
+     * @param versionNumber  the version number (or commit reference) to associate with the tag
+     */
+    @Deprecated()
+    public void create(String tag, long versionNumber, String targetBranch) {
+      create(tag, Ref.ofBranch(targetBranch, versionNumber));
+    }
+
+
     /**
      * Delete a tag from this dataset.
      *
@@ -1287,7 +1301,7 @@ public class Dataset implements Closeable {
      * @param tag the tag name
      * @param versionNumber the versionNumber on main.
      */
-    public void update(String tag, int versionNumber) {
+    public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
       nativeUpdateTag(tag, Ref.ofMain(versionNumber));
     }

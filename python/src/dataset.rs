@@ -2859,7 +2859,7 @@ impl Dataset {
                     Ok(Ref::Version(branch_name, version_number))
                 } else {
                     Err(PyValueError::new_err(
-                        "Version tuple must have 1 or 2 elements",
+                        "Version must be a (int, str) tuple",
                     ))
                 }
             } else {

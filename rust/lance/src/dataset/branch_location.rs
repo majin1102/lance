@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::refs::current_branch;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::location;
@@ -71,13 +72,13 @@ impl BranchLocation {
 
     /// Find the target branch location
     pub fn find_branch(&self, branch_name: Option<String>) -> Result<Self> {
-        if branch_name == self.branch {
+        if branch_name == self.branch || branch_name == current_branch() {
             return Ok(self.clone());
         }
 
         let root_location = self.find_main()?;
         if let Some(target_branch) = branch_name.as_ref() {
-            if target_branch == MAIN_BRANCH {
+            if target_branch.as_str() == MAIN_BRANCH {
                 return Ok(root_location);
             }
             let (new_path, new_uri) = {

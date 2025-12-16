@@ -35,7 +35,7 @@ pub enum Ref {
 
 impl From<u64> for Ref {
     fn from(reference: u64) -> Self {
-        Version(None, Some(reference))
+        Version(current_branch(), Some(reference))
     }
 }
 
@@ -564,6 +564,10 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
 // Note: child will encode '/' to '%2F'
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
+}
+
+pub(crate) fn current_branch() -> Option<String> {
+    Some(String::new())
 }
 
 async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>

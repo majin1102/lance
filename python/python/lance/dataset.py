@@ -2202,7 +2202,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.latest_version()
 
     def checkout_version(
-        self, version: int | str | Tuple[Optional[str], [int]]
+        self, version: int | str | Tuple[Optional[str], Optional[int]]
     ) -> "LanceDataset":
         """
         Load the given version of the dataset.
