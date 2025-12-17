@@ -2073,7 +2073,7 @@ fn transform_jstorage_options(
     env: &mut JNIEnv,
 ) -> Result<Option<ObjectStoreParams>> {
     let storage_options = env.get_optional(&jstorage_options, |env, map_obj| {
-        let jmap = JMap::from_env(env, map_obj)?;
+        let jmap = JMap::from_env(env, &map_obj)?;
         to_rust_map(env, &jmap)
     })?;
     Ok(storage_options
