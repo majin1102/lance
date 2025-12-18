@@ -4821,7 +4821,7 @@ def test_shallow_clone(tmp_path: Path):
 
     table_v3 = pa.table({"a": [7, 8, 9], "b": [40, 50, 60]})
     branch = ds.create_branch("branch", 2)
-    lance.write_dataset(table_v3, branch.uri(), mode="overwrite")
+    lance.write_dataset(table_v3, branch.uri, mode="overwrite")
     clone_branch_v3 = tmp_path / "clone_branch_v3"
     cloned_by_branch = branch.shallow_clone(clone_branch_v3, 3)
     assert cloned_by_branch.to_table() == table_v3
