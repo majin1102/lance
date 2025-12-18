@@ -567,7 +567,9 @@ impl DatasetBuilder {
             }
 
             if branch.as_deref() != dataset.manifest.branch.as_deref() {
-                return dataset.checkout_version((branch, version_number)).await;
+                return dataset
+                    .checkout_version((branch.as_deref(), version_number))
+                    .await;
             }
         }
         if let Some(version_number) = version_number {

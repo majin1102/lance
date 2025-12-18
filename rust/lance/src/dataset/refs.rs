@@ -51,19 +51,19 @@ impl From<&str> for Ref {
 
 impl From<(&str, u64)> for Ref {
     fn from(reference: (&str, u64)) -> Self {
-        Version(Some(reference.0.to_string()), Some(reference.1))
+        Version(standardize_branch(reference.0), Some(reference.1))
     }
 }
 
-impl From<(Option<String>, Option<u64>)> for Ref {
-    fn from(reference: (Option<String>, Option<u64>)) -> Self {
-        Version(reference.0, reference.1)
+impl From<(Option<&str>, Option<u64>)> for Ref {
+    fn from(reference: (Option<&str>, Option<u64>)) -> Self {
+        Version(reference.0.and_then(standardize_branch), reference.1)
     }
 }
 
 impl From<(&str, Option<u64>)> for Ref {
     fn from(reference: (&str, Option<u64>)) -> Self {
-        Version(Some(reference.0.to_string()), reference.1)
+        Version(standardize_branch(reference.0), reference.1)
     }
 }
 
@@ -391,7 +391,7 @@ impl Branches<'_> {
     ) -> Result<()> {
         check_valid_branch(branch_name)?;
 
-        let source_branch = source_branch.map(String::from);
+        let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
         if self.object_store().exists(&branch_file).await? {
@@ -514,35 +514,97 @@ impl Branches<'_> {
         remaining_branches: &[&str],
         base_location: &BranchLocation,
     ) -> Result<Option<Path>> {
-        let mut longest_used_length = 0;
-        for &candidate in remaining_branches {
-            let common_len = branch
-                .chars()
-                .zip(candidate.chars())
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            if common_len > longest_used_length {
-                longest_used_length = common_len;
+        let deleted_branch = BranchRelativePath::new(branch);
+        let mut related_branches = Vec::new();
+        let mut relative_dir = branch.to_string();
+        for branch in remaining_branches {
+            let branch = BranchRelativePath::new(branch);
+            if branch.is_parent(&deleted_branch) || branch.is_child(&deleted_branch) {
+                related_branches.push(branch);
+            } else if let Some(common_prefix) = deleted_branch.find_common_prefix(&branch) {
+                related_branches.push(common_prefix);
             }
         }
-        // Means this branch path is used as a prefix of other branches
-        if longest_used_length == branch.len() {
-            return Ok(None);
+
+        related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
+        if let Some(branch) = related_branches.first() {
+            if branch.is_child(&deleted_branch) || branch == &deleted_branch {
+                // There are children of the deleted branch, we can't delete any directory for now
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a/b/c/d"], we need to delete nothing
+                return Ok(None);
+            } else {
+                // We pick the longest common directory between the deleted branch and the remaining branches
+                // Then delete the first child of this common directory
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a"], we need to delete "a/b"
+                relative_dir = format!(
+                    "{}/{}",
+                    branch.segments.join("/"),
+                    deleted_branch.segments[branch.segments.len()]
+                );
+            }
+        } else if !deleted_branch.segments.is_empty() {
+            // There are no common directories between the deleted branch and the remaining branches
+            // We need to delete the entire directory
+            // Example: deleted_branch = "a/b/c", remaining_branches = [], we need to delete "a"
+            relative_dir = deleted_branch.segments[0].to_string();
         }
 
-        let mut used_relative_path = &branch[..longest_used_length];
-        if let Some(last_slash_index) = used_relative_path.rfind('/') {
-            used_relative_path = &used_relative_path[..last_slash_index];
+        let absolute_dir = base_location.find_branch(Some(relative_dir.as_str()))?;
+        Ok(Some(absolute_dir.path))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct BranchRelativePath<'a> {
+    segments: Vec<&'a str>,
+}
+
+impl<'a> BranchRelativePath<'a> {
+    fn new(branch_name: &'a str) -> Self {
+        let segments = branch_name.split('/').collect_vec();
+        Self { segments }
+    }
+
+    fn find_common_prefix(&self, other: &Self) -> Option<Self> {
+        let mut common_segments = Vec::new();
+        for (i, segment) in self.segments.iter().enumerate() {
+            if i >= other.segments.len() || other.segments[i] != *segment {
+                break;
+            }
+            common_segments.push(*segment);
         }
-        let unused_dir = &branch[used_relative_path.len()..].trim_start_matches('/');
-        if let Some(sub_dir) = unused_dir.split('/').next() {
-            let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
-            // Use base_location to generate the cleanup path
-            let absolute_dir = base_location.find_branch(Some(relative_dir).as_deref())?;
-            Ok(Some(absolute_dir.path))
+        if !common_segments.is_empty() {
+            Some(BranchRelativePath {
+                segments: common_segments,
+            })
         } else {
-            Ok(None)
+            None
+        }
+    }
+
+    fn is_parent(&self, other: &Self) -> bool {
+        if other.segments.len() <= self.segments.len() {
+            false
+        } else {
+            for (i, segment) in self.segments.iter().enumerate() {
+                if other.segments[i] != *segment {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    fn is_child(&self, other: &Self) -> bool {
+        if other.segments.len() >= self.segments.len() {
+            false
+        } else {
+            for (i, segment) in other.segments.iter().enumerate() {
+                if self.segments[i] != *segment {
+                    return false;
+                }
+            }
+            true
         }
     }
 }
@@ -585,6 +647,13 @@ pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
     match branch {
         None => MAIN_BRANCH.to_string(),
         Some(name) => name.to_string(),
+    }
+}
+
+pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
+    match branch {
+        MAIN_BRANCH => None,
+        name => Some(name.to_string()),
     }
 }
 
@@ -914,20 +983,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
-    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
-    #[case("a/b/c", &["a/b/d", "a/e"], Some("a/b/c"))]
     #[case("feature/auth", &["feature/auth/sub"], None)]
     #[case("feature", &["feature/sub1", "feature/sub2"], None)]
-    #[case("a/b", &["a/b/c", "a/b/d"], None)]
+    #[case("a/b", &["a/b/c", "b/c/d"], None)]
+    #[case("main", &[], Some("main"))]
     #[case("a", &["a"], None)]
-    #[case("single", &["other"], Some("single"))]
-    #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth"))]
-    #[case("feature/user-auth", &["feature/user-signup"], Some("feature/user-auth"))]
-    #[case("release/2024.01", &["release/2024.02"], Some("release/2024.01"))]
-    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
-    #[case("feature", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
     #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
+    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
+    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
+    #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],

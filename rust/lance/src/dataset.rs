@@ -2156,9 +2156,10 @@ impl Dataset {
                 if let Some(version_number) = version_number {
                     Ok((branch, version_number))
                 } else {
+                    let branch_location = self.branch_location().find_branch(branch.as_deref())?;
                     let version_number = self
                         .commit_handler
-                        .resolve_latest_location(&self.base, &self.object_store)
+                        .resolve_latest_location(&branch_location.path, &self.object_store)
                         .await?
                         .version;
                     Ok((branch, version_number))

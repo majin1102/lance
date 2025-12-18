@@ -2836,17 +2836,19 @@ impl Dataset {
         if let Some(reference) = reference {
             if let Ok(i) = reference.downcast_bound::<PyInt>(py) {
                 let version_number: u64 = i.extract()?;
-                Ok(Ref::from(version_number))
+                Ok(version_number.into())
             } else if let Ok(tag_name) = reference.downcast_bound::<PyString>(py) {
                 let tag: &str = &tag_name.to_string_lossy();
-                Ok(Ref::from(tag))
+                Ok(tag.into())
             } else if let Ok(tuple) = reference.downcast_bound::<PyTuple>(py) {
                 if tuple.len() == 2 {
                     let (branch_name, version_number) =
                         tuple.extract::<(Option<String>, Option<u64>)>()?;
-                    Ok(Ref::Version(branch_name, version_number))
+                    Ok((branch_name.as_deref(), version_number).into())
                 } else {
-                    Err(PyValueError::new_err("Version must be a (int, str) tuple"))
+                    Err(PyValueError::new_err(
+                        "Version tuple should be Tuple[Optional[str], Optional[int]]",
+                    ))
                 }
             } else {
                 Err(PyValueError::new_err(
