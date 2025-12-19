@@ -635,6 +635,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -824,6 +825,7 @@ pub(crate) async fn commit_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -1326,6 +1328,62 @@ mod tests {
 
             dataset.validate().await.unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn test_restore_does_not_decrease_max_fragment_id() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Write initial version.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Append a few times to advance max_fragment_id and create newer versions.
+        for _ in 0..2 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            dataset = Dataset::write(
+                reader,
+                test_uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
+
+        // Restore an earlier version (version 1) as the latest.
+        let mut dataset_v1 = dataset.checkout_version(1).await.unwrap();
+        dataset_v1.restore().await.unwrap();
+
+        // After restore, max_fragment_id should not decrease compared to the latest value before restore.
+        let restored_max = dataset_v1.manifest.max_fragment_id().unwrap_or(0);
+        assert!(
+            restored_max >= latest_max,
+            "max_fragment_id should not decrease on restore: before={}, after={}",
+            latest_max,
+            restored_max
+        );
     }
 
     async fn get_empty_dataset() -> (TempStrDir, Dataset) {
