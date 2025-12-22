@@ -541,7 +541,7 @@ async fn test_deep_clone(
     let original_version = branch.version().version;
     branch
         .tags()
-        .create_on_branch("tag", original_version, Some("branch"))
+        .create("tag", ("branch", original_version))
         .await
         .unwrap();
 

@@ -54,7 +54,7 @@ pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFil
         ..
     } = deletion_file;
     let suffix = file_type.suffix();
-    format!("{DELETION_DIRS}/{fragment_id}-{read_version}-{id}.{suffix}")
+    format!("{DELETIONS_DIR}/{fragment_id}-{read_version}-{id}.{suffix}")
 }
 
 /// Write a deletion file for a fragment for a given deletion vector.
