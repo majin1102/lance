@@ -959,6 +959,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
