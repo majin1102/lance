@@ -370,16 +370,16 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
         >>> analysis = builder.analyze_plan(new_data)
         >>> print(analysis) # doctest: +ELLIPSIS
-            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...], cumulative_cpu=...
-              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...], cumulative_cpu=...
-                ProjectionExec: expr=[_rowid@1 as _rowid, ...], metrics=[...], cumulative_cpu=...
-                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...], cumulative_cpu=...
-                    CoalesceBatchesExec: ..., metrics=[...], cumulative_cpu=...
-                      HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                        CooperativeExec, metrics=[], cumulative_cpu=...
-                          LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
+            MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
+              CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
+                ProjectionExec: elapsed=..., expr=[_rowid@1 as _rowid, ...], metrics=[...]
+                  ProjectionExec: elapsed=..., expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...]
+                    CoalesceBatchesExec: elapsed=..., ..., metrics=[...]
+                      HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                        CooperativeExec, elapsed=..., metrics=[]
+                          LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                         RepartitionExec: ...
-                          StreamingTableExec: ..., metrics=[], ...
+                          StreamingTableExec: ..., metrics=[]
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -588,7 +588,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_branch(
         self,
         branch: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> "LanceDataset":
         """Create a new branch from a version or tag.
@@ -597,10 +597,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         branch: str
             Name of the branch to create.
-        reference: Optional[int | str | Tuple[str, int]]
-            The reference which could be a version_number, a tag name or a tuple of
-            (branch_name, version_number) to create the branch from.
-            If None, the latest version of the current branch is used.
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -616,28 +617,6 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
-        ds._storage_options = self._storage_options
-        ds._default_scan_options = self._default_scan_options
-        ds._read_params = self._read_params
-        return ds
-
-    def checkout_branch(self, branch: str) -> "LanceDataset":
-        """Check out the latest version of a branch.
-
-        Parameters
-        ----------
-        branch: str
-            The branch name to checkout.
-
-        Returns
-        -------
-        LanceDataset
-            A dataset instance at the latest version of the branch.
-        """
-        inner = self._ds.checkout_branch(branch)
-        ds = LanceDataset.__new__(LanceDataset)
-        ds._ds = inner
-        ds._uri = inner.uri
         ds._storage_options = self._storage_options
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
@@ -1640,12 +1619,11 @@ class LanceDataset(pa.dataset.Dataset):
         if ids is not None:
             lance_blob_files = self._ds.take_blobs(ids, blob_column)
         elif addresses is not None:
-            # ROW ids and Row address are the same until stable ROW ID is implemented.
-            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
         elif indices is not None:
             lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
         else:
-            raise ValueError("Either ids or indices must be specified")
+            raise ValueError("Either ids, addresses, or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
@@ -2224,7 +2202,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version: int | str | Tuple[str, int]) -> "LanceDataset":
+    def checkout_version(
+        self, version: int | str | Tuple[Optional[str], Optional[int]]
+    ) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
@@ -2234,9 +2214,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        version: int | str | Tuple[str, int],
-            The version to check out. A version number on main (`int`), a tag
-            (`str`) or a tuple of ('branch_name', 'version_number') can be provided.
+        version: int | str | Tuple[Optional[str], Optional[int]],
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
 
         Returns
         -------
@@ -2284,6 +2266,7 @@ class LanceDataset(pa.dataset.Dataset):
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
         *,
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
@@ -2303,8 +2286,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this will be removed.  If not specified, this
-            will default to two weeks.
+            Only versions older than this will be removed.  If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -2324,10 +2310,14 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
         """
-        if older_than is None:
+        if older_than is None and retain_versions is None:
             older_than = timedelta(days=14)
+
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
         )
 
     def create_scalar_index(
@@ -2338,7 +2328,6 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BITMAP"],
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
-            Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
@@ -2407,7 +2396,7 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
-        * ``FTS/INVERTED``. It is used to index document columns. This index
+        * ``INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
@@ -2427,8 +2416,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
-            ``"INVERTED"`` or ``"BLOOMFILTER"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``, or
+            ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2457,8 +2446,8 @@ class LanceDataset(pa.dataset.Dataset):
             It won't impact the performance of non-phrase queries even if it is set to
             True.
         base_tokenizer: str, default "simple"
-            This is for the ``INVERTED`` index. The base tokenizer to use. The value
-            can be:
+            This is for the ``INVERTED`` index. The base tokenizer to use. The
+            value can be:
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
@@ -2529,7 +2518,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        lance_field = self._ds.lance_schema.field(column)
+        lance_field = self._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
             raise KeyError(f"{column} not found in schema")
 
@@ -2549,7 +2538,7 @@ class LanceDataset(pa.dataset.Dataset):
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        'or "INVERTED" or "BLOOMFILTER" are supported for '
+                        '"INVERTED", or "BLOOMFILTER" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
@@ -2582,7 +2571,7 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED", "FTS"]:
+            elif index_type in ["INVERTED"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
@@ -2797,6 +2786,10 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
+        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
+        type. Providing an accelerator for other index types will fall back to CPU
+        index building.
+
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
@@ -2813,7 +2806,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         # validate args
         for c in column:
-            lance_field = self._ds.lance_schema.field(c)
+            lance_field = self._ds.lance_schema.field_case_insensitive(c)
             if lance_field is None:
                 raise KeyError(f"{c} not found in schema")
             field = lance_field.to_arrow()
@@ -2881,6 +2874,13 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+        if accelerator is not None and index_type != "IVF_PQ":
+            LOGGER.warning(
+                "Index type %s does not support GPU acceleration; falling back to CPU",
+                index_type,
+            )
+            accelerator = None
+
         if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
@@ -3440,8 +3440,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def shallow_clone(
         self,
-        target_path: Union[str, Path],
-        version: Union[int, str, Tuple[int, str]],
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
         storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> "LanceDataset":
@@ -3455,10 +3455,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         target_path : str or Path
             The URI or filesystem path to clone the dataset into.
-        version : int, str or Tuple[int, str]
-            The source version to clone. An integer specifies a version number in main;
-            a string specifies a tag name; a Tuple[int, str] specifies a version number
-            in a specified branch.
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -3476,7 +3477,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, version, storage_options)
+        self._ds.shallow_clone(target_uri, reference, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
@@ -3903,6 +3904,7 @@ class Transaction:
 
 
 class Tag(TypedDict):
+    branch: Optional[str]
     version: int
     manifest_size: int
 
@@ -4687,7 +4689,7 @@ class ScannerBuilder:
     ) -> ScannerBuilder:
         q, q_dim = _coerce_query_vector(q)
 
-        lance_field = self.ds._ds.lance_schema.field(column)
+        lance_field = self.ds._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
             raise ValueError(f"Embedding column {column} is not in the dataset")
 
@@ -5193,7 +5195,11 @@ class Tags:
         """
         return self._ds.tags_ordered(order)
 
-    def create(self, tag: str, version: int, branch: Optional[str] = None) -> None:
+    def create(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ) -> None:
         """
         Create a tag for a given dataset version.
 
@@ -5202,12 +5208,13 @@ class Tags:
         tag: str,
             The name of the tag to create. This name must be unique among all tag
             names for the dataset.
-        version: int,
-            The dataset version to tag.
-        branch: Optional[str],
-            The specified branch to create the tag, None if the specified branch is main
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         """
-        self._ds.create_tag(tag, version, branch)
+        self._ds.create_tag(tag, reference)
 
     def delete(self, tag: str) -> None:
         """
@@ -5221,7 +5228,11 @@ class Tags:
         """
         self._ds.delete_tag(tag)
 
-    def update(self, tag: str, version: int, branch: Optional[str] = None) -> None:
+    def update(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ) -> None:
         """
         Update tag to a new version.
 
@@ -5229,12 +5240,13 @@ class Tags:
         ----------
         tag: str,
             The name of the tag to update.
-        version: int,
-            The new dataset version to tag.
-        branch: Optional[str],
-            The specified branch to create the tag, None if the specified branch is main
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         """
-        self._ds.update_tag(tag, version, branch)
+        self._ds.update_tag(tag, reference)
 
 
 class Branches:

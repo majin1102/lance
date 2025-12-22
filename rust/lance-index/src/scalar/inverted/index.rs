@@ -35,11 +35,8 @@ use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::utils::{
-    mask::RowIdMask,
-    tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
-};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{
     container::list::ExpLinkedList,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -547,7 +544,7 @@ impl ScalarIndex for InvertedIndex {
                     .downcast_ref::<UInt64Array>()
                     .unwrap();
                 let row_ids = row_ids.iter().flatten().collect_vec();
-                Ok(SearchResult::AtMost(RowAddrTreeMap::from_iter(row_ids)))
+                Ok(SearchResult::at_most(RowAddrTreeMap::from_iter(row_ids)))
             }
         }
     }
@@ -789,7 +786,7 @@ impl InvertedPartition {
         &self,
         params: &FtsSearchParams,
         operator: Operator,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         postings: Vec<PostingIterator>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate>> {
@@ -2386,6 +2383,7 @@ pub fn flat_bm25_search(
     query_tokens: &Tokens,
     tokenizer: &mut Box<dyn LanceTokenizer>,
     scorer: &mut MemBM25Scorer,
+    schema: SchemaRef,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
     let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
@@ -2423,7 +2421,7 @@ pub fn flat_bm25_search(
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
         .try_with_column(SCORE_FIELD.clone(), score_col)?
-        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
+        .project_by_schema(&schema)?;
     Ok(batch)
 }
 
@@ -2432,6 +2430,7 @@ pub fn flat_bm25_search_stream(
     doc_col: String,
     query: String,
     index: &Option<InvertedIndex>,
+    schema: SchemaRef,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = match index {
         Some(index) => index.tokenizer(),
@@ -2466,10 +2465,18 @@ pub fn flat_bm25_search_stream(
         None => MemBM25Scorer::new(0, 0, HashMap::new()),
     };
 
+    let batch_schema = schema.clone();
     let stream = input.map(move |batch| {
         let batch = batch?;
 
-        let batch = flat_bm25_search(batch, &doc_col, &tokens, &mut tokenizer, &mut bm25_scorer)?;
+        let batch = flat_bm25_search(
+            batch,
+            &doc_col,
+            &tokens,
+            &mut tokenizer,
+            &mut bm25_scorer,
+            batch_schema.clone(),
+        )?;
 
         // filter out rows with score 0
         let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
@@ -2483,7 +2490,7 @@ pub fn flat_bm25_search_stream(
         Ok(batch)
     });
 
-    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
 }
 
 pub fn is_phrase_query(query: &str) -> bool {

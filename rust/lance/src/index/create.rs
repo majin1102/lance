@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use futures::future::BoxFuture;
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
-use lance_table::format::IndexMetadata;
-use snafu::location;
-use std::{future::IntoFuture, sync::Arc};
-use tracing::instrument;
-use uuid::Uuid;
-
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -23,10 +15,20 @@ use crate::{
     },
     Error, Result,
 };
+use futures::future::BoxFuture;
+use lance_core::datatypes::format_field_path;
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
 };
+use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
+use lance_table::format::IndexMetadata;
+use snafu::location;
+use std::{future::IntoFuture, sync::Arc};
+use tracing::instrument;
+use uuid::Uuid;
+
+use arrow_array::RecordBatchReader;
 
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
@@ -38,6 +40,7 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     index_uuid: Option<String>,
+    preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -57,6 +60,7 @@ impl<'a> CreateIndexBuilder<'a> {
             train: true,
             fragments: None,
             index_uuid: None,
+            preprocessed_data: None,
         }
     }
 
@@ -85,6 +89,14 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    pub fn preprocessed_data(
+        mut self,
+        stream: Box<dyn RecordBatchReader + Send + 'static>,
+    ) -> Self {
+        self.preprocessed_data = Some(stream);
+        self
+    }
+
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
         if self.columns.len() != 1 {
@@ -93,13 +105,21 @@ impl<'a> CreateIndexBuilder<'a> {
                 location: location!(),
             });
         }
-        let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
+        let column_input = &self.columns[0];
+        // Use case-insensitive lookup for both simple and nested paths.
+        // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
             return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
+                message: format!("CreateIndex: column '{column_input}' does not exist"),
                 location: location!(),
             });
         };
+        let field = *field_path.last().unwrap();
+        // Reconstruct the column path with correct case from schema
+        // Use quoted format for SQL parsing (special chars are quoted)
+        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+        let quoted_column: String = format_field_path(&names);
+        let column = quoted_column.as_str();
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
@@ -154,6 +174,10 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
+                assert!(
+                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
+                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
+                );
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
@@ -176,6 +200,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     base_params
                 };
 
+                let preprocesssed_data = self
+                    .preprocessed_data
+                    .take()
+                    .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
                 build_scalar_index(
                     self.dataset,
                     column,
@@ -183,6 +211,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     &params,
                     train,
                     self.fragments.clone(),
+                    preprocesssed_data,
                 )
                 .await?
             }
@@ -203,6 +232,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     params,
                     train,
                     self.fragments.clone(),
+                    None,
                 )
                 .await?
             }
@@ -226,10 +256,20 @@ impl<'a> CreateIndexBuilder<'a> {
                     &params,
                     train,
                     self.fragments.clone(),
+                    None,
                 )
                 .await?
             }
-            (IndexType::Vector, LANCE_VECTOR_INDEX) => {
+            (
+                IndexType::Vector
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfFlat
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq,
+                LANCE_VECTOR_INDEX,
+            ) => {
                 // Vector index params.
                 let vec_params = self
                     .params
