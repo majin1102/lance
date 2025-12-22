@@ -1332,23 +1332,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_does_not_decrease_max_fragment_id() {
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-
-        // Write initial version.
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
 
         // Append a few times to advance max_fragment_id and create newer versions.
         for _ in 0..2 {
