@@ -1339,22 +1339,10 @@ mod tests {
 
         // Append a few times to advance max_fragment_id and create newer versions.
         for _ in 0..2 {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
-            )
-            .unwrap();
-            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-            dataset = Dataset::write(
-                reader,
-                test_uri,
-                Some(WriteParams {
-                    mode: WriteMode::Append,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
+            let reader = gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+            dataset.append(reader, None).await.unwrap();
         }
 
         let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
