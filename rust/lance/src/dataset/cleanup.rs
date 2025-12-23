@@ -60,7 +60,6 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use tracing::{debug, info, instrument, Span};
-
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
@@ -990,7 +989,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
@@ -1011,10 +1010,11 @@ mod tests {
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
+    use arrow::compute;
     use lance_core::utils::tempfile::TempStrDir;
 
     #[derive(Debug)]
-    struct MockObjectStore {
+    pub struct MockObjectStore {
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
@@ -1116,7 +1116,7 @@ mod tests {
                     ..Default::default()
                 }),
             )
-            .await?;
+                .await?;
             Ok(())
         }
 
@@ -1171,7 +1171,7 @@ mod tests {
                 &*index_params,
                 false,
             )
-            .await?;
+                .await?;
             Ok(())
         }
 
@@ -1221,7 +1221,7 @@ mod tests {
                     .before_timestamp(before)
                     .build(),
             )
-            .await
+                .await
         }
 
         async fn run_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<RemovalStats> {
@@ -1244,7 +1244,7 @@ mod tests {
                     .error_if_tagged_old_versions(error_if_tagged_old_versions.unwrap_or(true))
                     .build(),
             )
-            .await
+                .await
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
@@ -1321,7 +1321,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1])), blobs.finish().unwrap()],
         )
-        .unwrap();
+            .unwrap();
 
         Box::new(RecordBatchIterator::new(
             vec![Ok(batch)].into_iter(),
@@ -1385,8 +1385,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         assert_gt!(fixture.count_blob_files().await.unwrap(), 0);
 
         // Second version: overwrite with an inline blob (no sidecar).
@@ -1401,8 +1401,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // Advance time so the unverified threshold doesn't interfere.
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
@@ -1430,8 +1430,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         Dataset::write(
             blob_v2_batch(1024),
@@ -1444,8 +1444,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // Old version is verified (referenced by an old manifest) even though the files are
         // recent; cleanup should remove them without waiting 7 days.
@@ -1627,7 +1627,7 @@ mod tests {
         let cleanup_older_than = TimeDelta::from_std(
             parse_duration(dataset_config.get("lance.auto_cleanup.older_than").unwrap()).unwrap(),
         )
-        .unwrap();
+            .unwrap();
 
         // Helper function to check that the number of files is correct.
         async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize) {
@@ -2117,26 +2117,6 @@ mod tests {
         assert!(os.exists(&misc).await.unwrap());
         assert!(os.exists(&branch_file).await.unwrap());
     }
-}
-
-#[cfg(test)]
-mod lineage_tests {
-    use crate::dataset::cleanup::{
-        cleanup_old_versions, CleanupPolicy, CleanupPolicyBuilder, RemovalStats,
-    };
-    use crate::dataset::{WriteMode, WriteParams};
-    use crate::Dataset;
-    use crate::Result;
-    use arrow::compute;
-    use arrow_array::UInt64Array;
-    use chrono::TimeDelta;
-    use lance_core::utils::tempfile::TempStrDir;
-    use lance_index::DatasetIndexExt;
-    use lance_io::object_store::ObjectStore;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use mock_instant::thread_local::MockClock;
-    use object_store::path::Path;
-    use std::sync::Arc;
 
     // Lineage overview with annotated base versions:
     // - branch1 is created from main@v1
@@ -2163,8 +2143,6 @@ mod lineage_tests {
     // Important: auto_cleanup_hook uses policy derived from manifest config; it does not flip
     // clean_referenced_branches unless tests call cleanup_old_versions with a custom policy.
     struct LineageSetup {
-        #[allow(dead_code)]
-        base_dir: TempStrDir,
         main: DatasetWithCounts,
         branch1: DatasetWithCounts,
         branch2: DatasetWithCounts,
@@ -2214,13 +2192,18 @@ mod lineage_tests {
 
     // Build the lineage and configure per-branch auto-cleanup to retain latest version.
     async fn build_lineage_datasets() -> Result<LineageSetup> {
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         let base_dir = TempStrDir::default();
         let base_uri = format!("{}/lineage_ds", base_dir.as_str());
         // Add a text column so we can build a full-text index per branch/main.
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(IncrementingInt32::new().named("id".to_owned())))
             .col(Box::new(IncrementingUtf8::new().prefix("t").named("text")));
+
+        let mock_store = Arc::new(MockObjectStore::new());
+        let store_params = ObjectStoreParams {
+            object_store_wrapper: Some(mock_store.clone()),
+            ..Default::default()
+        };
 
         // Create main (initial write)
         let main_ds = Dataset::write(
@@ -2231,7 +2214,7 @@ mod lineage_tests {
                 ..Default::default()
             }),
         )
-        .await?;
+            .await?;
         let mut main = DatasetWithCounts::new(main_ds);
         // Initial index creation and refresh counts
         main.create_text_index().await?;
@@ -2240,7 +2223,7 @@ mod lineage_tests {
         // Create branch1 from main@v1, then do an initial append + deterministic delete
         let branch1_ds = main
             .dataset
-            .create_branch("branch1", (None, None), None)
+            .create_branch("branch1", (None, None), Some(store_params.clone()))
             .await?;
         let mut branch1 = DatasetWithCounts::new(branch1_ds);
         branch1.write_data().await?;
@@ -2248,7 +2231,7 @@ mod lineage_tests {
         // Create branch2 from branch1@latest
         let branch2_ds = branch1
             .dataset
-            .create_branch("dev/branch2", ("branch1", None), None)
+            .create_branch("dev/branch2", ("branch1", None), Some(store_params.clone()))
             .await?;
         let mut branch2 = DatasetWithCounts::new(branch2_ds);
         branch2.write_data().await?;
@@ -2256,7 +2239,7 @@ mod lineage_tests {
         // Create branch3 from branch2@latest, initial append + delete
         let branch3_ds = branch2
             .dataset
-            .create_branch("feature/nathan/branch3", ("dev/branch2", None), None)
+            .create_branch("feature/nathan/branch3", ("dev/branch2", None), Some(store_params.clone()))
             .await?;
         let mut branch3 = DatasetWithCounts::new(branch3_ds);
         branch3.write_data().await?;
@@ -2265,13 +2248,12 @@ mod lineage_tests {
         main.write_data().await?;
         let branch4_ds = main
             .dataset
-            .create_branch("branch4", (None, None), None)
+            .create_branch("branch4", (None, None), Some(store_params.clone()))
             .await?;
         let mut branch4 = DatasetWithCounts::new(branch4_ds);
         branch4.write_data().await?;
 
         let mut lineage = LineageSetup {
-            base_dir,
             main,
             branch1,
             branch2,
