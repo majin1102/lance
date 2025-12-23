@@ -52,7 +52,6 @@ use lance_table::{
     },
 };
 use object_store::path::Path;
-use snafu::location;
 use object_store::{Error as ObjectStoreError, ObjectMeta};
 use std::fmt::Debug;
 use std::{
@@ -63,6 +62,7 @@ use std::{
 use tracing::{debug, info, instrument, Span};
 
 use super::refs::TagContents;
+use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
@@ -615,10 +615,9 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<RemovalStats> {
         let mut final_stats = RemovalStats::default();
         for (branch, _) in referenced_branches {
-            let branch_name = branch.clone();
             let branch_dataset = self
                 .dataset
-                .checkout_version((Some(branch_name), None))
+                .checkout_version((branch.as_str(), None))
                 .await?;
             if let Some(stats) =
                 cleanup_cascade_branch(&branch_dataset, branch_dataset.manifest.as_ref()).await?
@@ -640,7 +639,7 @@ impl<'a> CleanupTask<'a> {
         for (branch, root_version_number) in referenced_branches {
             let branch = self
                 .dataset
-                .checkout_version((Some(branch.clone()), None))
+                .checkout_version((branch.as_str(), None))
                 .await?;
             branch
                 .commit_handler

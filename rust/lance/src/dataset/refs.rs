@@ -772,18 +772,17 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
 }
 
-pub fn standardize_branch(branch: Option<&str>) -> Option<String> {
+pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
     match branch {
-        None => None,
-        Some("main") => None,
-        Some(name) => Some(name.to_string()),
+        None => MAIN_BRANCH.to_string(),
+        Some(name) => name.to_string(),
     }
 }
 
-pub fn normalize_branch(branch: Option<&str>) -> String {
+pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
     match branch {
-        None => "main".to_string(),
-        Some(name) => name.to_string(),
+        MAIN_BRANCH => None,
+        name => Some(name.to_string()),
     }
 }
 
