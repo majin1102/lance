@@ -33,6 +33,9 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+use super::refs::TagContents;
+use crate::dataset::TRANSACTIONS_DIR;
+use crate::{utils::temporal::utc_now, Dataset};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use humantime::parse_duration;
@@ -60,9 +63,6 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use tracing::{debug, info, instrument, Span};
-use super::refs::TagContents;
-use crate::dataset::TRANSACTIONS_DIR;
-use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -989,7 +989,9 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_array::{
+        Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
@@ -1116,7 +1118,7 @@ mod tests {
                     ..Default::default()
                 }),
             )
-                .await?;
+            .await?;
             Ok(())
         }
 
@@ -1171,7 +1173,7 @@ mod tests {
                 &*index_params,
                 false,
             )
-                .await?;
+            .await?;
             Ok(())
         }
 
@@ -1221,7 +1223,7 @@ mod tests {
                     .before_timestamp(before)
                     .build(),
             )
-                .await
+            .await
         }
 
         async fn run_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<RemovalStats> {
@@ -1244,7 +1246,7 @@ mod tests {
                     .error_if_tagged_old_versions(error_if_tagged_old_versions.unwrap_or(true))
                     .build(),
             )
-                .await
+            .await
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
@@ -1321,7 +1323,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1])), blobs.finish().unwrap()],
         )
-            .unwrap();
+        .unwrap();
 
         Box::new(RecordBatchIterator::new(
             vec![Ok(batch)].into_iter(),
@@ -1385,8 +1387,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert_gt!(fixture.count_blob_files().await.unwrap(), 0);
 
         // Second version: overwrite with an inline blob (no sidecar).
@@ -1401,8 +1403,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Advance time so the unverified threshold doesn't interfere.
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
@@ -1430,8 +1432,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         Dataset::write(
             blob_v2_batch(1024),
@@ -1444,8 +1446,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Old version is verified (referenced by an old manifest) even though the files are
         // recent; cleanup should remove them without waiting 7 days.
@@ -1627,7 +1629,7 @@ mod tests {
         let cleanup_older_than = TimeDelta::from_std(
             parse_duration(dataset_config.get("lance.auto_cleanup.older_than").unwrap()).unwrap(),
         )
-            .unwrap();
+        .unwrap();
 
         // Helper function to check that the number of files is correct.
         async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize) {
@@ -2214,7 +2216,7 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await?;
+        .await?;
         let mut main = DatasetWithCounts::new(main_ds);
         // Initial index creation and refresh counts
         main.create_text_index().await?;
@@ -2239,7 +2241,11 @@ mod tests {
         // Create branch3 from branch2@latest, initial append + delete
         let branch3_ds = branch2
             .dataset
-            .create_branch("feature/nathan/branch3", ("dev/branch2", None), Some(store_params.clone()))
+            .create_branch(
+                "feature/nathan/branch3",
+                ("dev/branch2", None),
+                Some(store_params.clone()),
+            )
             .await?;
         let mut branch3 = DatasetWithCounts::new(branch3_ds);
         branch3.write_data().await?;
