@@ -1460,7 +1460,11 @@ mod tests {
             "lance.auto_cleanup.retain_versions".to_string(),
             Some("1".to_string()),
         );
-        dataset.update_config(config_updates).replace().await.unwrap();
+        dataset
+            .update_config(config_updates)
+            .replace()
+            .await
+            .unwrap();
 
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
@@ -1470,7 +1474,6 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         check_num_files(&fixture, 2).await;
     }
-
 
     #[tokio::test]
     async fn cleanup_recent_verified_files() {
