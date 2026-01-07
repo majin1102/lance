@@ -18,6 +18,8 @@ import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
+import org.lance.index.IndexCriteria;
+import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
@@ -1057,6 +1059,41 @@ public class Dataset implements Closeable {
   }
 
   private native List<Index> nativeGetIndexes();
+
+  /**
+   * Get statistics for a specific index in JSON form.
+   *
+   * <p>The JSON structure matches the Rust/Python index_statistics API.
+   *
+   * @param indexName the name of the index
+   * @return JSON string with index statistics
+   */
+  public String getIndexStatistics(String indexName) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetIndexStatistics(indexName);
+    }
+  }
+
+  private native String nativeGetIndexStatistics(String indexName);
+
+  /**
+   * Describe indices on this dataset filtered by criteria.
+   *
+   * @param criteria filter options such as column, name or index capabilities
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices(IndexCriteria criteria) {
+    Preconditions.checkNotNull(criteria, "criteria cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(criteria);
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndices(IndexCriteria criteria);
 
   /**
    * Get the table config of the dataset.
