@@ -23,14 +23,14 @@ import java.util.Optional;
  */
 public final class IndexCriteria {
 
-  private final String forColumn;
-  private final String hasName;
+  private final Optional<String> forColumn;
+  private final Optional<String> hasName;
   private final boolean mustSupportFts;
   private final boolean mustSupportExactEquality;
 
   private IndexCriteria(Builder builder) {
-    this.forColumn = builder.forColumn;
-    this.hasName = builder.hasName;
+    this.forColumn = Optional.ofNullable(builder.forColumn);
+    this.hasName = Optional.ofNullable(builder.hasName);
     this.mustSupportFts = builder.mustSupportFts;
     this.mustSupportExactEquality = builder.mustSupportExactEquality;
   }
@@ -41,12 +41,12 @@ public final class IndexCriteria {
    * <p>If present, only indices built on this column (and only this column) will be considered.
    */
   public Optional<String> getForColumn() {
-    return Optional.ofNullable(forColumn);
+    return forColumn;
   }
 
   /** Optional index name to restrict indices to. */
   public Optional<String> getHasName() {
-    return Optional.ofNullable(hasName);
+    return hasName;
   }
 
   /** If true, only indices that support full-text search will be considered. */

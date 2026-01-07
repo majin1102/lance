@@ -35,6 +35,7 @@ import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -1068,12 +1069,13 @@ public class Dataset implements Closeable {
    * @param indexName the name of the index
    * @return JSON string with index statistics
    */
-  public String getIndexStatistics(String indexName) {
+  public Map<String, Object> getIndexStatistics(String indexName) {
     Preconditions.checkArgument(
         indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeGetIndexStatistics(indexName);
+      String jsonDesc = nativeGetIndexStatistics(indexName);
+      return JsonUtils.fromJson(jsonDesc);
     }
   }
 
@@ -1089,11 +1091,23 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(criteria, "criteria cannot be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeDescribeIndices(criteria);
+      return nativeDescribeIndices(Optional.of(criteria));
     }
   }
 
-  private native List<IndexDescription> nativeDescribeIndices(IndexCriteria criteria);
+  /**
+   * Describe all indices on this dataset.
+   *
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
 
   /**
    * Get the table config of the dataset.

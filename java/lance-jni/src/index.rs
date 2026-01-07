@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::error::Result;
-use crate::traits::{export_vec, IntoJava, JLance};
+use crate::traits::{export_vec, IntoJava};
 use jni::objects::{JObject, JValue};
 use jni::sys::jbyte;
 use jni::JNIEnv;
@@ -14,8 +14,20 @@ use std::sync::Arc;
 
 impl IntoJava for &Arc<dyn IndexDescription> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let field_ids: Vec<i32> = self.field_ids().iter().map(|&x| x as i32).collect();
-        let field_ids_list = JLance(field_ids).into_java(env)?;
+        let field_ids_list = {
+            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for id in self.field_ids() {
+                let int_obj =
+                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(*id as i32)])?;
+                env.call_method(
+                    &array_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&int_obj)],
+                )?;
+            }
+            array_list
+        };
         let name = env.new_string(self.name())?;
         let type_url = env.new_string(self.type_url())?;
         let index_type = env.new_string(self.index_type())?;
