@@ -140,6 +140,14 @@ public class JNITest {
   }
 
   @Test
+  public void testIvfRqIndexParams() {
+    JniTestHelper.parseIndexParams(
+        IndexParams.builder()
+            .setVectorIndexParams(VectorIndexParams.ivfRq(10, (short) 1, DistanceType.L2))
+            .build());
+  }
+
+  @Test
   public void testInvalidCombinationPqAndSq() {
     IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(10).build();
     PQBuildParams pq = new PQBuildParams.Builder().build();

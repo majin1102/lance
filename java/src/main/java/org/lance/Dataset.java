@@ -791,7 +791,7 @@ public class Dataset implements Closeable {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       nativeCreateIndex(
           options.getColumns(),
-          options.getIndexType().ordinal(),
+          options.getIndexType().getValue(),
           options.getIndexName(),
           options.getIndexParams(),
           options.isReplace(),
