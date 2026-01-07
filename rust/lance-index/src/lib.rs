@@ -195,7 +195,7 @@ impl TryFrom<&str> for IndexType {
             "Bitmap" | "BITMAP" => Ok(Self::Bitmap),
             "LabelList" | "LABELLIST" => Ok(Self::LabelList),
             "Inverted" | "INVERTED" => Ok(Self::Inverted),
-            "NGram" | "NGRAM"=> Ok(Self::NGram),
+            "NGram" | "NGRAM" => Ok(Self::NGram),
             "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
             "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
