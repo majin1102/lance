@@ -296,6 +296,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfPq
                 | IndexType::IvfSq
                 | IndexType::IvfFlat
+                | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq,

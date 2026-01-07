@@ -26,6 +26,7 @@ public class VectorIndexParams {
   private final Optional<PQBuildParams> pqParams;
   private final Optional<HnswBuildParams> hnswParams;
   private final Optional<SQBuildParams> sqParams;
+  private final Optional<RQBuildParams> rqParams;
 
   private VectorIndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
@@ -33,6 +34,7 @@ public class VectorIndexParams {
     this.pqParams = builder.pqParams;
     this.hnswParams = builder.hnswParams;
     this.sqParams = builder.sqParams;
+    this.rqParams = builder.rqParams;
     validate();
   }
 
@@ -101,6 +103,35 @@ public class VectorIndexParams {
   }
 
   /**
+   * Create a new IVF index with RQ quantizer.
+   *
+   * @param numPartitions the number of partitions of IVF (Inverted File Index)
+   * @param numBits number of bits per dimension used by Rabit quantization
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @return the VectorIndexParams
+   */
+  public static VectorIndexParams ivfRq(
+      int numPartitions, short numBits, DistanceType distanceType) {
+    IvfBuildParams ivfParams = new IvfBuildParams.Builder().setNumPartitions(numPartitions).build();
+    RQBuildParams rqParams = new RQBuildParams.Builder().setNumBits(numBits).build();
+
+    return new Builder(ivfParams).setDistanceType(distanceType).setRqParams(rqParams).build();
+  }
+
+  /**
+   * Create a new IVF index with RQ quantizer.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param ivf the IVF build parameters
+   * @param rq the RQ build parameters
+   * @return the VectorIndexParams
+   */
+  public static VectorIndexParams withIvfRqParams(
+      DistanceType distanceType, IvfBuildParams ivf, RQBuildParams rq) {
+    return new Builder(ivf).setDistanceType(distanceType).setRqParams(rq).build();
+  }
+
+  /**
    * Create a new IVF HNSW index with PQ quantizer. The dataset is partitioned into IVF partitions,
    * and each partition builds an HNSW graph.
    *
@@ -144,6 +175,7 @@ public class VectorIndexParams {
     private Optional<PQBuildParams> pqParams = Optional.empty();
     private Optional<HnswBuildParams> hnswParams = Optional.empty();
     private Optional<SQBuildParams> sqParams = Optional.empty();
+    private Optional<RQBuildParams> rqParams = Optional.empty();
 
     /**
      * Create a new builder to create a vector index.
@@ -191,6 +223,15 @@ public class VectorIndexParams {
       return this;
     }
 
+    /**
+     * @param rqParams the RQ quantizer build parameters
+     * @return Builder
+     */
+    public Builder setRqParams(RQBuildParams rqParams) {
+      this.rqParams = Optional.of(rqParams);
+      return this;
+    }
+
     public VectorIndexParams build() {
       return new VectorIndexParams(this);
     }
@@ -220,6 +261,10 @@ public class VectorIndexParams {
     return sqParams;
   }
 
+  public Optional<RQBuildParams> getRqParams() {
+    return rqParams;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -228,6 +273,7 @@ public class VectorIndexParams {
         .add("pqParams", pqParams.orElse(null))
         .add("hnswParams", hnswParams.orElse(null))
         .add("sqParams", sqParams.orElse(null))
+        .add("rqParams", rqParams.orElse(null))
         .toString();
   }
 }
