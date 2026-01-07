@@ -4118,6 +4118,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "smallvec",
  "snafu",
  "tantivy",
  "tempfile",
