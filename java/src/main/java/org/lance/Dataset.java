@@ -1033,11 +1033,23 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(criteria, "criteria cannot be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeDescribeIndices(criteria);
+      return nativeDescribeIndices(Optional.of(criteria));
     }
   }
 
-  private native List<IndexDescription> nativeDescribeIndices(IndexCriteria criteria);
+  /**
+   * Describe all indices on this dataset.
+   *
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
 
   /**
    * Get the table config of the dataset.
