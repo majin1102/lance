@@ -5159,6 +5159,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-namespace-datafusion"
+version = "2.0.0-beta.4"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "dashmap",
+ "datafusion",
+ "datafusion-sql",
+ "lance",
+ "lance-namespace",
+ "lance-namespace-impls",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lance-namespace-impls"
 version = "2.0.0-beta.4"
 dependencies = [
