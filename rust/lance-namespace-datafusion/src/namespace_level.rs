@@ -12,31 +12,31 @@ const DEFAULT_CATALOG_NAME: &str = "lance";
 
 /// Lightweight wrapper around a Lance namespace handle and identifier.
 #[derive(Debug, Clone)]
-pub struct Namespace {
+pub struct NamespaceLevel {
     root: Arc<dyn LanceNamespace>,
     /// Full namespace identifier, e.g. [catalog, schema].
     namespace_id: Option<Vec<String>>,
 }
 
-impl From<Arc<dyn LanceNamespace>> for Namespace {
+impl From<Arc<dyn LanceNamespace>> for NamespaceLevel {
     fn from(lance_namespace: Arc<dyn LanceNamespace>) -> Self {
         Self::from_root(Arc::clone(&lance_namespace))
     }
 }
 
-impl From<(Arc<dyn LanceNamespace>, String)> for Namespace {
+impl From<(Arc<dyn LanceNamespace>, String)> for NamespaceLevel {
     fn from(lance_namespace: (Arc<dyn LanceNamespace>, String)) -> Self {
         Self::from_namespace(Arc::clone(&lance_namespace.0), vec![lance_namespace.1])
     }
 }
 
-impl From<(Arc<dyn LanceNamespace>, Vec<String>)> for Namespace {
+impl From<(Arc<dyn LanceNamespace>, Vec<String>)> for NamespaceLevel {
     fn from(lance_namespace: (Arc<dyn LanceNamespace>, Vec<String>)) -> Self {
         Self::from_namespace(Arc::clone(&lance_namespace.0), lance_namespace.1)
     }
 }
 
-impl Namespace {
+impl NamespaceLevel {
     /// Construct a namespace rooted at the top-level Lance namespace.
     pub fn from_root(root: Arc<dyn LanceNamespace>) -> Self {
         Self {

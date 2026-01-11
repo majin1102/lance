@@ -11,7 +11,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use lance_namespace::models::CreateNamespaceRequest;
 use lance_namespace::LanceNamespace;
-use lance_namespace_datafusion::{Namespace, SessionBuilder};
+use lance_namespace_datafusion::{NamespaceLevel, SessionBuilder};
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tempfile::TempDir;
 
@@ -251,10 +251,10 @@ async fn setup_test_context() -> DFResult<Context> {
     let extra_ns: Arc<dyn LanceNamespace> = Arc::new(extra_dir_ns);
 
     let ctx = SessionBuilder::new()
-        .with_root(Namespace::from_root(Arc::clone(&root_ns)))
+        .with_root(NamespaceLevel::from_root(Arc::clone(&root_ns)))
         .add_catalog(
             "crm",
-            Namespace::from_namespace(Arc::clone(&extra_ns), vec!["crm".to_string()]),
+            NamespaceLevel::from_namespace(Arc::clone(&extra_ns), vec!["crm".to_string()]),
         )
         .build()
         .await?;

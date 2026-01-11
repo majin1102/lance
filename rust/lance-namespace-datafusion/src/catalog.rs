@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
 use datafusion::error::Result;
 
-use crate::namespace::Namespace;
+use crate::namespace_level::NamespaceLevel;
 use crate::schema::LanceSchemaProvider;
 
 /// A dynamic [`CatalogProviderList`] that maps Lance namespaces to catalogs.
@@ -23,13 +23,16 @@ use crate::schema::LanceSchemaProvider;
 pub struct LanceCatalogProviderList {
     /// Root Lance namespace used to resolve catalogs / schemas / tables.
     #[allow(dead_code)]
-    namespace: Namespace,
+    ns_level: NamespaceLevel,
     /// Catalogs that have been loaded from the root namespace.
+    ///
+    /// Note: The values in this map may become stale over time, as there is currently
+    /// no mechanism to automatically refresh or invalidate cached catalog providers.
     catalogs: DashMap<String, Arc<dyn CatalogProvider>>,
 }
 
 impl LanceCatalogProviderList {
-    pub async fn try_new(namespace: Namespace) -> Result<Self> {
+    pub async fn try_new(namespace: NamespaceLevel) -> Result<Self> {
         let catalogs = DashMap::new();
         for child_namespace in namespace.children().await? {
             let catalog_name = child_namespace.name().to_string();
@@ -38,7 +41,7 @@ impl LanceCatalogProviderList {
         }
 
         Ok(Self {
-            namespace,
+            ns_level: namespace,
             catalogs,
         })
     }
@@ -80,12 +83,14 @@ impl CatalogProviderList for LanceCatalogProviderList {
 #[derive(Debug, Clone)]
 pub struct LanceCatalogProvider {
     #[allow(dead_code)]
-    namespace: Namespace,
+    ns_level: NamespaceLevel,
+    /// Note: The values in this map may become stale over time, as there is currently
+    /// no mechanism to automatically refresh or invalidate cached schema providers.
     schemas: DashMap<String, Arc<dyn SchemaProvider>>,
 }
 
 impl LanceCatalogProvider {
-    pub async fn try_new(namespace: Namespace) -> Result<Self> {
+    pub async fn try_new(namespace: NamespaceLevel) -> Result<Self> {
         let schemas = DashMap::new();
         for child_namespace in namespace.children().await? {
             let schema_name = child_namespace.name().to_string();
@@ -93,7 +98,10 @@ impl LanceCatalogProvider {
             schemas.insert(schema_name, schema_provider as Arc<dyn SchemaProvider>);
         }
 
-        Ok(Self { namespace, schemas })
+        Ok(Self {
+            ns_level: namespace,
+            schemas,
+        })
     }
 }
 

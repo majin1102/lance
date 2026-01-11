@@ -3,7 +3,7 @@
 
 //! DataFusion `SchemaProvider` backed by a Lance namespace.
 //!
-//! This provider resolves tables on demand from a Lance [`Namespace`]
+//! This provider resolves tables on demand from a Lance [`NamespaceLevel`]
 //! and caches `LanceTableProvider` instances per table name. It focuses
 //! on read-only access; DML is handled elsewhere.
 
@@ -17,24 +17,24 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 
 use crate::error::to_datafusion_error;
-use crate::namespace::Namespace;
+use crate::namespace_level::NamespaceLevel;
 use lance::datafusion::LanceTableProvider;
 
-/// Dynamic [`SchemaProvider`] backed directly by a [`Namespace`].
+/// Dynamic [`SchemaProvider`] backed directly by a [`NamespaceLevel`].
 ///
 /// * `table(name)` calls `DatasetBuilder::from_namespace` via
-///   [`Namespace::load_dataset`] and builds a fresh
+///   [`NamespaceLevel::load_dataset`] and builds a fresh
 ///   [`LanceTableProvider`], caching it by table name.
 #[derive(Debug, Clone)]
 pub struct LanceSchemaProvider {
-    namespace: Namespace,
+    ns_level: NamespaceLevel,
     tables: DashMap<String, Arc<LanceTableProvider>>,
 }
 
 impl LanceSchemaProvider {
-    pub async fn try_new(namespace: Namespace) -> Result<Self> {
+    pub async fn try_new(namespace: NamespaceLevel) -> Result<Self> {
         Ok(Self {
-            namespace,
+            ns_level: namespace,
             tables: DashMap::new(),
         })
     }
@@ -44,7 +44,7 @@ impl LanceSchemaProvider {
         table_name: &str,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         let dataset = self
-            .namespace
+            .ns_level
             .load_dataset(table_name)
             .await
             .map_err(to_datafusion_error)?;

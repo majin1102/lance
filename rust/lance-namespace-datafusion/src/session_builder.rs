@@ -15,7 +15,7 @@ use datafusion::error::Result;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 
 use crate::catalog::LanceCatalogProviderList;
-use crate::namespace::Namespace;
+use crate::namespace_level::NamespaceLevel;
 use crate::LanceCatalogProvider;
 
 /// Builder for configuring a `SessionContext` with Lance namespaces.
@@ -23,9 +23,9 @@ use crate::LanceCatalogProvider;
 pub struct SessionBuilder {
     /// Optional root namespace exposed via a dynamic
     /// `LanceCatalogProviderList`.
-    root: Option<Namespace>,
+    root: Option<NamespaceLevel>,
     /// Explicit catalogs to register by name.
-    catalogs: Vec<(String, Namespace)>,
+    catalogs: Vec<(String, NamespaceLevel)>,
     /// Optional DataFusion session configuration.
     config: Option<SessionConfig>,
 }
@@ -38,7 +38,7 @@ impl SessionBuilder {
 
     /// Attach a root `LanceNamespace` that is exposed as a dynamic
     /// catalog list via `LanceCatalogProviderList`.
-    pub fn with_root(mut self, ns: Namespace) -> Self {
+    pub fn with_root(mut self, ns: NamespaceLevel) -> Self {
         self.root = Some(ns);
         self
     }
@@ -48,7 +48,7 @@ impl SessionBuilder {
     /// The catalog is identified by `name` and can later be combined
     /// with schemas via `SessionBuilder::add_schema` using the same
     /// namespace.
-    pub fn add_catalog(mut self, name: &str, ns: Namespace) -> Self {
+    pub fn add_catalog(mut self, name: &str, ns: NamespaceLevel) -> Self {
         self.catalogs.push((name.to_string(), ns));
         self
     }
