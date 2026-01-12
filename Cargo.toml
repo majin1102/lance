@@ -69,17 +69,17 @@ lance-test-macros = { version = "=2.0.0-beta.6", path = "./rust/lance-test-macro
 lance-testing = { version = "=2.0.0-beta.6", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "57.0.0", optional = false, features = ["prettyprint"] }
-arrow-arith = "57.0.0"
-arrow-array = "57.0.0"
-arrow-buffer = "57.0.0"
-arrow-cast = "57.0.0"
-arrow-data = "57.0.0"
-arrow-ipc = { version = "57.0.0", features = ["zstd"] }
-arrow-ord = "57.0.0"
-arrow-row = "57.0.0"
-arrow-schema = "57.0.0"
-arrow-select = "57.0.0"
+arrow = { version = "=57.1.0", optional = false, features = ["prettyprint"] }
+arrow-arith = "=57.1.0"
+arrow-array = "=57.1.0"
+arrow-buffer = "=57.1.0"
+arrow-cast = "=57.1.0"
+arrow-data = "=57.1.0"
+arrow-ipc = { version = "=57.1.0", features = ["zstd"] }
+arrow-ord = "=57.1.0"
+arrow-row = "=57.1.0"
+arrow-schema = "=57.1.0"
+arrow-select = "=57.1.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 axum = "0.7"
