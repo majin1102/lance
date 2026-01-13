@@ -13,6 +13,8 @@ use datafusion::error::Result;
 
 use crate::namespace_level::NamespaceLevel;
 use crate::schema::LanceSchemaProvider;
+#[allow(unused_imports)]
+use crate::SessionBuilder;
 
 /// A dynamic [`CatalogProviderList`] that maps Lance namespaces to catalogs.
 ///
