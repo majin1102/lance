@@ -16,9 +16,9 @@ use crate::schema::LanceSchemaProvider;
 
 /// A dynamic [`CatalogProviderList`] that maps Lance namespaces to catalogs.
 ///
-/// Top-level namespaces (e.g. `ListNamespacesRequest { id: Some(vec![]) }`)
-/// are exposed as catalog names. Child namespaces under a given catalog are
-/// exposed as schemas via [`LanceCatalogProvider`].
+/// The underlying namespace must be a four-level namespace. It is explicitly configured
+/// via [`SessionBuilder::with_root`], and each child namespace under this root is
+/// automatically registered as a [`LanceCatalogProvider`].
 #[derive(Debug, Clone)]
 pub struct LanceCatalogProviderList {
     /// Root Lance namespace used to resolve catalogs / schemas / tables.
@@ -78,8 +78,13 @@ impl CatalogProviderList for LanceCatalogProviderList {
     }
 }
 
-/// Dynamic [`CatalogProvider`] that views child namespaces under a single
-/// top-level namespace as schemas.
+/// A dynamic [`CatalogProvider`] that exposes the immediate child namespaces
+/// of a Lance namespace as database schemas.
+///
+/// The underlying namespace must be a three-level namespace. It is either explicitly
+/// registered via [`SessionBuilder::add_catalog`], or automatically created as part of
+/// the catalog hierarchy when [`SessionBuilder::with_root`] is used.
+/// Child namespaces are automatically loaded as [`LanceSchemaProvider`] instances.
 #[derive(Debug, Clone)]
 pub struct LanceCatalogProvider {
     #[allow(dead_code)]

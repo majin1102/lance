@@ -20,11 +20,10 @@ use crate::error::to_datafusion_error;
 use crate::namespace_level::NamespaceLevel;
 use lance::datafusion::LanceTableProvider;
 
-/// Dynamic [`SchemaProvider`] backed directly by a [`NamespaceLevel`].
+/// A dynamic [`SchemaProvider`] backed directly by a [`NamespaceLevel`].
 ///
-/// * `table(name)` calls `DatasetBuilder::from_namespace` via
-///   [`NamespaceLevel::load_dataset`] and builds a fresh
-///   [`LanceTableProvider`], caching it by table name.
+/// Exposes Lance tables in the namespace as [`LanceTableProvider`] instances,
+/// loaded on demand and cached by table name.
 #[derive(Debug, Clone)]
 pub struct LanceSchemaProvider {
     ns_level: NamespaceLevel,
