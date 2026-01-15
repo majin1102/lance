@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! DataFusion `SchemaProvider` backed by a Lance namespace.
-//!
-//! This provider resolves tables on demand from a Lance [`NamespaceLevel`]
-//! and caches `LanceTableProvider` instances per table name. It focuses
-//! on read-only access; DML is handled elsewhere.
-
 use std::any::Any;
 use std::sync::Arc;
 

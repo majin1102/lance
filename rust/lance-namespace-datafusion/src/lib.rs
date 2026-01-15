@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Lance integration between namespaces and Apache DataFusion catalogs.
-//!
-//! This crate provides adapters to expose Lance namespaces as
-//! DataFusion `CatalogProviderList`, `CatalogProvider`, and
-//! `SchemaProvider` implementations. It intentionally focuses on
-//! read-only catalog and schema mapping.
-
 pub mod catalog;
 pub mod error;
 pub mod namespace_level;

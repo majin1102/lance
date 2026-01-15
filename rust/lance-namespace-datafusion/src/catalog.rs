@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! DataFusion catalog providers backed by Lance namespaces.
-
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,6 +19,11 @@ use crate::SessionBuilder;
 /// The underlying namespace must be a four-level namespace. It is explicitly configured
 /// via [`SessionBuilder::with_root`], and each child namespace under this root is
 /// automatically registered as a [`LanceCatalogProvider`].
+///
+/// This `CatalogProviderList` is optional when building a DataFusion `SessionContext`.
+/// If not provided, you can still configure catalogs using
+/// [`SessionBuilder::add_catalog`] or set a default catalog via
+/// [`SessionBuilder::with_default_catalog`].
 #[derive(Debug, Clone)]
 pub struct LanceCatalogProviderList {
     /// Root Lance namespace used to resolve catalogs / schemas / tables.

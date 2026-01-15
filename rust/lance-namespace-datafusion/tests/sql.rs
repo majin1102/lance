@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::Schema;
+use datafusion::common::record_batch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::SessionContext;
 use lance::dataset::{WriteMode, WriteParams};
@@ -29,77 +30,47 @@ fn col<T: 'static>(batch: &RecordBatch, idx: usize) -> &T {
 
 fn customers_data() -> (Arc<Schema>, RecordBatch) {
     let batch = record_batch!(
-        ("customer_id", Int32, [1, 2, 3]),
-        ("name", Utf8, ["Alice", "Bob", "Carol"]),
-        ("city", Utf8, ["NY", "SF", "LA"])
-    ).unwrap();
+        ("customer_id", Int32, vec![1, 2, 3]),
+        ("name", Utf8, vec!["Alice", "Bob", "Carol"]),
+        ("city", Utf8, vec!["NY", "SF", "LA"])
+    )
+    .unwrap();
     let schema = batch.schema();
 
     (schema, batch)
 }
 
 fn orders_data() -> (Arc<Schema>, RecordBatch) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("order_id", DataType::Int32, false),
-        Field::new("customer_id", DataType::Int32, false),
-        Field::new("amount", DataType::Int32, false),
-    ]));
-
-    let order_ids = Int32Array::from(vec![101, 102, 103]);
-    let customer_ids = Int32Array::from(vec![1, 2, 3]);
-    let amounts = Int32Array::from(vec![100, 200, 300]);
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(order_ids),
-            Arc::new(customer_ids),
-            Arc::new(amounts),
-        ],
+    let batch = record_batch!(
+        ("order_id", Int32, vec![101, 102, 103]),
+        ("customer_id", Int32, vec![1, 2, 3]),
+        ("amount", Int32, vec![100, 200, 300])
     )
     .unwrap();
+    let schema = batch.schema();
 
     (schema, batch)
 }
 
 fn orders2_data() -> (Arc<Schema>, RecordBatch) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("order_id", DataType::Int32, false),
-        Field::new("customer_id", DataType::Int32, false),
-        Field::new("amount", DataType::Int32, false),
-    ]));
-
-    let order_ids = Int32Array::from(vec![201, 202]);
-    let customer_ids = Int32Array::from(vec![1, 2]);
-    let amounts = Int32Array::from(vec![150, 250]);
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(order_ids),
-            Arc::new(customer_ids),
-            Arc::new(amounts),
-        ],
+    let batch = record_batch!(
+        ("order_id", Int32, vec![201, 202]),
+        ("customer_id", Int32, vec![1, 2]),
+        ("amount", Int32, vec![150, 250])
     )
     .unwrap();
+    let schema = batch.schema();
 
     (schema, batch)
 }
 
 fn customers_dim_data() -> (Arc<Schema>, RecordBatch) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("customer_id", DataType::Int32, false),
-        Field::new("segment", DataType::Utf8, false),
-    ]));
-
-    let customer_ids = Int32Array::from(vec![1, 2, 3]);
-    let segments = StringArray::from(vec!["Silver", "Gold", "Platinum"]);
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(customer_ids), Arc::new(segments)],
+    let batch = record_batch!(
+        ("customer_id", Int32, vec![1, 2, 3]),
+        ("segment", Utf8, vec!["Silver", "Gold", "Platinum"])
     )
     .unwrap();
+    let schema = batch.schema();
 
     (schema, batch)
 }

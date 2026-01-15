@@ -8,7 +8,7 @@ use lance::{Dataset, Result};
 use lance_namespace::models::{ListNamespacesRequest, ListTablesRequest};
 use lance_namespace::LanceNamespace;
 
-const DEFAULT_CATALOG_NAME: &str = "lance";
+const DEFAULT_NAMESPACE_NAME: &str = "lance";
 
 /// Lightweight wrapper around a Lance namespace handle and identifier.
 #[derive(Debug, Clone)]
@@ -63,7 +63,9 @@ impl NamespaceLevel {
         self.namespace_id
             .as_deref()
             .and_then(|v| v.last())
-            .map_or(DEFAULT_CATALOG_NAME, |relative_name| relative_name.as_str())
+            .map_or(DEFAULT_NAMESPACE_NAME, |relative_name| {
+                relative_name.as_str()
+            })
     }
 
     fn child_id(&self, child_name: String) -> Vec<String> {
