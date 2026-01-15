@@ -28,21 +28,12 @@ fn col<T: 'static>(batch: &RecordBatch, idx: usize) -> &T {
 }
 
 fn customers_data() -> (Arc<Schema>, RecordBatch) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("customer_id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("city", DataType::Utf8, false),
-    ]));
-
-    let customer_ids = Int32Array::from(vec![1, 2, 3]);
-    let names = StringArray::from(vec!["Alice", "Bob", "Carol"]);
-    let cities = StringArray::from(vec!["NY", "SF", "LA"]);
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(customer_ids), Arc::new(names), Arc::new(cities)],
-    )
-    .unwrap();
+    let batch = record_batch!(
+        ("customer_id", Int32, [1, 2, 3]),
+        ("name", Utf8, ["Alice", "Bob", "Carol"]),
+        ("city", Utf8, ["NY", "SF", "LA"])
+    ).unwrap();
+    let schema = batch.schema();
 
     (schema, batch)
 }
