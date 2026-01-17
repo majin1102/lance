@@ -58,7 +58,7 @@ impl NamespaceLevel {
         self.namespace_id.clone().unwrap_or_default()
     }
 
-    /// Human readable name for this namespace (last component or default).
+    /// Name for this namespace (last component or default).
     pub fn name(&self) -> &str {
         self.namespace_id
             .as_deref()
@@ -119,7 +119,6 @@ impl NamespaceLevel {
         DatasetBuilder::from_namespace(
             Arc::clone(&self.root),
             self.child_id(table_name.to_string()),
-            false,
         )
         .await?
         .load()
