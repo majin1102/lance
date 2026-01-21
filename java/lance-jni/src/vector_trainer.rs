@@ -74,21 +74,6 @@ fn build_pq_params_from_java(
     })
 }
 
-fn build_sq_params_from_java(
-    env: &mut JNIEnv,
-    sq_params_obj: &JObject,
-) -> Result<RustSqBuildParams> {
-    let num_bits = env
-        .call_method(sq_params_obj, "getNumBits", "()S", &[])?
-        .s()? as u16;
-    let sample_rate = env.get_int_as_usize_from_method(sq_params_obj, "getSampleRate")?;
-
-    Ok(RustSqBuildParams {
-        num_bits,
-        sample_rate,
-    })
-}
-
 #[no_mangle]
 pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainIvfCentroids<'local>(
     mut env: JNIEnv<'local>,
@@ -192,43 +177,4 @@ fn inner_train_pq_codebook<'local>(
     let jarray = env.new_float_array(flattened.len() as i32)?;
     env.set_float_array_region(&jarray, 0, &flattened)?;
     Ok(jarray)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainSq<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    dataset_obj: JObject<'local>,   // org.lance.Dataset
-    column_jstr: JString<'local>,   // java.lang.String
-    sq_params_obj: JObject<'local>, // org.lance.index.vector.SQBuildParams
-) -> JObject<'local> {
-    ok_or_throw!(
-        env,
-        inner_train_sq(&mut env, dataset_obj, column_jstr, sq_params_obj)
-    )
-}
-
-fn inner_train_sq<'local>(
-    env: &mut JNIEnv<'local>,
-    dataset_obj: JObject<'local>,
-    column_jstr: JString<'local>,
-    sq_params_obj: JObject<'local>,
-) -> Result<JObject<'local>> {
-    let column: String = env.get_string(&column_jstr)?.into();
-    let _sq_params = build_sq_params_from_java(env, &sq_params_obj)?;
-
-    {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(dataset_obj, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
-
-        // Ensure the column exists and is a vector column. This will return a
-        // descriptive error if the column is invalid.
-        let _dim = get_vector_dim(dataset.schema(), &column)?;
-
-        // Drop dataset_guard at the end of this block before reusing env.
-    }
-
-    // No additional normalization is needed on the Java object; return it as-is.
-    Ok(sq_params_obj)
 }

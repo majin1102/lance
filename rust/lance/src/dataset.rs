@@ -2759,10 +2759,6 @@ impl Dataset {
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
         let index_dir = self.indices_dir().child(index_uuid);
-        log::info!(
-            "merge_index_metadata called with index_type={})",
-            index_type,
-        );
         match index_type {
             IndexType::Inverted => {
                 // Call merge_index_files function for inverted index

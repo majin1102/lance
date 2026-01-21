@@ -275,15 +275,12 @@ public class VectorIndexTest {
         IvfBuildParams ivfTrainParams =
             new IvfBuildParams.Builder().setNumPartitions(numPartitions).setMaxIters(1).build();
 
-        SQBuildParams sqTrainParams =
+        SQBuildParams sqParams =
             new SQBuildParams.Builder().setNumBits(numBits).setSampleRate(256).build();
 
         float[] centroids =
             VectorTrainer.trainIvfCentroids(
                 dataset, TestVectorDataset.vectorColumnName, ivfTrainParams);
-
-        SQBuildParams sqParams =
-            VectorTrainer.trainSq(dataset, TestVectorDataset.vectorColumnName, sqTrainParams);
 
         IvfBuildParams ivfParams =
             new IvfBuildParams.Builder()

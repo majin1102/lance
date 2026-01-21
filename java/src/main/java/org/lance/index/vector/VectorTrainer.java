@@ -65,25 +65,6 @@ public final class VectorTrainer {
     return nativeTrainPqCodebook(dataset, column, params);
   }
 
-  /**
-   * Validate and finalize SQ build parameters for the given column.
-   *
-   * <p>SQ does not require a pre-trained artifact. This entry point exists to mirror the IVF/PQ
-   * training APIs and to perform any parameter validation on the Rust side.
-   *
-   * @param dataset the dataset to inspect
-   * @param column the vector column name
-   * @param params SQ build parameters
-   * @return a (potentially validated / normalized) SQBuildParams instance
-   */
-  public static SQBuildParams trainSq(Dataset dataset, String column, SQBuildParams params) {
-    Preconditions.checkArgument(dataset != null, "dataset cannot be null");
-    Preconditions.checkArgument(
-        column != null && !column.isEmpty(), "column cannot be null or empty");
-    Preconditions.checkArgument(params != null, "params cannot be null");
-    return nativeTrainSq(dataset, column, params);
-  }
-
   private static native float[] nativeTrainIvfCentroids(
       Dataset dataset, String column, IvfBuildParams params);
 
