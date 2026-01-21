@@ -13,7 +13,6 @@ use jni::JNIEnv;
 use lance::index::vector::utils::get_vector_dim;
 use lance_index::vector::ivf::builder::IvfBuildParams as RustIvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams as RustPQBuildParams;
-use lance_index::vector::sq::builder::SQBuildParams as RustSqBuildParams;
 use lance_linalg::distance::MetricType;
 
 /// Flatten a FixedSizeList<Float32> into a contiguous Vec<f32>.
