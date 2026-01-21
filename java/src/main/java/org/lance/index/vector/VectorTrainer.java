@@ -70,7 +70,4 @@ public final class VectorTrainer {
 
   private static native float[] nativeTrainPqCodebook(
       Dataset dataset, String column, PQBuildParams params);
-
-  private static native SQBuildParams nativeTrainSq(
-      Dataset dataset, String column, SQBuildParams params);
 }
