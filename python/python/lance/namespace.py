@@ -13,7 +13,7 @@ The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from lance_namespace import (
     CreateEmptyTableRequest,
@@ -46,7 +46,12 @@ from lance_namespace import (
 )
 
 from .io import StorageOptionsProvider
-from .lance import PyDirectoryNamespace  # Low-level Rust binding
+from .lance import (
+    PyDirectoryNamespace,  # Low-level Rust binding
+    PyNamespaceSessionBuilder,
+    PyNamespaceSession,
+)
+import pyarrow as pa
 
 try:
     from .lance import PyRestNamespace  # Low-level Rust binding
@@ -64,6 +69,7 @@ __all__ = [
     "RestAdapter",
     "LanceNamespaceStorageOptionsProvider",
     "DynamicContextProvider",
+    "NamespaceSession",
 ]
 
 
@@ -744,3 +750,79 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
             f"LanceNamespaceStorageOptionsProvider {{ "
             f"namespace: {namespace_id}, table_id: {self._table_id!r} }}"
         )
+
+
+class NamespaceSession:
+    """High-level SQL session over Lance namespaces.
+
+    This class provides a Pythonic wrapper around the low-level
+    ``PyNamespaceSessionBuilder`` / ``PyNamespaceSession`` bindings. It allows
+    running DataFusion SQL queries using fully qualified
+    ``catalog.schema.table`` identifiers backed by Lance namespaces.
+
+    Parameters
+    ----------
+    root:
+        The root :class:`LanceNamespace` instance. Its direct child namespaces
+        are exposed as catalogs in the underlying DataFusion session.
+    catalogs:
+        Optional mapping from catalog name to ``(namespace, namespace_id)``
+        tuples. Each namespace will be mounted as a named catalog; the
+        ``namespace_id`` list is passed through to the underlying
+        ``Namespace`` abstraction.
+    config:
+        Optional configuration dictionary forwarded to the underlying
+        builder. Currently supports keys like ``"batch_size"`` and
+        ``"target_partitions"``.
+    """
+
+    def __init__(
+        self,
+        root: Optional[LanceNamespace] = None,
+        catalogs: Optional[Dict[str, Tuple[LanceNamespace, List[str]]]] = None,
+        config: Optional[Dict] = None,
+        default_catalog: Optional[str] = None,
+        default_schema: Optional[str] = None,
+    ) -> None:
+        has_root = root is not None
+        has_catalog_ns = (
+            catalogs is not None
+            and any(isinstance(ns, LanceNamespace) for ns, _ in catalogs.values())
+        )
+
+        if not (has_root or has_catalog_ns):
+            raise ValueError(
+                "At least one LanceNamespace is required via root or catalogs."
+            )
+
+        builder = PyNamespaceSessionBuilder()
+
+        if root is not None:
+            builder = builder.with_root(root)
+
+        if default_catalog is not None:
+            builder = builder.with_default_catalog(default_catalog)
+
+        if default_schema is not None:
+            builder = builder.with_default_schema(default_schema)
+
+        if catalogs is not None:
+            for name, (ns, ns_id) in catalogs.items():
+                builder = builder.add_catalog(name, ns, ns_id)
+
+        if config is not None:
+            builder = builder.with_config(config)
+
+        self._session = builder.build()
+
+    def sql(self, sql: str) -> pa.Table:
+        """Execute a SQL query and return the result as a PyArrow table.
+
+        The query is executed against the namespace-backed catalogs
+        configured for this session. All record batches are collected and
+        combined into a single :class:`pyarrow.Table` with compacted chunks.
+        """
+
+        batches = self._session.sql(sql)
+        table = pa.Table.from_batches(batches)
+        return table.combine_chunks()

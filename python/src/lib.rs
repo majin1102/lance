@@ -277,6 +277,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
+    m.add_class::<namespace::PyNamespaceSessionBuilder>()?;
+    m.add_class::<namespace::PyNamespaceSession>()?;
     m.add_class::<namespace::PyRestNamespace>()?;
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;

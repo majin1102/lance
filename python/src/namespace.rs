@@ -6,16 +6,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::error::PythonErrorExt;
+use crate::session::Session;
+use arrow::pyarrow::IntoPyArrow;
 use bytes::Bytes;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use lance_namespace_datafusion::{NamespaceLevel, SessionBuilder};
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
-
-use crate::error::PythonErrorExt;
-use crate::session::Session;
 
 /// Python-implemented dynamic context provider.
 ///
@@ -650,5 +653,172 @@ impl PyRestAdapter {
             "PyRestAdapter(host='{}', port={})",
             self.config.host, self.config.port
         )
+    }
+}
+
+fn to_lance_namespace(
+    ns_any: &Bound<'_, PyAny>,
+) -> PyResult<Arc<dyn lance_namespace::LanceNamespace>> {
+    // Try low-level Rust implementations first.
+    if let Ok(ns) = ns_any.extract::<PyRef<PyDirectoryNamespace>>() {
+        return Ok(ns.inner.clone());
+    }
+
+    #[cfg(feature = "rest")]
+    {
+        if let Ok(ns) = ns_any.extract::<PyRef<PyRestNamespace>>() {
+            return Ok(ns.inner.clone());
+        }
+    }
+
+    // Then try high-level Python wrappers which expose `_inner`.
+    if let Ok(inner) = ns_any.getattr("_inner") {
+        if let Ok(ns) = inner.extract::<PyRef<PyDirectoryNamespace>>() {
+            return Ok(ns.inner.clone());
+        }
+        #[cfg(feature = "rest")]
+        {
+            if let Ok(ns) = inner.extract::<PyRef<PyRestNamespace>>() {
+                return Ok(ns.inner.clone());
+            }
+        }
+    }
+
+    Err(PyTypeError::new_err(
+        "Expected DirectoryNamespace, RestNamespace, PyDirectoryNamespace, or PyRestNamespace",
+    ))
+}
+
+/// Builder for constructing DataFusion SessionContext instances backed by Lance namespaces.
+#[pyclass(name = "PyNamespaceSessionBuilder", module = "lance")]
+#[derive(Clone, Debug)]
+pub struct PyNamespaceSessionBuilder {
+    builder: SessionBuilder,
+}
+
+#[pymethods]
+impl PyNamespaceSessionBuilder {
+    #[new]
+    fn new() -> Self {
+        Self {
+            builder: SessionBuilder::new(),
+        }
+    }
+
+    /// Attach a root namespace that will be exposed via a dynamic catalog list.
+    fn with_root(&self, namespace_like: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let ns = to_lance_namespace(namespace_like)?;
+        let builder = self
+            .builder
+            .clone()
+            .with_root(NamespaceLevel::from_root(ns));
+        Ok(Self { builder })
+    }
+
+    /// Register an additional catalog backed by the given namespace.
+    #[pyo3(signature = (name, namespace_like, id=None))]
+    fn add_catalog(
+        &self,
+        name: &str,
+        namespace_like: &Bound<'_, PyAny>,
+        id: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let ns_root = to_lance_namespace(namespace_like)?;
+        let namespace = if let Some(namespace_id) = id {
+            NamespaceLevel::from_namespace(ns_root, namespace_id)
+        } else {
+            NamespaceLevel::from_root(ns_root)
+        };
+
+        let builder = self.builder.clone().add_catalog(name, namespace);
+        Ok(Self { builder })
+    }
+
+    /// Configure DataFusion session options such as batch_size and target_partitions.
+    fn with_config(&self, options: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let mut config = SessionConfig::new();
+
+        if let Some(value) = options.get_item("target_partitions")? {
+            if !value.is_none() {
+                let target_partitions: usize = value.extract()?;
+                config = config.with_target_partitions(target_partitions);
+            }
+        }
+
+        if let Some(value) = options.get_item("batch_size")? {
+            if !value.is_none() {
+                let batch_size: usize = value.extract()?;
+                config = config.with_batch_size(batch_size);
+            }
+        }
+
+        let builder = self.builder.clone().with_config(config);
+        Ok(Self { builder })
+    }
+
+    /// Override the default catalog name used by the session.
+    ///
+    /// If a default schema is set, it must be used together with a default catalog.
+    fn with_default_catalog(&self, name: &str) -> PyResult<Self> {
+        let builder = self.builder.clone().with_default_catalog(name, None);
+        Ok(Self { builder })
+    }
+
+    /// Override the default schema name used by the session.
+    ///
+    /// This should be combined with `with_default_catalog` to ensure the default
+    /// catalog and schema are configured together.
+    fn with_default_schema(&self, name: &str) -> PyResult<Self> {
+        let builder = self.builder.clone().with_default_schema(name, None);
+        Ok(Self { builder })
+    }
+
+    /// Build a namespace-aware DataFusion SessionContext and wrap it in PyNamespaceSession.
+    fn build(&self, py: Python<'_>) -> PyResult<PyNamespaceSession> {
+        let builder = self.builder.clone();
+        let ctx = crate::rt()
+            .block_on(Some(py), async move { builder.build().await })
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+
+        // Register Lance UDFs on the context.
+        lance_datafusion::udf::register_functions(&ctx);
+
+        Ok(PyNamespaceSession::new(ctx))
+    }
+}
+
+/// Namespace-aware SQL session backed by a DataFusion SessionContext.
+#[pyclass(name = "PyNamespaceSession", module = "lance")]
+#[derive(Clone)]
+pub struct PyNamespaceSession {
+    ctx: SessionContext,
+}
+
+impl PyNamespaceSession {
+    pub fn new(ctx: SessionContext) -> Self {
+        Self { ctx }
+    }
+}
+
+#[pymethods]
+impl PyNamespaceSession {
+    /// Execute a SQL query against the namespace-backed catalogs.
+    fn sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let ctx = self.ctx.clone();
+        let sql_owned = sql.to_string();
+
+        let batches = crate::rt()
+            .block_on(Some(py), async move {
+                let df = ctx.sql(&sql_owned).await?;
+                df.collect().await
+            })
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+
+        batches
+            .into_iter()
+            .map(|batch| batch.into_pyarrow(py))
+            .collect::<PyResult<Vec<_>>>()
     }
 }
