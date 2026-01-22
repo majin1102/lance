@@ -13,7 +13,6 @@ from __future__ import annotations
 import lance
 import pyarrow as pa
 import pytest
-
 from lance.namespace import NamespaceSession
 from lance_namespace import (
     CreateNamespaceRequest,

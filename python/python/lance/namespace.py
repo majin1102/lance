@@ -15,6 +15,7 @@ The LanceNamespace ABC interface is provided by the lance_namespace package.
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
+import pyarrow as pa
 from lance_namespace import (
     CreateEmptyTableRequest,
     CreateEmptyTableResponse,
@@ -49,9 +50,7 @@ from .io import StorageOptionsProvider
 from .lance import (
     PyDirectoryNamespace,  # Low-level Rust binding
     PyNamespaceSessionBuilder,
-    PyNamespaceSession,
 )
-import pyarrow as pa
 
 try:
     from .lance import PyRestNamespace  # Low-level Rust binding
@@ -785,9 +784,8 @@ class NamespaceSession:
         default_schema: Optional[str] = None,
     ) -> None:
         has_root = root is not None
-        has_catalog_ns = (
-            catalogs is not None
-            and any(isinstance(ns, LanceNamespace) for ns, _ in catalogs.values())
+        has_catalog_ns = catalogs is not None and any(
+            isinstance(ns, LanceNamespace) for ns, _ in catalogs.values()
         )
 
         if not (has_root or has_catalog_ns):
