@@ -6,12 +6,13 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
 use datafusion::common::record_batch;
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use lance_namespace::models::CreateNamespaceRequest;
 use lance_namespace::LanceNamespace;
+use lance_namespace_datafusion::session_builder::LanceUrlTableExt;
 use lance_namespace_datafusion::{NamespaceLevel, SessionBuilder};
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tempfile::TempDir;
@@ -80,7 +81,7 @@ async fn write_table(
     file_name: &str,
     schema: Arc<Schema>,
     batch: RecordBatch,
-) -> DFResult<()> {
+) -> Result<()> {
     let full_path = dir.path().join(file_name);
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -100,7 +101,7 @@ async fn write_table(
     Ok(())
 }
 
-async fn setup_test_context() -> DFResult<Context> {
+async fn setup_test_context() -> Result<Context> {
     let root_dir = TempDir::new()?;
     let extra_dir = TempDir::new()?;
 
@@ -229,7 +230,7 @@ async fn setup_test_context() -> DFResult<Context> {
 }
 
 #[tokio::test]
-async fn join_within_retail() -> DFResult<()> {
+async fn join_within_retail() -> Result<()> {
     let ns = setup_test_context().await?;
 
     let df = ns
@@ -257,7 +258,7 @@ async fn join_within_retail() -> DFResult<()> {
 }
 
 #[tokio::test]
-async fn join_across_root_catalogs() -> DFResult<()> {
+async fn join_across_root_catalogs() -> Result<()> {
     let ns = setup_test_context().await?;
 
     let df = ns
@@ -285,7 +286,7 @@ async fn join_across_root_catalogs() -> DFResult<()> {
 }
 
 #[tokio::test]
-async fn join_across_catalogs() -> DFResult<()> {
+async fn join_across_catalogs() -> Result<()> {
     let ns = setup_test_context().await?;
 
     let df = ns
@@ -313,7 +314,7 @@ async fn join_across_catalogs() -> DFResult<()> {
 }
 
 #[tokio::test]
-async fn aggregation_city_totals() -> DFResult<()> {
+async fn aggregation_city_totals() -> Result<()> {
     let ns = setup_test_context().await?;
 
     let df = ns
@@ -348,7 +349,7 @@ async fn aggregation_city_totals() -> DFResult<()> {
 }
 
 #[tokio::test]
-async fn cte_view_customer_orders() -> DFResult<()> {
+async fn cte_view_customer_orders() -> Result<()> {
     let ns = setup_test_context().await?;
 
     let df = ns
@@ -375,6 +376,35 @@ async fn cte_view_customer_orders() -> DFResult<()> {
     assert_eq!(order_id_col.value(0), 101);
     assert_eq!(name_col.value(0), "Alice");
     assert_eq!(amount_col.value(0), 100);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn url_literal_select_orders_by_amount() -> Result<()> {
+    let env = setup_test_context().await?;
+
+    let path = env.root_dir.path().join("retail$sales$orders.lance");
+
+    let sql = format!(
+        "SELECT order_id, amount FROM '{}' WHERE amount >= 200 ORDER BY order_id",
+        path.to_string_lossy(),
+    );
+
+    let ctx = env.ctx.enable_lance_url_table();
+    let df = ctx.sql(&sql).await?;
+    let batches = df.collect().await?;
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2);
+
+    let order_id_col = col::<Int32Array>(batch, 0);
+    let amount_col = col::<Int32Array>(batch, 1);
+
+    assert_eq!(order_id_col.value(0), 102);
+    assert_eq!(amount_col.value(0), 200);
+    assert_eq!(order_id_col.value(1), 103);
+    assert_eq!(amount_col.value(1), 300);
 
     Ok(())
 }

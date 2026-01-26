@@ -6,6 +6,7 @@ pub mod error;
 pub mod namespace_level;
 pub mod schema;
 pub mod session_builder;
+pub mod url_factory;
 
 pub use catalog::{LanceCatalogProvider, LanceCatalogProviderList};
 pub use namespace_level::NamespaceLevel;

@@ -17,6 +17,7 @@ datafusion.workspace = true
 lance.workspace = true
 lance-namespace.workspace = true
 tokio.workspace = true
+datafusion-session.workspace = true
 
 [dev-dependencies]
 arrow.workspace = true

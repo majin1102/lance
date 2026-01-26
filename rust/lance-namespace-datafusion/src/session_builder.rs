@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use datafusion::catalog::{CatalogProvider, SchemaProvider};
-use datafusion::error::Result;
-use datafusion::execution::context::{SessionConfig, SessionContext};
-use std::sync::Arc;
-
 use crate::catalog::LanceCatalogProviderList;
 use crate::namespace_level::NamespaceLevel;
+use crate::url_factory::{LanceUrlTableFactory, MultiUrlTableFactory};
 use crate::LanceCatalogProvider;
+use datafusion::catalog::{CatalogProvider, DynamicFileCatalog, SchemaProvider, UrlTableFactory};
+use datafusion::datasource::dynamic_file::DynamicListTableFactory;
+use datafusion::error::Result;
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion_session::SessionStore;
+use std::sync::Arc;
 
 /// Builder for configuring a `SessionContext` with Lance namespaces.
 #[derive(Clone, Debug, Default)]
@@ -130,6 +132,82 @@ impl SessionBuilder {
             )));
         }
         Ok(())
+    }
+}
+
+pub trait LanceUrlTableExt {
+    fn enable_lance_url_table(self) -> Self;
+}
+
+impl LanceUrlTableExt for SessionContext {
+    /// Enables querying local files and URIs as DataFusion tables, with extended support for
+    /// Lance datasets (`.lance`).
+    ///
+    /// This method mirrors the behavior of DataFusion's native
+    /// [`SessionContext::enable_url_table`], with the following differences:
+    ///
+    /// - It wraps the existing `catalog_list` in a [`DynamicFileCatalog`].
+    /// - It installs a [`LanceUrlTableFactory`] *before* DataFusion's default
+    ///   [`DynamicListTableFactory`] in the URL resolution chain.
+    /// - As a result, `.lance` paths are resolved by Lance first, while other formats
+    ///   such as CSV, Parquet and JSON continue to be handled by `DynamicListTableFactory`.
+    /// - It wires the current [`SessionState`] into both factories via [`SessionStore`], so
+    ///   they can access session configuration and runtime state when resolving URLs.
+    ///
+    /// After calling this method, you can use URL literals in SQL, for example:
+    ///
+    /// ```sql
+    /// SELECT * FROM 'tests/data/example.csv';
+    /// SELECT * FROM 'tests/data/example.parquet';
+    /// SELECT * FROM 'tests/data/example.json';
+    /// SELECT * FROM 'tests/data/example.lance';
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// This method is intended to be the Lance-aware counterpart of
+    /// [`SessionContext::enable_url_table`]. If you call `enable_url_table` *after*
+    /// calling this method, the URL table configuration set up here (including `.lance`
+    /// support and factory ordering) may be overwritten by DataFusion's default wiring.
+    /// In that case, `.lance` URLs may no longer be resolved by `LanceUrlTableFactory`
+    /// as intended.
+    ///
+    /// For security-sensitive deployments, treat this method the same way as
+    /// `enable_url_table`: only enable it in environments where direct access to
+    /// the underlying file system or object store from SQL is acceptable.
+    fn enable_lance_url_table(self) -> Self {
+        // Enable URL table support by wrapping the current catalog list with a
+        // DynamicFileCatalog that uses both DataFusion's DynamicListTableFactory
+        // (for Parquet/CSV/JSON/etc) and a LanceUrlTableFactory (for .lance URLs).
+        let current_catalog_list = Arc::clone(self.state().catalog_list());
+
+        let default_url_factory = Arc::new(DynamicListTableFactory::new(SessionStore::new()));
+        let lance_url_factory = Arc::new(LanceUrlTableFactory::new(SessionStore::new()));
+        let url_factory = Arc::new(MultiUrlTableFactory::new(vec![
+            lance_url_factory.clone() as Arc<dyn UrlTableFactory>,
+            default_url_factory.clone() as Arc<dyn UrlTableFactory>,
+        ]));
+
+        let catalog_list = Arc::new(DynamicFileCatalog::new(current_catalog_list, url_factory));
+
+        let session_id = self.session_id();
+        let ctx: SessionContext = self
+            .into_state_builder()
+            .with_session_id(session_id)
+            .with_catalog_list(catalog_list)
+            .build()
+            .into();
+
+        // Register the new SessionState with each SessionStore so that
+        // URL table factories can access the runtime session as needed.
+        default_url_factory
+            .session_store()
+            .with_state(ctx.state_weak_ref());
+        lance_url_factory
+            .session_store()
+            .with_state(ctx.state_weak_ref());
+
+        ctx
     }
 }
 
