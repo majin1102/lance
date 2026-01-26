@@ -191,7 +191,7 @@ impl LanceUrlTableExt for SessionContext {
         let catalog_list = Arc::new(DynamicFileCatalog::new(current_catalog_list, url_factory));
 
         let session_id = self.session_id();
-        let ctx: SessionContext = self
+        let ctx: Self = self
             .into_state_builder()
             .with_session_id(session_id)
             .with_catalog_list(catalog_list)
