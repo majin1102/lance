@@ -151,8 +151,6 @@ impl LanceUrlTableExt for SessionContext {
     ///   [`DynamicListTableFactory`] in the URL resolution chain.
     /// - As a result, `.lance` paths are resolved by Lance first, while other formats
     ///   such as CSV, Parquet and JSON continue to be handled by `DynamicListTableFactory`.
-    /// - It wires the current [`SessionState`] into both factories via [`SessionStore`], so
-    ///   they can access session configuration and runtime state when resolving URLs.
     ///
     /// After calling this method, you can use URL literals in SQL, for example:
     ///
@@ -200,6 +198,7 @@ impl LanceUrlTableExt for SessionContext {
 
         // Register the new SessionState with each SessionStore so that
         // URL table factories can access the runtime session as needed.
+        // This process is aligned with How datafusion registers DynamicListTableFactory
         default_url_factory
             .session_store()
             .with_state(ctx.state_weak_ref());
