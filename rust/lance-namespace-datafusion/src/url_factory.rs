@@ -52,11 +52,6 @@ impl UrlTableFactory for MultiUrlTableFactory {
 #[derive(Debug)]
 pub struct LanceUrlTableFactory {
     /// SessionStore shared with other UrlTableFactory implementations.
-    ///
-    /// This mirrors DataFusion's DynamicListTableFactory wiring so that
-    /// all factories participate in the same session lifecycle. The
-    /// Lance implementation does not currently use the session state
-    /// directly but keeps the store for future extensions.
     session_store: SessionStore,
 }
 
