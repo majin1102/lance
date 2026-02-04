@@ -212,6 +212,177 @@ impl From<&Manifest> for Version {
     }
 }
 
+pub struct Snapshot {
+    pub dataset: Arc<Dataset>,
+    pub manifest_location: ManifestLocation,
+}
+
+impl Snapshot {
+    pub fn new(dataset: Arc<Dataset>, manifest_location: ManifestLocation) -> Self {
+        Self {
+            dataset,
+            manifest_location,
+        }
+    }
+
+    pub fn version_number(&self) -> u64 {
+        self.manifest_location.version
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.manifest_location.last_modified
+    }
+
+    pub async fn manifest(&self) -> Result<Manifest> {
+        read_manifest(
+            &self.dataset.object_store,
+            &self.manifest_location.path,
+            self.manifest_location.size,
+        )
+        .await
+    }
+
+    pub async fn version(&self) -> Result<Version> {
+        self.manifest().await.map(|m| Version::from(&m))
+    }
+
+    /// Read the transaction for this snapshot.
+    ///
+    /// Uses the Dataset's metadata cache for efficient repeated access.
+    /// The cache is keyed by version, so repeated calls for the same version
+    /// are efficient.
+    pub async fn transaction(&self) -> Result<Option<Transaction>> {
+        self.dataset
+            .read_transaction_by_version(self.manifest_location.version)
+            .await
+    }
+
+    /// Checkout this snapshot as a new Dataset instance.
+    pub async fn checkout(&self) -> Result<Dataset> {
+        self.dataset.checkout_version(self.manifest_location.version).await
+    }
+}
+
+pub struct Snapshots {
+    dataset: Arc<Dataset>,
+}
+
+impl Snapshots {
+    pub fn new(dataset: Arc<Dataset>) -> Self {
+        Self { dataset }
+    }
+
+    /// List all snapshots in descending order (latest first).
+    async fn list_inner(&self) -> Result<Vec<ManifestLocation>> {
+        self.dataset
+            .commit_handler
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, true)
+            .try_collect()
+            .await
+    }
+
+    /// Get the latest snapshot.
+    pub async fn latest(&self) -> Result<Snapshot> {
+        let location = self
+            .dataset
+            .commit_handler
+            .resolve_latest_location(&self.dataset.base, &self.dataset.object_store)
+            .await?;
+        Ok(Snapshot::new(self.dataset.clone(), location))
+    }
+
+    /// Get all snapshots as a vector (latest first).
+    pub async fn list(&self) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list_inner()
+            .await?
+            .into_iter()
+            .map(|loc| Snapshot::new(self.dataset.clone(), loc))
+            .collect())
+    }
+
+    /// Get snapshots within the version range `[lower_version, upper_version)`.
+    /// The results are ordered from latest to earliest.
+    pub async fn within(&self, lower_version: u64, upper_version: u64) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.version_number() >= lower_version && s.version_number() < upper_version)
+            .collect())
+    }
+
+    /// Get snapshots within the timestamp range `[lower, upper)`.
+    /// The results are ordered from latest to earliest.
+    pub async fn within_timestamp(
+        &self,
+        lower: DateTime<Utc>,
+        upper: DateTime<Utc>,
+    ) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.timestamp() >= lower && s.timestamp() < upper)
+            .collect())
+    }
+
+    /// Get snapshots earlier than the given version, returning at most `limit` results.
+    /// The results are ordered from latest to earliest.
+    pub async fn earlier_than(&self, version: u64, limit: u32) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.version_number() < version)
+            .take(limit as usize)
+            .collect())
+    }
+
+    /// Get snapshots earlier than the given timestamp, returning at most `limit` results.
+    /// The results are ordered from latest to earliest.
+    pub async fn earlier_than_timestamp(
+        &self,
+        timestamp: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.timestamp() < timestamp)
+            .take(limit as usize)
+            .collect())
+    }
+
+    /// Get snapshots later than the given version, returning at most `limit` results.
+    /// The results are ordered from latest to earliest.
+    pub async fn later_than(&self, version: u64, limit: u32) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.version_number() >= version)
+            .take(limit as usize)
+            .collect())
+    }
+
+    /// Get snapshots later than the given timestamp, returning at most `limit` results.
+    /// The results are ordered from latest to earliest.
+    pub async fn later_than_timestamp(
+        &self,
+        timestamp: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.timestamp() >= timestamp)
+            .take(limit as usize)
+            .collect())
+    }
+}
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
@@ -437,6 +608,10 @@ impl Dataset {
 
     pub fn branches(&self) -> Branches<'_> {
         self.refs.branches()
+    }
+
+    pub fn snapshots(&self) -> Snapshots {
+        Snapshots::new(Arc::new(self.clone()))
     }
 
     /// Check out the latest version of the dataset

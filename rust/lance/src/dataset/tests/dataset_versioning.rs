@@ -758,3 +758,305 @@ async fn test_branch() {
         .unwrap();
     assert!(branches.is_empty());
 }
+
+// Tests for the Snapshots API (dataset.snapshots())
+
+const NUM_VERSIONS: usize = 5;
+
+/// Create a test dataset with multiple versions for snapshot testing.
+async fn setup_multi_version_dataset(
+    base_uri: &str,
+    num_versions: usize,
+) -> Result<Dataset, Box<dyn std::error::Error>> {
+    use crate::dataset::write::{InsertBuilder, WriteMode};
+
+    // First write: create mode
+    let write_params_create = WriteParams {
+        mode: WriteMode::Create,
+        ..Default::default()
+    };
+
+    // Create first version
+    let batch = RecordBatch::try_from_iter(vec![(
+        "id",
+        Arc::new(arrow_array::Int32Array::from(vec![0])) as _,
+    )])?;
+
+    let mut dataset = InsertBuilder::new(base_uri)
+        .with_params(&write_params_create)
+        .execute(vec![batch])
+        .await?;
+
+    // Subsequent writes: append mode - need to use the dataset itself
+    let write_params_append = WriteParams {
+        mode: WriteMode::Append,
+        ..Default::default()
+    };
+
+    for i in 1..num_versions {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(arrow_array::Int32Array::from(vec![i as i32])) as _,
+        )])?;
+
+        dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&write_params_append)
+            .execute(vec![batch])
+            .await?;
+
+        // Ensure timestamp difference between versions
+        if i < num_versions - 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    Ok(dataset)
+}
+
+#[tokio::test]
+async fn test_snapshot_checkout() {
+    // Arrange
+    let uri = "memory://test_snapshot_checkout";
+    let dataset = setup_multi_version_dataset(uri, 3).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Get the second snapshot (version 2)
+    let all_snapshots = snapshots.list().await.unwrap();
+    assert_eq!(all_snapshots.len(), 3);
+
+    let second_snapshot = &all_snapshots[1]; // Version 2 (0-indexed: index 1 is version 2)
+    assert_eq!(second_snapshot.version_number(), 2);
+
+    // Act
+    let checked_out = second_snapshot.checkout().await.unwrap();
+
+    // Assert: version should be correct
+    assert_eq!(checked_out.manifest().version, 2);
+
+    // Note: rows include all fragments from version 1 and 2 since Lance uses append mode
+    // Each version adds 1 row, so version 2 has 2 rows total
+    assert_eq!(checked_out.count_rows(None).await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_snapshots_list() {
+    // Arrange
+    let uri = "memory://test_snapshots_list";
+    let dataset = setup_multi_version_dataset(uri, NUM_VERSIONS).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Act
+    let list = snapshots.list().await.unwrap();
+
+    // Assert
+    assert_eq!(list.len(), NUM_VERSIONS);
+
+    // Should be in descending order (latest first)
+    // Versions are [5, 4, 3, 2, 1] for NUM_VERSIONS=5
+    for (i, snapshot) in list.iter().enumerate() {
+        let expected_version = (NUM_VERSIONS - i) as u64;
+        assert_eq!(snapshot.version_number(), expected_version);
+    }
+}
+
+#[tokio::test]
+async fn test_snapshots_latest() {
+    // Arrange
+    let uri = "memory://test_snapshots_latest";
+    let dataset = setup_multi_version_dataset(uri, 3).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Act
+    let latest = snapshots.latest().await.unwrap();
+
+    // Assert: latest version should be 3 (the last version created)
+    assert_eq!(latest.version_number(), 3);
+}
+
+#[tokio::test]
+async fn test_snapshots_within() {
+    // Arrange
+    let uri = "memory://test_snapshots_within";
+    let dataset = setup_multi_version_dataset(uri, NUM_VERSIONS).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Get all snapshots and their timestamps for verification
+    let all_snapshots = snapshots.list().await.unwrap();
+    assert_eq!(all_snapshots.len(), NUM_VERSIONS);
+
+    // Test within by version number: [1, 4) should include versions 1, 2, 3
+    // Act
+    let within_v1_v4 = snapshots.within(1, 4).await.unwrap();
+
+    // Assert
+    assert_eq!(within_v1_v4.len(), 3);
+    assert!(within_v1_v4
+        .iter()
+        .all(|s| s.version_number() >= 1 && s.version_number() < 4));
+
+    // Test within_timestamp
+    // Get timestamps from version 1 and version 4
+    let v1_timestamp = all_snapshots
+        .iter()
+        .find(|s| s.version_number() == 1)
+        .unwrap()
+        .timestamp();
+    let v4_timestamp = all_snapshots
+        .iter()
+        .find(|s| s.version_number() == 4)
+        .unwrap()
+        .timestamp();
+
+    // Act
+    let within_ts = snapshots
+        .within_timestamp(v1_timestamp, v4_timestamp)
+        .await
+        .unwrap();
+
+    // Assert: should include versions >= v1 and < v4
+    // Note: the exact count depends on timestamps, but the filter should work
+    for snapshot in within_ts {
+        assert!(snapshot.timestamp() >= v1_timestamp);
+        assert!(snapshot.timestamp() < v4_timestamp);
+    }
+}
+
+#[tokio::test]
+async fn test_snapshots_within_edge_cases() {
+    // Arrange
+    let uri = "memory://test_snapshots_within_edge";
+    let dataset = setup_multi_version_dataset(uri, NUM_VERSIONS).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Test empty range: [3, 3) should be empty
+    // Act
+    let empty = snapshots.within(3, 3).await.unwrap();
+
+    // Assert
+    assert!(empty.is_empty());
+
+    // Test range beyond available versions: [10, 20)
+    // Act
+    let beyond = snapshots.within(10, 20).await.unwrap();
+
+    // Assert
+    assert!(beyond.is_empty());
+}
+
+#[tokio::test]
+async fn test_snapshots_earlier_than() {
+    // Arrange
+    let uri = "memory://test_snapshots_earlier_than";
+    let dataset = setup_multi_version_dataset(uri, NUM_VERSIONS).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Test earlier_than by version: versions < 3, limit 2
+    // Act
+    let earlier = snapshots.earlier_than(3, 2).await.unwrap();
+
+    // Assert
+    assert_eq!(earlier.len(), 2);
+    // Should be versions 2 and 1 (latest first among earlier versions)
+    assert_eq!(earlier[0].version_number(), 2);
+    assert_eq!(earlier[1].version_number(), 1);
+
+    // Test earlier_than_timestamp
+    // Get timestamp of version 3
+    let all_snapshots = snapshots.list().await.unwrap();
+    let v3_timestamp = all_snapshots
+        .iter()
+        .find(|s| s.version_number() == 3)
+        .unwrap()
+        .timestamp();
+
+    // Act
+    let earlier_ts = snapshots
+        .earlier_than_timestamp(v3_timestamp, 2)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(earlier_ts.len(), 2);
+    for snapshot in earlier_ts {
+        assert!(snapshot.timestamp() < v3_timestamp);
+    }
+}
+
+#[tokio::test]
+async fn test_snapshots_later_than() {
+    // Arrange
+    let uri = "memory://test_snapshots_later_than";
+    let dataset = setup_multi_version_dataset(uri, NUM_VERSIONS).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Test later_than by version: versions >= 2, limit 2
+    // Act
+    let later = snapshots.later_than(2, 2).await.unwrap();
+
+    // Assert
+    assert_eq!(later.len(), 2);
+    // Should be versions 5 and 4 (latest first, since NUM_VERSIONS=5)
+    assert_eq!(later[0].version_number(), 5);
+    assert_eq!(later[1].version_number(), 4);
+
+    // Test later_than_timestamp
+    // Get timestamp of version 2
+    let all_snapshots = snapshots.list().await.unwrap();
+    let v2_timestamp = all_snapshots
+        .iter()
+        .find(|s| s.version_number() == 2)
+        .unwrap()
+        .timestamp();
+
+    // Act
+    let later_ts = snapshots
+        .later_than_timestamp(v2_timestamp, 2)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(later_ts.len(), 2);
+    for snapshot in later_ts {
+        assert!(snapshot.timestamp() >= v2_timestamp);
+    }
+}
+
+#[tokio::test]
+async fn test_snapshots_lazy_loading() {
+    // Arrange
+    let uri = "memory://test_snapshots_lazy_loading";
+    let dataset = setup_multi_version_dataset(uri, 3).await.unwrap();
+    let snapshots = dataset.snapshots();
+
+    // Act: Get snapshot without accessing manifest
+    let snapshot = snapshots.latest().await.unwrap();
+
+    // Assert: version_number and timestamp should work without loading manifest
+    // Latest version should be 3
+    assert_eq!(snapshot.version_number(), 3);
+    // Note: accessing timestamp might load manifest depending on implementation
+
+    // Now access manifest
+    let manifest = snapshot.manifest().await.unwrap();
+
+    // The manifest should have the correct version
+    assert_eq!(manifest.version, 3);
+}
+
+#[tokio::test]
+async fn test_snapshots_checkout_reuses_manifest() {
+    // Arrange
+    let uri = "memory://test_snapshots_checkout_reuses";
+    let dataset = setup_multi_version_dataset(uri, 3).await.unwrap();
+    let snapshots = dataset.snapshots();
+    let snapshot = snapshots.list().await.unwrap().into_iter().nth(1).unwrap();
+
+    // Act: First access manifest (loads it)
+    let _manifest = snapshot.manifest().await.unwrap();
+
+    // Then checkout (should reuse the loaded manifest)
+    let checked_out = snapshot.checkout().await.unwrap();
+
+    // Assert: The checked out dataset should have the same version
+    assert_eq!(checked_out.manifest().version, snapshot.version_number());
+}

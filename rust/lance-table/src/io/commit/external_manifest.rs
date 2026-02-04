@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
 };
@@ -57,6 +58,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             size: None,
             naming_scheme,
             e_tag: None,
+            last_modified: Utc::now(),
         })
     }
 
@@ -84,6 +86,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     size: None,
                     naming_scheme,
                     e_tag: None,
+                    last_modified: Utc::now(),
                 })
             })
             .transpose()
@@ -194,6 +197,7 @@ impl ExternalManifestCommitHandler {
             size: Some(size),
             naming_scheme,
             e_tag,
+            last_modified: Utc::now(),
         };
 
         if !copied {
@@ -242,6 +246,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 size,
                 naming_scheme,
                 e_tag,
+                last_modified,
             }) => {
                 // The path is finalized, no need to check object store
                 if path.extension() == Some(MANIFEST_EXTENSION) {
@@ -251,6 +256,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         size,
                         naming_scheme,
                         e_tag,
+                        last_modified,
                     });
                 }
 
@@ -339,6 +345,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             size: Some(size),
                             naming_scheme,
                             e_tag,
+                            last_modified: Utc::now(),
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {

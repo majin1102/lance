@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{fmt::Debug, fs::DirEntry};
-
+use chrono::{DateTime, Utc};
 use super::manifest::write_manifest;
 use futures::future::Either;
 use futures::Stream;
@@ -224,6 +224,8 @@ pub struct ManifestLocation {
     /// if we detect a change in the e-tag, it means the manifest was tampered with.
     /// This might happen if the dataset was deleted and then re-created.
     pub e_tag: Option<String>,
+    /// Last modified time of the manifest file.
+    pub last_modified: DateTime<Utc>,
 }
 
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
@@ -251,6 +253,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            last_modified: meta.last_modified,
         })
     }
 }
@@ -316,6 +319,7 @@ async fn current_manifest_path(
                 size: Some(meta.size),
                 naming_scheme: scheme,
                 e_tag: meta.e_tag,
+                last_modified: meta.last_modified,
             })
         }
         // If the list is not lexically ordered, we need to iterate all manifests
@@ -352,6 +356,7 @@ async fn current_manifest_path(
                 size: Some(current_meta.size),
                 naming_scheme: scheme,
                 e_tag: current_meta.e_tag,
+                last_modified: current_meta.last_modified,
             })
         }
         (None, _) => Err(Error::NotFound {
@@ -420,6 +425,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             size: Some(metadata.len()),
             naming_scheme: scheme.unwrap(),
             e_tag: Some(get_etag(&metadata)),
+            last_modified: get_last_modified(&metadata)?,
         }))
     } else {
         Ok(None)
@@ -441,6 +447,13 @@ fn get_etag(metadata: &std::fs::Metadata) -> String {
     // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
     // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
     format!("{inode:x}-{mtime:x}-{size:x}")
+}
+
+/// Get the last modified time from file metadata.
+fn get_last_modified(metadata: &std::fs::Metadata) -> std::io::Result<DateTime<Utc>> {
+    let mtime = metadata.modified()?;
+    let dt = DateTime::<Utc>::from(mtime);
+    Ok(dt)
 }
 
 #[cfg(unix)]
@@ -608,6 +621,7 @@ async fn default_resolve_version(
             path: ManifestNamingScheme::V2.manifest_path(base_path, version),
             size: None,
             e_tag: None,
+            last_modified: Utc::now(),
         });
     }
 
@@ -621,6 +635,7 @@ async fn default_resolve_version(
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            last_modified: meta.last_modified,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -631,6 +646,7 @@ async fn default_resolve_version(
                 size: None,
                 naming_scheme: scheme,
                 e_tag: None,
+                last_modified: Utc::now(),
             })
         }
         Err(e) => Err(e.into()),
@@ -875,6 +891,7 @@ impl CommitHandler for UnsafeCommitHandler {
             naming_scheme,
             path: version_path,
             e_tag: res.e_tag,
+            last_modified: Utc::now(),
         })
     }
 }
@@ -958,6 +975,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
             naming_scheme,
             path,
             e_tag: res.e_tag,
+            last_modified: Utc::now(),
         })
     }
 }
@@ -1026,6 +1044,7 @@ impl CommitHandler for RenameCommitHandler {
                     size: Some(res.size as u64),
                     naming_scheme,
                     e_tag: None, // Re-name can change e-tag.
+                    last_modified: Utc::now(),
                 })
             }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
@@ -1101,6 +1120,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             size: Some(size),
             naming_scheme,
             e_tag: res.e_tag,
+            last_modified: Utc::now(),
         })
     }
 }
