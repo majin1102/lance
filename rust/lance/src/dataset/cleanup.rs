@@ -2292,7 +2292,8 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("text", DataType::Utf8, false),
         ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
         Dataset::write(
@@ -2305,10 +2306,7 @@ mod tests {
             }),
         )
         .await?;
-        let mut main = BranchDatasetFixture::new(
-            fixture.clone(),
-            fixture.load().await?,
-        );
+        let mut main = BranchDatasetFixture::new(fixture.clone(), fixture.load().await?);
         // Initial index creation and refresh counts
         main.create_text_index().await?;
         main.write_data().await?;
@@ -2316,21 +2314,31 @@ mod tests {
         // Create branch1 from main@v1, then do an initial append + deterministic delete
         let mut branch1 = BranchDatasetFixture::new(
             fixture.clone(),
-            fixture.create_branch_and_load(&mut main.dataset, "branch1", (None, None)).await?,
+            fixture
+                .create_branch_and_load(&mut main.dataset, "branch1", (None, None))
+                .await?,
         );
         branch1.write_data().await?;
 
         // Create branch2 from branch1@latest
         let mut branch2 = BranchDatasetFixture::new(
             fixture.clone(),
-            fixture.create_branch_and_load(&mut branch1.dataset, "dev/branch2", ("branch1", None)).await?,
+            fixture
+                .create_branch_and_load(&mut branch1.dataset, "dev/branch2", ("branch1", None))
+                .await?,
         );
         branch2.write_data().await?;
 
         // Create branch3 from branch2@latest, initial append + delete
         let mut branch3 = BranchDatasetFixture::new(
             fixture.clone(),
-            fixture.create_branch_and_load(&mut branch2.dataset, "feature/nathan/branch3", ("dev/branch2", None)).await?,
+            fixture
+                .create_branch_and_load(
+                    &mut branch2.dataset,
+                    "feature/nathan/branch3",
+                    ("dev/branch2", None),
+                )
+                .await?,
         );
         branch3.write_data().await?;
 
@@ -2338,7 +2346,9 @@ mod tests {
         main.write_data().await?;
         let mut branch4 = BranchDatasetFixture::new(
             fixture.clone(),
-            fixture.create_branch_and_load(&mut main.dataset, "branch4", (None, None)).await?,
+            fixture
+                .create_branch_and_load(&mut main.dataset, "branch4", (None, None))
+                .await?,
         );
         branch4.write_data().await?;
 
@@ -2419,7 +2429,8 @@ mod tests {
                 Field::new("id", DataType::Int32, false),
                 Field::new("text", DataType::Utf8, false),
             ]));
-            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
             let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
             self.dataset
@@ -2456,7 +2467,11 @@ mod tests {
             let branch_path = self.dataset.base.clone();
 
             // Count files in a directory, filtering by optional extension(s).
-            async fn count_dir(os: &ObjectStore, dir: &Path, exts: Option<&[&str]>) -> Result<usize> {
+            async fn count_dir(
+                os: &ObjectStore,
+                dir: &Path,
+                exts: Option<&[&str]>,
+            ) -> Result<usize> {
                 let mut count = 0usize;
                 let mut s = os.read_dir_all(dir, None);
                 while let Some(meta) = s.try_next().await? {
@@ -2475,16 +2490,20 @@ mod tests {
             }
 
             let manifest_dir = branch_path.child("_versions");
-            self.counts.num_manifest_files =
-                count_dir(&self.dataset.object_store, &manifest_dir, Some(&["manifest"]))
-                    .await
-                    .unwrap_or(0);
+            self.counts.num_manifest_files = count_dir(
+                &self.dataset.object_store,
+                &manifest_dir,
+                Some(&["manifest"]),
+            )
+            .await
+            .unwrap_or(0);
 
             // Transactions: count files under _transactions (extension .txn)
             let txn_dir = branch_path.child("_transactions");
-            self.counts.num_tx_files = count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
-                .await
-                .unwrap_or(0);
+            self.counts.num_tx_files =
+                count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
+                    .await
+                    .unwrap_or(0);
 
             // Indices: count files under _indices
             let idx_dir = branch_path.child(crate::dataset::INDICES_DIR);
@@ -2494,16 +2513,20 @@ mod tests {
 
             // Deletions: count files under _deletions (extensions .arrow / .bin)
             let del_dir = branch_path.child("_deletions");
-            self.counts.num_delete_files =
-                count_dir(&self.dataset.object_store, &del_dir, Some(&["arrow", "bin"]))
-                    .await
-                    .unwrap_or(0);
+            self.counts.num_delete_files = count_dir(
+                &self.dataset.object_store,
+                &del_dir,
+                Some(&["arrow", "bin"]),
+            )
+            .await
+            .unwrap_or(0);
 
             // Data files: count .lance files under data/
             let data_dir = branch_path.child(crate::dataset::DATA_DIR);
-            self.counts.num_data_files = count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
-                .await
-                .unwrap_or(0);
+            self.counts.num_data_files =
+                count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
+                    .await
+                    .unwrap_or(0);
 
             Ok(())
         }
@@ -2524,7 +2547,10 @@ mod tests {
             let pre_data_count = self.count_data().await?;
 
             self.refresh().await?;
-            assert_eq!(self.counts.num_manifest_files, pre_counts.num_manifest_files);
+            assert_eq!(
+                self.counts.num_manifest_files,
+                pre_counts.num_manifest_files
+            );
             assert_eq!(self.counts.num_data_files, pre_counts.num_data_files);
             assert_eq!(self.counts.num_tx_files, pre_counts.num_tx_files);
             assert_eq!(self.counts.num_delete_files, pre_counts.num_delete_files);
@@ -2656,7 +2682,9 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
         assert_eq!(setup.branch3.counts.num_index_files, 4);
-        setup.assert_unchanged(&["branch1", "branch2", "branch4", "main"]).await;
+        setup
+            .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
+            .await;
 
         setup.branch2.compact().await.unwrap();
         setup.branch2.run_cleanup().await.unwrap();
@@ -2680,7 +2708,9 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
         assert_eq!(setup.branch3.counts.num_index_files, 4);
-        setup.assert_unchanged(&["branch1", "branch2", "branch4", "main"]).await;
+        setup
+            .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
+            .await;
 
         setup.branch2.compact().await.unwrap();
         setup.branch2.run_cleanup().await.unwrap();
@@ -2940,7 +2970,9 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
         assert_eq!(setup.branch3.counts.num_index_files, 4);
-        setup.assert_unchanged(&["branch1", "branch4", "main"]).await;
+        setup
+            .assert_unchanged(&["branch1", "branch4", "main"])
+            .await;
 
         setup.disable_auto_cleanup().await.unwrap();
         setup.branch2.write_data().await.unwrap();
@@ -2967,7 +2999,9 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
         assert_eq!(setup.branch3.counts.num_index_files, 4);
-        setup.assert_unchanged(&["branch1", "branch4", "main"]).await;
+        setup
+            .assert_unchanged(&["branch1", "branch4", "main"])
+            .await;
     }
 
     #[tokio::test]
