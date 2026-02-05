@@ -125,7 +125,7 @@ impl BlockingDataset {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
-        version: Option<i32>,
+        version: Option<u64>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
@@ -165,7 +165,7 @@ impl BlockingDataset {
         let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
 
         if let Some(ver) = version {
-            builder = builder.with_version(ver as u64);
+            builder = builder.with_version(ver);
         }
 
         if let Some(serialized_manifest) = serialized_manifest {
@@ -1038,7 +1038,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
-    version_obj: JObject,    // Optional<Integer>
+    version_obj: JObject,    // Optional<Long>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1066,7 +1066,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
-    version_obj: JObject,    // Optional<Integer>
+    version_obj: JObject,    // Optional<Long>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1075,7 +1075,7 @@ fn inner_open_native<'local>(
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
-    let version = env.get_int_opt(&version_obj)?;
+    let version = env.get_u64_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;

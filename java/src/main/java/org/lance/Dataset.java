@@ -341,7 +341,7 @@ public class Dataset implements Closeable {
 
   private static native Dataset openNative(
       String path,
-      Optional<Integer> version,
+      Optional<Long> version,
       Optional<Integer> blockSize,
       long indexCacheSize,
       long metadataCacheSizeBytes,
