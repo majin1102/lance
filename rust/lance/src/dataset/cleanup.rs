@@ -176,7 +176,6 @@ impl<'a> CleanupTask<'a> {
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
-
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
@@ -184,7 +183,6 @@ impl<'a> CleanupTask<'a> {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
             .await?;
-
         Ok(inspection.into_inner().unwrap())
     }
 
@@ -199,6 +197,7 @@ impl<'a> CleanupTask<'a> {
         // to ignore a manifest error because if it is a temporary I/O error and we
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
+
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let dataset_version = self.dataset.version().version;
@@ -241,7 +240,7 @@ impl<'a> CleanupTask<'a> {
     fn process_manifest(
         &self,
         manifest: &Manifest,
-        indexes: &[IndexMetadata],
+        indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {
@@ -1015,7 +1014,7 @@ mod tests {
     use snafu::location;
 
     #[derive(Debug)]
-    pub struct MockObjectStore {
+    struct MockObjectStore {
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
@@ -1079,8 +1078,8 @@ mod tests {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
         _tmpdir: TempStrDir,
-        pub dataset_path: String,
-        pub mock_store: Arc<MockObjectStore>,
+        dataset_path: String,
+        mock_store: Arc<MockObjectStore>,
     }
 
     impl MockDatasetFixture {

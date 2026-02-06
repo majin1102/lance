@@ -682,6 +682,8 @@ impl BranchIdentifier {
         Self { version_mapping }
     }
 
+    // The null branch identifier is used for legacy BranchContent entries that don't have an explicit identifier.
+    // Because their parent version_number is 0, these branches have no valid lineage and are skipped during cleanup.
     pub fn null() -> Self {
         Self {
             version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
