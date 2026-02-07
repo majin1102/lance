@@ -37,6 +37,8 @@ use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
 use chrono::{DateTime, TimeDelta, Utc};
+use dashmap::DashSet;
+use futures::future::try_join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 use humantime::parse_duration;
 use lance_core::{
@@ -95,7 +97,7 @@ struct CleanupTask<'a> {
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
-    old_manifests: HashMap<Path, Manifest>,
+    old_manifests: HashMap<Path, u64>,
     /// Referenced files are part of our working set
     referenced_files: ReferencedFiles,
     /// Verified files may or may not be part of the working set but they are
@@ -223,7 +225,7 @@ impl<'a> CleanupTask<'a> {
         if !in_working_set {
             inspection
                 .old_manifests
-                .insert(location.path.clone(), manifest);
+                .insert(location.path.clone(), manifest.version);
         } else {
             let commit_ts = manifest.timestamp();
             if let Some(ts) = inspection.earliest_retained_manifest_time {
@@ -576,34 +578,52 @@ impl<'a> CleanupTask<'a> {
         let all_branches = self.dataset.branches().list().await?;
         let children = current_branch_id.collect_referenced_versions(&all_branches);
 
-        // We need to use vec so we can clean them in the correct order
-        let mut referenced_branches: Vec<(String, u64)> = Vec::new();
-        // Build referenced version map by traversing the branch lineage
-        for (branch_name, referenced_version) in children.iter() {
-            let manifest_location = self
-                .dataset
-                .commit_handler
-                .resolve_version_location(
-                    &self.dataset.base,
-                    *referenced_version,
-                    &self.dataset.object_store.inner,
-                )
-                .await?;
-            let manifest = read_manifest(
-                &self.dataset.object_store,
-                &manifest_location.path,
-                manifest_location.size,
-            )
-            .await;
+        // Use a concurrent set to identify branches eligible for cleanup.
+        // The filter below preserves the original (branch_name, version) tuples.
+        let referenced_branches: DashSet<String> = DashSet::new();
+        let tasks: Vec<_> = children
+            .iter()
+            .map(|(branch_name, referenced_version)| {
+                let dataset = &self.dataset;
+                let policy = &self.policy;
+                let referenced_branches = &referenced_branches;
 
-            // If the parent manifest has been cleaned, or the parent manifest should be clean
-            // we should check the referenced branch to make sure the referenced files could be retained
-            if let Ok(manifest) = manifest {
-                if self.policy.should_clean(&manifest) {
-                    referenced_branches.push((branch_name.clone(), *referenced_version));
+                async move {
+                    let manifest_location = dataset
+                        .commit_handler
+                        .resolve_version_location(
+                            &dataset.base,
+                            *referenced_version,
+                            &dataset.object_store.inner,
+                        )
+                        .await?;
+
+                    let manifest = read_manifest(
+                        &dataset.object_store,
+                        &manifest_location.path,
+                        manifest_location.size,
+                    )
+                    .await;
+
+                    if let Ok(manifest) = manifest {
+                        if policy.should_clean(&manifest) {
+                            referenced_branches.insert(branch_name.clone());
+                        }
+                    }
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                 }
-            }
-        }
+            })
+            .collect();
+
+        try_join_all(tasks).await?;
+
+        // Filter children to only include branches that should be cleaned.
+        // The DashSet contains branch names found eligible during concurrent scan.
+        let referenced_branches = children
+            .iter()
+            .filter(|(branch_name, _)| referenced_branches.contains(branch_name))
+            .cloned()
+            .collect();
         Ok(referenced_branches)
     }
 
@@ -611,23 +631,49 @@ impl<'a> CleanupTask<'a> {
         &self,
         referenced_branches: &[(String, u64)],
     ) -> Result<RemovalStats> {
-        let mut final_stats = RemovalStats::default();
-        for (branch, _) in referenced_branches {
-            let branch_dataset = self
-                .dataset
-                .checkout_version((branch.as_str(), None))
-                .await?;
-            if let Some(stats) =
-                cleanup_cascade_branch(&branch_dataset, branch_dataset.manifest.as_ref()).await?
-            {
-                final_stats.bytes_removed += stats.bytes_removed;
-                final_stats.old_versions += stats.old_versions;
-            }
+        let final_stats = Mutex::new(RemovalStats::default());
+
+        // Group branches by their lineage identifier (BranchIdentifier).
+        // Branches with the same identifier share a lineage and must be cleaned sequentially
+        // to preserve cleanup order. Different lineages can be cleaned concurrently.
+        let mut branches_chains = HashMap::new();
+        for (branch, id) in referenced_branches {
+            branches_chains
+                .entry(*id)
+                .or_insert_with(Vec::new)
+                .push(branch.clone());
         }
-        Ok(final_stats)
+        let tasks: Vec<_> = branches_chains
+            .values()
+            .map(|branch_chain| {
+                let final_stats = &final_stats;
+                async move {
+                    for branch in branch_chain {
+                        let branch_dataset = self
+                            .dataset
+                            .checkout_version((branch.as_str(), None))
+                            .await?;
+                        if let Some(stats) = cleanup_cascade_branch(
+                            &branch_dataset,
+                            branch_dataset.manifest.as_ref(),
+                        )
+                        .await?
+                        {
+                            let mut stats_guard = final_stats.lock().unwrap();
+                            stats_guard.bytes_removed += stats.bytes_removed;
+                            stats_guard.old_versions += stats.old_versions;
+                        }
+                    }
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                }
+            })
+            .collect();
+        try_join_all(tasks).await?;
+        Ok(final_stats.into_inner().unwrap())
     }
 
-    // We need to retain the latest manifest that has the file referenced by descendants_branches
+    // Retain manifests containing files referenced by descendant branches.
+    // This protects parent branch files that are still needed by child branches.
     async fn retain_branch_lineage_files(
         &self,
         inspection: CleanupInspection,
@@ -635,13 +681,13 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(inspection);
         for (branch, root_version_number) in referenced_branches {
-            let branch = self
-                .dataset
-                .checkout_version((branch.as_str(), None))
-                .await?;
-            branch
+            // Use find_branch to get the branch path directly without checkout.
+            // This avoids creating a dataset instance and prevents manifest deletion
+            // during the retain operation.
+            let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
+            self.dataset
                 .commit_handler
-                .list_manifest_locations(&branch.base, &self.dataset.object_store, false)
+                .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
                         location,
@@ -731,7 +777,7 @@ impl<'a> CleanupTask<'a> {
         if is_referenced {
             inspection
                 .old_manifests
-                .retain(|_path, manifest| manifest.version != referenced_version);
+                .retain(|_path, version_number| *version_number != referenced_version);
         }
 
         Ok(())
@@ -877,7 +923,6 @@ pub async fn cleanup_cascade_branch(
     if let Some(mut policy) = policy {
         policy.clean_referenced_branches = false;
         policy.error_if_tagged_old_versions = false;
-        policy.delete_unverified = false;
         Ok(Some(dataset.cleanup_with_policy(policy).await?))
     } else {
         Ok(None)

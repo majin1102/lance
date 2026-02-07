@@ -663,7 +663,7 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
-    #[serde(default = "null_branch_identifier")]
+    #[serde(default = "BranchIdentifier::none")]
     pub identifier: BranchIdentifier,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
@@ -682,9 +682,9 @@ impl BranchIdentifier {
         Self { version_mapping }
     }
 
-    // The null branch identifier is used for legacy BranchContent entries that don't have an explicit identifier.
-    // Because their parent version_number is 0, these branches have no valid lineage and are skipped during cleanup.
-    pub fn null() -> Self {
+    /// Creates a branch identifier for legacy branches without explicit lineage.
+    /// Legacy branches have parent_version=0 and are skipped during cleanup.
+    pub fn none() -> Self {
         Self {
             version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
         }
@@ -730,7 +730,8 @@ impl BranchIdentifier {
             .filter(|&version| version > 0)
     }
 
-    /// Collect all (branch_name, referenced_version) tuples in deep-first order.
+    /// Collects all branches that reference this branch, returning (branch_name, version) tuples.
+    /// Results are in post-order traversal (deepest branches first).
     pub fn collect_referenced_versions(
         &self,
         branches: &HashMap<String, BranchContents>,
@@ -750,11 +751,6 @@ impl BranchIdentifier {
             })
             .collect()
     }
-}
-
-// This is used to provide backwards compatibility for branches don't have an identifier
-pub fn null_branch_identifier() -> BranchIdentifier {
-    BranchIdentifier::null()
 }
 
 pub fn base_tags_path(base_path: &Path) -> Path {
@@ -1072,7 +1068,7 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
-            identifier: null_branch_identifier(),
+            identifier: BranchIdentifier::none(),
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
@@ -1169,9 +1165,9 @@ mod tests {
     /// Build a reusable mocked BranchContents map mirroring cleanup::lineage_tests::build_lineage_datasets.
     ///
     /// Structure:
-    //    main:v1 ──▶ branch1:v1 ──▶ dev/branch2:v2 ──▶ feature/nathan/branch3:v3
-    //        │
-    //    (main:v2) ──▶ branch4:v2
+    ///    main:v1 ──▶ branch1:v1 ──▶ dev/branch2:v2 ──▶ feature/nathan/branch3:v3
+    ///        │
+    ///    (main:v2) ──▶ branch4:v2
     ///
     /// Notes:
     /// - The "main" root is virtual (no BranchContents entry).
