@@ -610,7 +610,7 @@ impl<'a> CleanupTask<'a> {
                             referenced_branches.insert(branch_name.clone());
                         }
                     }
-                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                    Ok::<(), Error>(())
                 }
             })
             .collect();
@@ -664,7 +664,7 @@ impl<'a> CleanupTask<'a> {
                             stats_guard.old_versions += stats.old_versions;
                         }
                     }
-                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                    Ok::<(), Error>(())
                 }
             })
             .collect();
