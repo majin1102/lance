@@ -39,8 +39,8 @@ public class VectorIndexParams {
   }
 
   private void validate() {
-    if (pqParams.isPresent() && sqParams.isPresent()) {
-      throw new IllegalArgumentException("PQ and SQ cannot coexist");
+    if ((pqParams.isPresent() ? 1 : 0) + (sqParams.isPresent() ? 1 : 0) + (rqParams.isPresent() ? 1 : 0) > 1) {
+      throw new IllegalArgumentException("Only one of PQ, SQ, or RQ can be specified at a time.");
     }
     if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
       throw new IllegalArgumentException("HNSW must be combined with either PQ or SQ");
