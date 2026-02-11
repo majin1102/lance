@@ -368,7 +368,7 @@ public class VectorIndexTest {
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
         IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
-        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((short) 1).build();
+        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).build();
 
         VectorIndexParams vectorIndexParams =
             VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);

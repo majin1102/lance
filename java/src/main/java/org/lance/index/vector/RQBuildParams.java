@@ -17,14 +17,14 @@ import com.google.common.base.MoreObjects;
 
 /** Parameters for building a Rabit Quantizer (RQ) index stage. */
 public class RQBuildParams {
-  private final short numBits;
+  private final byte numBits;
 
   private RQBuildParams(Builder builder) {
     this.numBits = builder.numBits;
   }
 
   public static class Builder {
-    private short numBits = 1;
+    private byte numBits = 1;
 
     public Builder() {}
 
@@ -32,7 +32,7 @@ public class RQBuildParams {
      * @param numBits number of bits per dimension used by Rabit quantization.
      * @return Builder
      */
-    public Builder setNumBits(short numBits) {
+    public Builder setNumBits(byte numBits) {
       this.numBits = numBits;
       return this;
     }
@@ -42,7 +42,7 @@ public class RQBuildParams {
     }
   }
 
-  public short getNumBits() {
+  public byte getNumBits() {
     return numBits;
   }
 

@@ -39,7 +39,10 @@ public class VectorIndexParams {
   }
 
   private void validate() {
-    if ((pqParams.isPresent() ? 1 : 0) + (sqParams.isPresent() ? 1 : 0) + (rqParams.isPresent() ? 1 : 0) > 1) {
+    if ((pqParams.isPresent() ? 1 : 0)
+            + (sqParams.isPresent() ? 1 : 0)
+            + (rqParams.isPresent() ? 1 : 0)
+        > 1) {
       throw new IllegalArgumentException("Only one of PQ, SQ, or RQ can be specified at a time.");
     }
     if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
@@ -111,7 +114,7 @@ public class VectorIndexParams {
    * @return the VectorIndexParams
    */
   public static VectorIndexParams ivfRq(
-      int numPartitions, short numBits, DistanceType distanceType) {
+      int numPartitions, byte numBits, DistanceType distanceType) {
     IvfBuildParams ivfParams = new IvfBuildParams.Builder().setNumPartitions(numPartitions).build();
     RQBuildParams rqParams = new RQBuildParams.Builder().setNumBits(numBits).build();
 

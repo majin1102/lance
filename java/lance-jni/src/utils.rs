@@ -405,7 +405,7 @@ pub fn get_vector_index_params(
                 &vector_index_params_obj,
                 "getRqParams",
                 |env, rq_obj| {
-                    let num_bits = env.call_method(&rq_obj, "getNumBits", "()S", &[])?.s()? as u8;
+                    let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
                     Ok(RQBuildParams { num_bits })
                 },
             )?;
