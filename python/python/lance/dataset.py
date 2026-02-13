@@ -3395,6 +3395,7 @@ class LanceDataset(pa.dataset.Dataset):
         max_retries: int = 20,
         *,
         commit_message: Optional[str] = None,
+        enable_stable_row_ids: Optional[bool] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3456,6 +3457,11 @@ class LanceDataset(pa.dataset.Dataset):
         commit_message: str, optional
             A message to associate with this commit. This message will be stored in the
             dataset's metadata and can be retrieved using read_transaction().
+        enable_stable_row_ids: bool, optional
+            If True, enables stable row IDs when creating a new dataset.  Stable
+            row IDs assign each row a monotonically increasing id that persists
+            across compaction and other maintenance operations.  This option is
+            ignored for existing datasets.
 
         Returns
         -------
@@ -3525,6 +3531,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
+                enable_stable_row_ids=enable_stable_row_ids,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -3538,6 +3545,7 @@ class LanceDataset(pa.dataset.Dataset):
                 detached=detached,
                 max_retries=max_retries,
                 commit_message=commit_message,
+                enable_stable_row_ids=enable_stable_row_ids,
             )
         else:
             raise TypeError(

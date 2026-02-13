@@ -34,7 +34,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
 use datafusion_functions::core::getfield::GetFieldFunc;
-use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -53,6 +53,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
+use lance_datafusion::aggregate::Aggregate;
 use lance_datafusion::exec::{
     analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
 };
@@ -462,6 +463,223 @@ impl ExprFilter {
     }
 }
 
+/// Aggregate expression from Substrait or DataFusion.
+#[derive(Debug, Clone)]
+pub enum AggregateExpr {
+    #[cfg(feature = "substrait")]
+    Substrait(Vec<u8>),
+    Datafusion {
+        group_by: Vec<Expr>,
+        aggregates: Vec<Expr>,
+    },
+}
+
+impl AggregateExpr {
+    /// Create a new builder for aggregate expressions.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let agg = AggregateExpr::builder()
+    ///     .group_by("category")
+    ///     .count_star().alias("total_count")
+    ///     .sum("amount").alias("total_amount")
+    ///     .avg("price")
+    ///     .build();
+    /// scanner.aggregate(agg);
+    /// ```
+    pub fn builder() -> AggregateExprBuilder<false> {
+        AggregateExprBuilder::new()
+    }
+
+    /// Create from Substrait Plan bytes.
+    #[cfg(feature = "substrait")]
+    pub fn substrait(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Substrait(bytes.into())
+    }
+
+    /// Create from DataFusion expressions.
+    /// Use `.alias()` on expressions to set output column names.
+    pub fn datafusion(group_by: Vec<Expr>, aggregates: Vec<Expr>) -> Self {
+        Self::Datafusion {
+            group_by,
+            aggregates,
+        }
+    }
+
+    fn to_aggregate(
+        &self,
+        #[allow(unused_variables)] schema: Arc<ArrowSchema>,
+    ) -> Result<Aggregate> {
+        match self {
+            #[cfg(feature = "substrait")]
+            Self::Substrait(bytes) => {
+                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+                use lance_datafusion::substrait::parse_substrait_aggregate;
+
+                let ctx = get_session_context(&LanceExecutionOptions::default());
+                parse_substrait_aggregate(bytes, schema, &ctx.state())
+                    .now_or_never()
+                    .expect("could not parse the Substrait aggregate in a synchronous fashion")
+            }
+            Self::Datafusion {
+                group_by,
+                aggregates,
+            } => Ok(Aggregate {
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+            }),
+        }
+    }
+}
+
+/// Builder for creating aggregate expressions without using DataFusion or Substrait directly.
+///
+/// The const generic `HAS_PENDING` tracks whether there's a pending aggregate that can be aliased.
+/// When `HAS_PENDING` is `true`, the last item in `aggregates` is the pending aggregate.
+#[derive(Debug, Clone)]
+pub struct AggregateExprBuilder<const HAS_PENDING: bool> {
+    group_by: Vec<Expr>,
+    aggregates: Vec<Expr>,
+}
+
+impl Default for AggregateExprBuilder<false> {
+    fn default() -> Self {
+        Self {
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+        }
+    }
+}
+
+impl AggregateExprBuilder<false> {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build the aggregate expression.
+    pub fn build(self) -> AggregateExpr {
+        AggregateExpr::Datafusion {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+}
+
+impl<const HAS_PENDING: bool> AggregateExprBuilder<HAS_PENDING> {
+    /// Add a column to group by.
+    ///
+    /// Multiple invocations will add to the list (not replace it).
+    /// E.g. `.group_by("x").group_by("y")` will group by both `x` and `y`.
+    pub fn group_by(mut self, column: impl Into<String>) -> AggregateExprBuilder<false> {
+        self.group_by.push(col(column.into()));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add multiple columns to group by.
+    ///
+    /// Multiple invocations will add to the list (not replace it).
+    /// E.g. `.group_by("x").group_by_columns(["y", "z"])` will group by `x`, `y`, and `z`.
+    pub fn group_by_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> AggregateExprBuilder<false> {
+        for column in columns {
+            self.group_by.push(col(column.into()));
+        }
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add COUNT(*) aggregate that counts all rows.
+    pub fn count_star(mut self) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::count::count(lit(1)));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add COUNT(column) aggregate.
+    ///
+    /// Unlike `count_star`, this will only count the number of rows where `column`
+    /// is not NULL.
+    pub fn count(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::count::count(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add SUM(column) aggregate.
+    pub fn sum(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::sum::sum(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add AVG(column) aggregate.
+    pub fn avg(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::average::avg(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add MIN(column) aggregate.
+    pub fn min(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::min_max::min(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Add MAX(column) aggregate.
+    pub fn max(mut self, column: impl Into<String>) -> AggregateExprBuilder<true> {
+        self.aggregates
+            .push(functions_aggregate::min_max::max(col(column.into())));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+}
+
+impl AggregateExprBuilder<true> {
+    /// Set an alias for the pending aggregate (the last added aggregate).
+    pub fn alias(mut self, name: impl Into<String>) -> AggregateExprBuilder<false> {
+        let pending = self.aggregates.pop().expect("pending aggregate must exist");
+        self.aggregates.push(pending.alias(name.into()));
+        AggregateExprBuilder {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+
+    /// Build the aggregate expression.
+    pub fn build(self) -> AggregateExpr {
+        AggregateExpr::Datafusion {
+            group_by: self.group_by,
+            aggregates: self.aggregates,
+        }
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -569,6 +787,8 @@ pub struct Scanner {
 
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
+
+    aggregate: Option<AggregateExpr>,
 
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
@@ -787,6 +1007,7 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            aggregate: None,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
@@ -1014,6 +1235,12 @@ impl Scanner {
 
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter.expr_filter = Some(ExprFilter::Datafusion(filter));
+        self
+    }
+
+    /// Set aggregation.
+    pub fn aggregate(&mut self, aggregate: AggregateExpr) -> &mut Self {
+        self.aggregate = Some(aggregate);
         self
     }
 
@@ -1718,7 +1945,10 @@ impl Scanner {
             let input_phy_exprs: &[Arc<dyn PhysicalExpr>] = &[one];
             let schema = plan.schema();
 
-            let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
+            let mut builder = datafusion_physical_expr::aggregate::AggregateExprBuilder::new(
+                count_udaf(),
+                input_phy_exprs.to_vec(),
+            );
             builder = builder.schema(schema);
             builder = builder.alias("count_rows".to_string());
 
@@ -1765,6 +1995,161 @@ impl Scanner {
             }
         }
         .boxed()
+    }
+
+    /// Create an execution plan with aggregation.
+    ///
+    /// Requires `aggregate()` to be called first.
+    #[deprecated(note = "Use create_plan() instead, which now applies aggregate automatically")]
+    pub fn create_aggregate_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+        async move {
+            if self.aggregate.is_none() {
+                return Err(Error::invalid_input(
+                    "create_aggregate_plan called but no aggregate was set",
+                    location!(),
+                ));
+            }
+            // create_plan() now applies aggregate automatically when set
+            self.create_plan().await
+        }
+        .boxed()
+    }
+
+    async fn apply_aggregate(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        agg_spec: &AggregateExpr,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
+
+        let schema = plan.schema();
+        let agg = agg_spec.to_aggregate(schema.clone())?;
+        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+
+        let group_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = agg
+            .group_by
+            .iter()
+            .map(|expr| {
+                let name = expr.schema_name().to_string();
+                let physical_expr =
+                    create_physical_expr(expr, &df_schema, &ExecutionProps::default())?;
+                Ok((physical_expr, name))
+            })
+            .collect::<Result<_>>()?;
+
+        #[allow(clippy::type_complexity)]
+        let aggr_results: Vec<(Arc<AggregateFunctionExpr>, Option<Arc<dyn PhysicalExpr>>)> = agg
+            .aggregates
+            .iter()
+            .map(|expr| self.build_physical_aggregate_expr(expr, &df_schema, &schema))
+            .collect::<Result<_>>()?;
+
+        let (aggr_exprs, filters): (Vec<_>, Vec<_>) = aggr_results.into_iter().unzip();
+
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(group_exprs),
+            aggr_exprs,
+            filters,
+            plan,
+            schema,
+        )?) as Arc<dyn ExecutionPlan>)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_physical_aggregate_expr(
+        &self,
+        expr: &Expr,
+        df_schema: &DFSchema,
+        input_schema: &SchemaRef,
+    ) -> Result<(
+        Arc<datafusion_physical_expr::aggregate::AggregateFunctionExpr>,
+        Option<Arc<dyn PhysicalExpr>>,
+    )> {
+        use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
+
+        let coerced_expr = self.coerce_aggregate_expr(expr, df_schema)?;
+
+        // Note: order_by is already embedded in the AggregateFunctionExpr for ordered aggregates
+        let (agg_expr, filter, _order_by) = create_aggregate_expr_and_maybe_filter(
+            &coerced_expr,
+            df_schema,
+            input_schema.as_ref(),
+            &ExecutionProps::default(),
+        )?;
+
+        Ok((agg_expr, filter))
+    }
+
+    /// Apply type coercion to aggregate arguments for UserDefined signature functions.
+    ///
+    /// Most aggregate functions (SUM, COUNT, MIN, MAX) have explicit type signatures that
+    /// DataFusion handles automatically. However, some functions like AVG use UserDefined
+    /// type signatures in the Substrait consumer, which means DataFusion doesn't know the
+    /// expected input types and won't perform automatic coercion. We must explicitly coerce
+    /// arguments to the types returned by `func.coerce_types()`.
+    fn coerce_aggregate_expr(&self, expr: &Expr, schema: &DFSchema) -> Result<Expr> {
+        Self::coerce_aggregate_expr_impl(expr, schema)
+    }
+
+    fn coerce_aggregate_expr_impl(expr: &Expr, schema: &DFSchema) -> Result<Expr> {
+        use datafusion::logical_expr::{expr::AggregateFunction, Expr, TypeSignature};
+
+        match expr {
+            Expr::AggregateFunction(agg_func) => {
+                let func = &agg_func.func;
+                let args = &agg_func.params.args;
+
+                // Only UserDefined signature functions need explicit coercion
+                if !matches!(func.signature().type_signature, TypeSignature::UserDefined) {
+                    return Ok(expr.clone());
+                }
+
+                if args.is_empty() {
+                    return Ok(expr.clone());
+                }
+
+                let current_types: Vec<arrow_schema::DataType> = args
+                    .iter()
+                    .map(|e| e.get_type(schema))
+                    .collect::<std::result::Result<_, _>>()?;
+
+                let coerced_types = func.coerce_types(&current_types)?;
+                let coerced_args: Vec<Expr> = args
+                    .iter()
+                    .zip(coerced_types.iter())
+                    .map(|(arg, target_type)| {
+                        let arg_type = arg.get_type(schema)?;
+                        if arg_type == *target_type {
+                            Ok(arg.clone())
+                        } else {
+                            arg.clone().cast_to(target_type, schema)
+                        }
+                    })
+                    .collect::<std::result::Result<_, _>>()?;
+
+                Ok(Expr::AggregateFunction(AggregateFunction::new_udf(
+                    func.clone(),
+                    coerced_args,
+                    agg_func.params.distinct,
+                    agg_func.params.filter.clone(),
+                    agg_func.params.order_by.clone(),
+                    agg_func.params.null_treatment,
+                )))
+            }
+            Expr::Alias(alias) => {
+                // Recursively coerce the inner expression and preserve the alias
+                let coerced_inner = Self::coerce_aggregate_expr_impl(&alias.expr, schema)?;
+                Ok(coerced_inner.alias(&alias.name))
+            }
+            other => Err(Error::invalid_input(
+                format!(
+                    "Expected aggregate function expression, got {:?}",
+                    other.variant_name()
+                ),
+                location!(),
+            )),
+        }
     }
 
     // A "narrow" field is a field that is so small that we are better off reading the
@@ -1850,6 +2235,25 @@ impl Scanner {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
             });
+        }
+
+        if self.aggregate.is_some() {
+            if self.limit.is_some() || self.offset.is_some() {
+                return Err(Error::InvalidInput {
+                    source:
+                        "Cannot use limit/offset with aggregate. Apply limit to the result instead."
+                            .into(),
+                    location: location!(),
+                });
+            }
+            if self.ordering.is_some() {
+                return Err(Error::InvalidInput {
+                    source:
+                        "Cannot use order_by with aggregate. Apply ordering to the result instead."
+                            .into(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())
@@ -2008,7 +2412,7 @@ impl Scanner {
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
         let mut use_limit_node = true;
-        // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
+        // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
             (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
@@ -2066,8 +2470,7 @@ impl Scanner {
             }
         };
 
-        // Stage 1.5 load columns needed for stages 2 & 3
-        // Calculate the schema needed for the filter and ordering.
+        // Load columns needed for filter and ordering
         let mut pre_filter_projection = self.dataset.empty_projection();
 
         // We may need to take filter columns if we are going to refine
@@ -2093,10 +2496,17 @@ impl Scanner {
 
         plan = self.take(plan, pre_filter_projection)?;
 
-        // Stage 2: filter
+        // Filter
         plan = filter_plan.refine_filter(plan, self).await?;
 
-        // Stage 3: sort
+        // Aggregate (if set, applies aggregate and returns early)
+        if let Some(agg_spec) = &self.aggregate {
+            // Take columns needed for aggregation
+            plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
+            return self.apply_aggregate(plan, agg_spec).await;
+        }
+
+        // Sort
         if let Some(ordering) = &self.ordering {
             let ordering_columns = ordering.iter().map(|col| &col.column_name);
             let projection_with_ordering = self
@@ -2128,25 +2538,25 @@ impl Scanner {
             ));
         }
 
-        // Stage 4: limit / offset
+        // Limit / offset
         if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
-        // Stage 5: take remaining columns required for projection
+        // Take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 6: Add system columns, if requested
+        // Add system columns, if requested
         if self.projection_plan.must_add_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
 
-        // Stage 7: final projection
+        // Final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
-        // Stage 8: If requested, apply a strict batch size to the final output
+        // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
@@ -2747,7 +3157,7 @@ impl Scanner {
                     AggregateMode::Single,
                     PhysicalGroupBy::new_single(group_expr),
                     vec![Arc::new(
-                        AggregateExprBuilder::new(
+                        datafusion_physical_expr::aggregate::AggregateExprBuilder::new(
                             functions_aggregate::min_max::max_udaf(),
                             vec![expressions::col(SCORE_COL, &schema)?],
                         )
