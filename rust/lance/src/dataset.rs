@@ -64,6 +64,7 @@ use tracing::{info, instrument};
 
 pub(crate) mod blob;
 mod branch_location;
+pub mod archive;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
