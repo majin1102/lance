@@ -17,8 +17,8 @@ pub use fragment::*;
 pub use index::IndexMetadata;
 
 pub use manifest::{
-    is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
-    WriterVersion, DETACHED_VERSION_MASK,
+    is_detached_version, BasePath, DataStorageFormat, Manifest, ManifestSummary,
+    SelfDescribingFileReader, WriterVersion, DETACHED_VERSION_MASK,
 };
 pub use transaction::Transaction;
 
@@ -40,6 +40,19 @@ pub mod pb {
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+}
+
+/// Protobuf definitions for Archive Format
+pub mod pb_archive {
+    #![allow(clippy::all)]
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(unused)]
+    #![allow(improper_ctypes)]
+    #![allow(clippy::upper_case_acronyms)]
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.archive.rs"));
 }
 
 /// These version/magic values are written at the end of manifest files (e.g. versions/1.version)

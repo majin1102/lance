@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.archive;
+
+// Version summary metadata.
+//
+// Stores a summary of a single manifest version's metadata,
+// used for timeline queries and archival.
+message VersionSummary {
+  // The manifest version number.
+  uint64 version = 1;
+
+  // Manifest creation timestamp in milliseconds.
+  int64 timestamp_millis = 2;
+
+  // Manifest summary statistics (flattened).
+  uint64 total_fragments = 3;
+  uint64 total_data_files = 4;
+  uint64 total_files_size = 5;
+  uint64 total_deletion_files = 6;
+  uint64 total_data_file_rows = 7;
+  uint64 total_deletion_file_rows = 8;
+  uint64 total_rows = 9;
+
+  // Whether this version is pinned by a tag.
+  bool is_tagged = 10;
+
+  // Whether the data files have been cleaned up.
+  bool is_cleaned_up = 11;
+
+  // Transaction UUID, used to construct the transaction file name.
+  // - None: transaction is embedded in the manifest.
+  // - Some(uuid): transaction is in a separate file, filename format {read_version}-{uuid}.txn.
+  optional string transaction_uuid = 12;
+
+  // The base version read by the transaction.
+  optional uint64 read_version = 13;
+
+  // Operation type string, e.g. "Append", "Delete", "Rewrite", etc.
+  optional string operation_type = 14;
+
+  // Transaction properties.
+  map<string, string> transaction_properties = 15;
+}
+
+// Version archive file content.
+message VersionArchive {
+  // List of version summaries, sorted by version number in ascending order.
+  repeated VersionSummary versions = 1;
+
+  // Dataset creation time (timestamp of the earliest version).
+  // This value is inherited during archival and never changes.
+  int64 dataset_created_millis = 2;
+
+  // Archive file creation timestamp in milliseconds.
+  int64 created_at_millis = 3;
+
+  // The latest version number in this archive file.
+  // Used for quick lookup without iterating through the versions list.
+  uint64 latest_version_number = 4;
+}

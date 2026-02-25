@@ -33,6 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+use super::archive::{VersionArchive, VersionArchiveConfig, VersionSummary};
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
@@ -95,7 +96,7 @@ struct CleanupTask<'a> {
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct CleanupInspection {
     old_manifests: HashMap<Path, u64>,
     /// Referenced files are part of our working set
@@ -108,6 +109,30 @@ struct CleanupInspection {
     tagged_old_versions: HashSet<u64>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
+    /// Pre-generated VersionSummary for archive (populated during process_manifests)
+    version_summaries: Vec<VersionSummary>,
+    /// Latest version archive file
+    version_archive: VersionArchive,
+}
+
+impl CleanupInspection {
+    async fn try_new(dataset: &Dataset) -> Result<Self> {
+        let config = VersionArchiveConfig::from_config(&dataset.manifest.config);
+        let version_archive = VersionArchive::load_or_new(
+            dataset.base.clone(),
+            dataset.object_store.clone(),
+            config,
+        ).await?;
+        Ok(Self {
+            old_manifests: HashMap::new(),
+            referenced_files: ReferencedFiles::default(),
+            verified_files: ReferencedFiles::default(),
+            tagged_old_versions: HashSet::new(),
+            earliest_retained_manifest_time: None,
+            version_summaries: Vec::new(),
+            version_archive,
+        })
+    }
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -166,9 +191,22 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
-        let stats = self.delete_unreferenced_files(inspection).await?;
+        // Populate is_tagged and is_cleaned_up for version summaries
+        let old_versions: HashSet<u64> = inspection.old_manifests.values().copied().collect();
+        for summary in &mut inspection.version_summaries {
+            summary.is_tagged = tagged_versions.contains(&summary.version);
+            summary.is_cleaned_up = old_versions.contains(&summary.version);
+        }
+
+        // Add collected summaries to archive (sorts internally)
+        inspection.version_archive.add_summaries(&inspection.version_summaries);
+
+        let stats = self.delete_unreferenced_files(inspection.clone()).await?;
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
+
+        self.archive_versions(&mut inspection).await?;
+
         Ok(final_stats)
     }
 
@@ -177,7 +215,7 @@ impl<'a> CleanupTask<'a> {
         &'a self,
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
-        let inspection = Mutex::new(CleanupInspection::default());
+        let inspection = Mutex::new(CleanupInspection::try_new(self.dataset).await?);
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
@@ -213,7 +251,43 @@ impl<'a> CleanupTask<'a> {
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
+        let transaction = self
+            .dataset
+            .read_transaction_by_version(manifest.version)
+            .await
+            .ok()
+            .flatten();
+
         let mut inspection = inspection.lock().unwrap();
+
+        if manifest.version > inspection.version_archive.latest_version_number {
+            let manifest_summary = manifest.summary();
+            let (transaction_uuid, read_version, operation_type, transaction_properties) =
+                match &transaction {
+                    Some(tx) => {
+                        (
+                            Some(tx.uuid.clone()),
+                            Some(tx.read_version),
+                            Some(tx.operation.to_string()),
+                            tx.transaction_properties.as_deref().cloned().unwrap_or_default(),
+                        )
+                    }
+                    None => (None, None, None, HashMap::new()),
+                };
+
+            let version_summary = VersionSummary {
+                version: manifest.version,
+                timestamp_millis: manifest.timestamp().timestamp_millis(),
+                manifest_summary,
+                is_tagged: false,
+                is_cleaned_up: false,
+                transaction_uuid,
+                read_version,
+                operation_type,
+                transaction_properties,
+            };
+            inspection.version_summaries.push(version_summary);
+        }
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -782,6 +856,25 @@ impl<'a> CleanupTask<'a> {
 
         Ok(())
     }
+
+    /// Archive version metadata after deleting files.
+    ///
+    /// This preserves manifest data for historical versions that have been cleaned up.
+    /// Also cleans up old archive files.
+    async fn archive_versions(&self, inspection: &mut CleanupInspection) -> Result<()> {
+        if !inspection.version_archive.is_enabled() || inspection.version_archive.versions.is_empty() {
+            return Ok(());
+        }
+
+        let old_versions: HashSet<u64> = inspection.old_manifests.values().copied().collect();
+        for summary in &mut inspection.version_archive.versions {
+            if old_versions.contains(&summary.version) {
+                summary.is_cleaned_up = true;
+            }
+        }
+
+        inspection.version_archive.flush().await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1045,6 +1138,7 @@ mod tests {
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use chrono::{DateTime, TimeDelta, Utc};
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
@@ -1116,6 +1210,7 @@ mod tests {
         num_index_files: usize,
         num_delete_files: usize,
         num_tx_files: usize,
+        num_archive_files: usize,
         num_bytes: u64,
     }
 
@@ -1353,9 +1448,14 @@ mod tests {
                 num_index_files: 0,
                 num_manifest_files: 0,
                 num_tx_files: 0,
+                num_archive_files: 0,
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
+                // Skip archive files in count (they're managed separately)
+                if path.location.parts().any(|p| p.as_ref() == "_archive") {
+                    continue;
+                }
                 file_count.num_bytes += path.size;
                 match path.location.extension() {
                     Some("lance") => file_count.num_data_files += 1,
@@ -1363,6 +1463,7 @@ mod tests {
                     Some("arrow") | Some("bin") => file_count.num_delete_files += 1,
                     Some("idx") => file_count.num_index_files += 1,
                     Some("txn") => file_count.num_tx_files += 1,
+                    Some("binpb") => file_count.num_archive_files += 1,
                     _ => (),
                 }
             }
@@ -2439,6 +2540,7 @@ mod tests {
                     num_tx_files: 0,
                     num_delete_files: 0,
                     num_index_files: 0,
+                    num_archive_files: 0,
                     num_bytes: 0,
                 },
             }
@@ -3356,5 +3458,159 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
         assert_eq!(setup.branch4.counts.num_index_files, 4);
+    }
+
+    #[tokio::test]
+    async fn test_version_archive_comprehensive() {
+        use lance_table::format::ManifestSummary;
+
+        fn create_version_summary(version: u64) -> VersionSummary {
+            VersionSummary {
+                version,
+                timestamp_millis: version as i64 * 1000,
+                manifest_summary: ManifestSummary {
+                    total_fragments: version,
+                    total_data_files: version,
+                    total_files_size: version * 100,
+                    total_deletion_files: 0,
+                    total_data_file_rows: version * 100,
+                    total_deletion_file_rows: 0,
+                    total_rows: version * 100,
+                },
+                is_tagged: false,
+                is_cleaned_up: false,
+                transaction_uuid: None,
+                read_version: None,
+                operation_type: None,
+                transaction_properties: HashMap::new(),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let tmpdir_path = tmpdir.as_str();
+        let path_prefix = if tmpdir_path.starts_with('/') { "" } else { "/" };
+        let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/test_db");
+
+        let db = Dataset::write(
+            some_batch(),
+            &dataset_path,
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        ).await.unwrap();
+
+        let config = VersionArchiveConfig::default();
+
+        let mut archive = VersionArchive::load_or_new(
+            db.base.clone(),
+            db.object_store.clone(),
+            config,
+        ).await.unwrap();
+
+        assert!(archive.versions.is_empty());
+        assert_eq!(archive.latest_version(), 0);
+
+        let summaries = vec![
+            create_version_summary(1),
+            create_version_summary(2),
+            create_version_summary(3),
+        ];
+        archive.add_summaries(&summaries);
+        archive.flush().await.unwrap();
+
+        assert_eq!(archive.versions.len(), 3);
+        assert_eq!(archive.versions[0].version, 1);
+        assert_eq!(archive.versions[1].version, 2);
+        assert_eq!(archive.versions[2].version, 3);
+
+        let loaded = VersionArchive::load_or_new(
+            db.base.clone(),
+            db.object_store.clone(),
+            config,
+        ).await.unwrap();
+
+        assert_eq!(loaded.versions.len(), 3);
+        assert_eq!(loaded.latest_version(), 3);
+
+        let archive_dir = archive.archive_dir();
+        let path = archive_dir.child(format!("{:020}.binpb", u64::MAX - 3));
+        db.object_store.put(&path, b"corrupted data").await.unwrap();
+
+        let corrupted_loaded = VersionArchive::load_or_new(
+            db.base.clone(),
+            db.object_store.clone(),
+            config,
+        ).await.unwrap();
+
+        assert!(corrupted_loaded.versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archive_integration() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&db, 1).await.unwrap()
+            .error_if_tagged_old_versions(false)
+            .build();
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let config = VersionArchiveConfig::from_config(&db.manifest.config);
+        let archive = VersionArchive::load_or_new(
+            db.base.clone(),
+            db.object_store.clone(),
+            config,
+        ).await.unwrap();
+
+        assert_eq!(archive.versions.len(), 3, "Expected 3 versions in archive");
+        
+        assert_eq!(archive.versions[0].version, 1);
+        assert_eq!(archive.versions[1].version, 2);
+        assert_eq!(archive.versions[2].version, 3);
+
+        assert!(archive.versions[0].is_cleaned_up, "Version 1 should be cleaned up");
+        assert!(archive.versions[1].is_cleaned_up, "Version 2 should be cleaned up");
+        assert!(!archive.versions[2].is_cleaned_up, "Latest version should not be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archive_with_tagged_version() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        db.tags().create("v1", 1).await.unwrap();
+
+        let before = utc_now();
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(before)
+            .error_if_tagged_old_versions(false)
+            .build();
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let config = VersionArchiveConfig::from_config(&db.manifest.config);
+        let archive = VersionArchive::load_or_new(
+            db.base.clone(),
+            db.object_store.clone(),
+            config,
+        ).await.unwrap();
+
+        let v1 = archive.versions.iter().find(|v| v.version == 1);
+        assert!(v1.is_some(), "Version 1 should exist in archive");
+        assert!(v1.unwrap().is_tagged, "Version 1 should be tagged");
     }
 }
