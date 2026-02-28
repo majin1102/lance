@@ -216,6 +216,17 @@ impl From<&Manifest> for Version {
     }
 }
 
+impl From<&archive::VersionSummary> for Version {
+    fn from(s: &archive::VersionSummary) -> Self {
+        Self {
+            version: s.version,
+            timestamp: DateTime::from_timestamp_millis(s.timestamp_millis)
+                .unwrap_or_else(Utc::now),
+            metadata: s.manifest_summary.clone().into(),
+        }
+    }
+}
+
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
@@ -1828,11 +1839,39 @@ impl Dataset {
     }
 
     /// Get all versions.
+    ///
+    /// This method efficiently retrieves version history by:
+    /// 1. Reading historical versions from VersionArchive when available
+    /// 2. Reading only incremental manifests for versions newer than the archive
+    ///
+    /// If the archive is unavailable or disabled, falls back to reading all manifests.
     pub async fn versions(&self) -> Result<Vec<Version>> {
-        let mut versions: Vec<Version> = self
+        let config = archive::VersionArchiveConfig::from_config(&self.manifest.config);
+        let (archived_latest_version, mut versions): (u64, Vec<Version>) = if config.enabled {
+            archive::VersionArchive::load_latest(
+                self.base.clone(),
+                self.object_store.clone(),
+                config,
+            )
+            .await?
+            .map(|a| {
+                (
+                    a.latest_version(),
+                    a.versions.iter().map(|s| s.into()).collect(),
+                )
+            })
+            .unwrap_or_default()
+        } else {
+            (0, Vec::new())
+        };
+
+        let inc_versions: Vec<Version> = self
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
             .try_filter_map(|location| async move {
+                if location.version <= archived_latest_version {
+                    return Ok(None);
+                }
                 match read_manifest(&self.object_store, &location.path, location.size).await {
                     Ok(manifest) => Ok(Some(Version::from(&manifest))),
                     Err(e) => Err(e),
@@ -1841,9 +1880,8 @@ impl Dataset {
             .try_collect()
             .await?;
 
-        // TODO: this API should support pagination
+        versions.extend(inc_versions);
         versions.sort_by_key(|v| v.version);
-
         Ok(versions)
     }
 

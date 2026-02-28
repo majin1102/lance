@@ -219,10 +219,29 @@ impl VersionArchive {
         })
     }
 
+    /// Load the latest archive from storage
+    pub async fn load_latest(
+        base: Path,
+        object_store: Arc<ObjectStore>,
+        config: VersionArchiveConfig,
+    ) -> Result<Option<Self>> {
+        let archive_dir = base.child(ARCHIVE_DIR).child(VERSION_ARCHIVE_SUBDIR);
+        let archives = Self::list_archive_files(&object_store, &archive_dir).await?;
+        for (_, path) in archives {
+            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+                Ok(archive) => return Ok(Some(archive)),
+                Err(e) => {
+                    tracing::warn!("Failed to load archive file {}: {}", path, e);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn load_from_path(
         base: &Path,
-        object_store: Arc<ObjectStore>,
         path: &Path,
+        object_store: Arc<ObjectStore>,
         config: VersionArchiveConfig,
     ) -> Result<Self> {
         let reader = object_store.open(path).await?;

@@ -764,3 +764,213 @@ async fn test_branch() {
         .unwrap();
     assert!(branches.is_empty());
 }
+
+#[tokio::test]
+async fn test_versions_with_archive_partial() {
+    // This test verifies that versions() correctly merges archive and manifest data
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionSummary};
+    use lance_table::format::ManifestSummary;
+    use std::collections::HashMap;
+
+    // Create a temporary dataset
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+
+    // Write initial versions
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+
+    let schema = data.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Now manually create an archive with version 1
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let object_store = dataset.object_store.clone();
+    let base_path = dataset.base.clone();
+
+    let config = VersionArchiveConfig::default();
+    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+        .await
+        .unwrap();
+
+    let summaries = vec![VersionSummary {
+        version: 1,
+        timestamp_millis: 1000,
+        manifest_summary: ManifestSummary::default(),
+        is_tagged: false,
+        is_cleaned_up: false,
+        transaction_uuid: None,
+        read_version: None,
+        operation_type: None,
+        transaction_properties: HashMap::new(),
+    }];
+
+    archive.add_summaries(&summaries);
+    archive.flush().await.unwrap();
+
+    // Open dataset and get versions
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let versions = dataset.versions().await.unwrap();
+
+    // Should have 2 versions (1 from archive, 1 from manifest)
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].version, 1);
+    assert_eq!(versions[1].version, 2);
+}
+
+#[tokio::test]
+async fn test_versions_no_archive() {
+    // This test verifies that versions() works when no archive exists
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+
+    // Write multiple versions
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+
+    let schema = data.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Open dataset and get versions
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let versions = dataset.versions().await.unwrap();
+
+    // Should have 3 versions
+    assert_eq!(versions.len(), 3);
+    assert_eq!(versions[0].version, 1);
+    assert_eq!(versions[1].version, 2);
+    assert_eq!(versions[2].version, 3);
+}
+
+#[tokio::test]
+async fn test_versions_full_archive() {
+    // This test verifies that versions() works when all versions are in archive
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionSummary};
+    use lance_table::format::ManifestSummary;
+    use std::collections::HashMap;
+
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+
+    // Write 2 versions
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+
+    let schema = data.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Create archive with BOTH versions
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let object_store = dataset.object_store.clone();
+    let base_path = dataset.base.clone();
+
+    let config = VersionArchiveConfig::default();
+    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+        .await
+        .unwrap();
+
+    let summaries = vec![
+        VersionSummary {
+            version: 1,
+            timestamp_millis: 1000,
+            manifest_summary: ManifestSummary::default(),
+            is_tagged: false,
+            is_cleaned_up: false,
+            transaction_uuid: None,
+            read_version: None,
+            operation_type: None,
+            transaction_properties: HashMap::new(),
+        },
+        VersionSummary {
+            version: 2,
+            timestamp_millis: 2000,
+            manifest_summary: ManifestSummary::default(),
+            is_tagged: false,
+            is_cleaned_up: false,
+            transaction_uuid: None,
+            read_version: None,
+            operation_type: None,
+            transaction_properties: HashMap::new(),
+        },
+    ];
+
+    archive.add_summaries(&summaries);
+    archive.flush().await.unwrap();
+
+    // Open dataset and get versions
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let versions = dataset.versions().await.unwrap();
+
+    // Should have 2 versions (both from archive)
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].version, 1);
+    assert_eq!(versions[1].version, 2);
+}
