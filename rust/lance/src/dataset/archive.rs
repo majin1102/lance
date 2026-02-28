@@ -165,7 +165,10 @@ impl VersionArchive {
         self.base.child(ARCHIVE_DIR).child(VERSION_ARCHIVE_SUBDIR)
     }
 
-    async fn list_archive_files(object_store: &ObjectStore, archive_dir: &Path) -> Result<Vec<(u64, Path)>> {
+    async fn list_archive_files(
+        object_store: &ObjectStore,
+        archive_dir: &Path,
+    ) -> Result<Vec<(u64, Path)>> {
         let mut archives = Vec::new();
         let mut stream = object_store.list(Some(archive_dir.clone()));
         while let Some(meta) = stream.next().await {
@@ -224,8 +227,9 @@ impl VersionArchive {
     ) -> Result<Self> {
         let reader = object_store.open(path).await?;
         let data = reader.get_all().await?;
-        let proto = pb_archive::VersionArchive::decode(data.as_ref())
-            .map_err(|e| Error::invalid_input(format!("Failed to decode archive: {}", e), location!()))?;
+        let proto = pb_archive::VersionArchive::decode(data.as_ref()).map_err(|e| {
+            Error::invalid_input(format!("Failed to decode archive: {}", e), location!())
+        })?;
 
         let versions: Vec<VersionSummary> = proto.versions.into_iter().map(|v| v.into()).collect();
         Ok(Self {
@@ -256,7 +260,11 @@ impl VersionArchive {
 
         self.versions.sort_by_key(|v| v.version);
         if self.dataset_created_millis == 0 {
-            self.dataset_created_millis = self.versions.first().map(|v| v.timestamp_millis as u64).unwrap_or(0);
+            self.dataset_created_millis = self
+                .versions
+                .first()
+                .map(|v| v.timestamp_millis as u64)
+                .unwrap_or(0);
         }
 
         if self.versions.len() > self.config.max_entries {
@@ -379,11 +387,10 @@ mod tests {
                 3,
                 None,
             );
-            let archive = VersionArchive::load_or_new(
-                Path::from("test"),
-                Arc::new(object_store),
-                config,
-            ).await.unwrap();
+            let archive =
+                VersionArchive::load_or_new(Path::from("test"), Arc::new(object_store), config)
+                    .await
+                    .unwrap();
             Self { archive }
         }
     }
@@ -398,6 +405,8 @@ mod tests {
     #[tokio::test]
     async fn test_archive_add_summaries_and_flush() {
         let mut fixture = ArchiveTestFixture::new().await;
+        assert!(fixture.archive.is_enabled(), "Archive should be enabled by default");
+
         fixture.archive.add_summaries(&[
             create_test_version_summary(1),
             create_test_version_summary(2),
@@ -406,23 +415,61 @@ mod tests {
 
         assert_eq!(fixture.archive.versions.len(), 2);
         assert_eq!(fixture.archive.latest_version(), 2);
+
+        // Test disabled archive - is_enabled() returns false
+        let disabled_fixture = ArchiveTestFixture::new_with_config(VersionArchiveConfig {
+            enabled: false,
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            !disabled_fixture.archive.is_enabled(),
+            "Archive should be disabled when enabled=false"
+        );
     }
 
     #[tokio::test]
     async fn test_archive_load_existing() {
         let mut fixture = ArchiveTestFixture::new().await;
-        fixture.archive.add_summaries(&[create_test_version_summary(1)]);
+        fixture
+            .archive
+            .add_summaries(&[create_test_version_summary(1)]);
         fixture.archive.flush().await.unwrap();
 
         let loaded = VersionArchive::load_or_new(
             fixture.archive.base.clone(),
             fixture.archive.object_store.clone(),
             *fixture.archive.config(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(loaded.versions.len(), 1);
         assert_eq!(loaded.versions[0].version, 1);
         assert_eq!(loaded.latest_version(), 1);
+
+        // Test is_tagged field serialization/deserialization
+        let mut fixture2 = ArchiveTestFixture::new().await;
+        let mut summary = create_test_version_summary(2);
+        summary.is_tagged = true;
+        summary.is_cleaned_up = true;
+        fixture2.archive.add_summaries(&[summary]);
+        fixture2.archive.flush().await.unwrap();
+
+        let loaded2 = VersionArchive::load_or_new(
+            fixture2.archive.base.clone(),
+            fixture2.archive.object_store.clone(),
+            *fixture2.archive.config(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(loaded2.versions.len(), 1);
+        assert!(loaded2.versions[0].is_tagged, "is_tagged should be preserved");
+        assert!(
+            loaded2.versions[0].is_cleaned_up,
+            "is_cleaned_up should be preserved"
+        );
     }
 
     #[tokio::test]
@@ -430,7 +477,8 @@ mod tests {
         let mut fixture = ArchiveTestFixture::new_with_config(VersionArchiveConfig {
             max_entries: 2,
             ..Default::default()
-        }).await;
+        })
+        .await;
 
         fixture.archive.add_summaries(&[
             create_test_version_summary(1),
@@ -447,18 +495,27 @@ mod tests {
     #[tokio::test]
     async fn test_archive_corruption_graceful_degradation() {
         let mut fixture = ArchiveTestFixture::new().await;
-        fixture.archive.add_summaries(&[create_test_version_summary(1)]);
+        fixture
+            .archive
+            .add_summaries(&[create_test_version_summary(1)]);
         fixture.archive.flush().await.unwrap();
 
         let archive_dir = fixture.archive.archive_dir();
         let path = archive_dir.child(format!("{:020}.binpb", to_inverted_version(1)));
-        fixture.archive.object_store.put(&path, b"corrupted data").await.unwrap();
+        fixture
+            .archive
+            .object_store
+            .put(&path, b"corrupted data")
+            .await
+            .unwrap();
 
         let loaded = VersionArchive::load_or_new(
             fixture.archive.base.clone(),
             fixture.archive.object_store.clone(),
             *fixture.archive.config(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(loaded.versions.is_empty());
     }
@@ -466,9 +523,18 @@ mod tests {
     #[test]
     fn test_config_from_config() {
         let mut config = HashMap::new();
-        config.insert("lance.version_archive.enabled".to_string(), "false".to_string());
-        config.insert("lance.version_archive.max_entries".to_string(), "100".to_string());
-        config.insert("lance.version_archive.max_archive_files".to_string(), "5".to_string());
+        config.insert(
+            "lance.version_archive.enabled".to_string(),
+            "false".to_string(),
+        );
+        config.insert(
+            "lance.version_archive.max_entries".to_string(),
+            "100".to_string(),
+        );
+        config.insert(
+            "lance.version_archive.max_archive_files".to_string(),
+            "5".to_string(),
+        );
 
         let archive_config = VersionArchiveConfig::from_config(&config);
         assert!(!archive_config.enabled);
@@ -495,7 +561,9 @@ mod tests {
             fixture.archive.base.clone(),
             fixture.archive.object_store.clone(),
             *fixture.archive.config(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(loaded.versions.is_empty());
     }
@@ -515,7 +583,9 @@ mod tests {
             fixture.archive.base.clone(),
             fixture.archive.object_store.clone(),
             *fixture.archive.config(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(loaded.versions.len(), 3);
         assert_eq!(loaded.versions[0].version, 1);
@@ -528,10 +598,13 @@ mod tests {
         let mut fixture = ArchiveTestFixture::new_with_config(VersionArchiveConfig {
             max_archive_files: 2,
             ..Default::default()
-        }).await;
+        })
+        .await;
 
         for i in 1..=4 {
-            fixture.archive.add_summaries(&[create_test_version_summary(i)]);
+            fixture
+                .archive
+                .add_summaries(&[create_test_version_summary(i)]);
             fixture.archive.flush().await.unwrap();
         }
 
@@ -548,20 +621,34 @@ mod tests {
     async fn test_load_newest_valid_archive() {
         let mut fixture = ArchiveTestFixture::new().await;
 
-        fixture.archive.add_summaries(&[create_test_version_summary(1)]);
+        fixture
+            .archive
+            .add_summaries(&[create_test_version_summary(1)]);
         fixture.archive.flush().await.unwrap();
 
-        fixture.archive.add_summaries(&[create_test_version_summary(2)]);
+        fixture
+            .archive
+            .add_summaries(&[create_test_version_summary(2)]);
         fixture.archive.flush().await.unwrap();
 
-        let v2_path = fixture.archive.archive_dir().child(format!("{:020}.binpb", to_inverted_version(2)));
-        fixture.archive.object_store.put(&v2_path, b"corrupted").await.unwrap();
+        let v2_path = fixture
+            .archive
+            .archive_dir()
+            .child(format!("{:020}.binpb", to_inverted_version(2)));
+        fixture
+            .archive
+            .object_store
+            .put(&v2_path, b"corrupted")
+            .await
+            .unwrap();
 
         let loaded = VersionArchive::load_or_new(
             fixture.archive.base.clone(),
             fixture.archive.object_store.clone(),
             *fixture.archive.config(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(loaded.latest_version(), 1);
     }
@@ -570,7 +657,10 @@ mod tests {
     fn test_version_inversion() {
         assert_eq!(from_inverted_version(to_inverted_version(1)), 1);
         assert_eq!(from_inverted_version(to_inverted_version(100)), 100);
-        assert_eq!(from_inverted_version(to_inverted_version(u64::MAX)), u64::MAX);
+        assert_eq!(
+            from_inverted_version(to_inverted_version(u64::MAX)),
+            u64::MAX
+        );
         assert!(to_inverted_version(1) > to_inverted_version(2));
     }
 }
