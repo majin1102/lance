@@ -200,7 +200,7 @@ impl VersionArchive {
         let archives = Self::list_archive_files(&object_store, &archive_dir).await?;
 
         for (_, path) in archives {
-            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+            match Self::load_from_path(&base, &path, object_store.clone(), config).await {
                 Ok(archive) => return Ok(archive),
                 Err(e) => {
                     tracing::warn!("Failed to load archive file {}: {}", path, e);
@@ -228,7 +228,7 @@ impl VersionArchive {
         let archive_dir = base.child(ARCHIVE_DIR).child(VERSION_ARCHIVE_SUBDIR);
         let archives = Self::list_archive_files(&object_store, &archive_dir).await?;
         for (_, path) in archives {
-            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+            match Self::load_from_path(&base, &path, object_store.clone(), config).await {
                 Ok(archive) => return Ok(Some(archive)),
                 Err(e) => {
                     tracing::warn!("Failed to load archive file {}: {}", path, e);

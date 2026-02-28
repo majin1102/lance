@@ -220,8 +220,7 @@ impl From<&archive::VersionSummary> for Version {
     fn from(s: &archive::VersionSummary) -> Self {
         Self {
             version: s.version,
-            timestamp: DateTime::from_timestamp_millis(s.timestamp_millis)
-                .unwrap_or_else(Utc::now),
+            timestamp: DateTime::from_timestamp_millis(s.timestamp_millis).unwrap_or_else(Utc::now),
             metadata: s.manifest_summary.clone().into(),
         }
     }
@@ -1854,10 +1853,15 @@ impl Dataset {
                 config,
             )
             .await?
-            .map(|a| {
+            .map(|version_archive| {
                 (
-                    a.latest_version(),
-                    a.versions.iter().map(|s| s.into()).collect(),
+                    version_archive.latest_version(),
+                    version_archive
+                        .versions
+                        .iter()
+                        .filter(|version| !version.is_cleaned_up)
+                        .map(|s| s.into())
+                        .collect(),
                 )
             })
             .unwrap_or_default()
