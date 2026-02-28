@@ -68,9 +68,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub mod archive;
 pub(crate) mod blob;
 mod branch_location;
-pub mod archive;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
