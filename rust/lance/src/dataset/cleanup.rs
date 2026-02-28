@@ -118,11 +118,9 @@ struct CleanupInspection {
 impl CleanupInspection {
     async fn try_new(dataset: &Dataset) -> Result<Self> {
         let config = VersionArchiveConfig::from_config(&dataset.manifest.config);
-        let version_archive = VersionArchive::load_or_new(
-            dataset.base.clone(),
-            dataset.object_store.clone(),
-            config,
-        ).await?;
+        let version_archive =
+            VersionArchive::load_or_new(dataset.base.clone(), dataset.object_store.clone(), config)
+                .await?;
         Ok(Self {
             old_manifests: HashMap::new(),
             referenced_files: ReferencedFiles::default(),
@@ -191,21 +189,11 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
-        // Populate is_tagged and is_cleaned_up for version summaries
-        let old_versions: HashSet<u64> = inspection.old_manifests.values().copied().collect();
-        for summary in &mut inspection.version_summaries {
-            summary.is_tagged = tagged_versions.contains(&summary.version);
-            summary.is_cleaned_up = old_versions.contains(&summary.version);
-        }
-
-        // Add collected summaries to archive (sorts internally)
-        inspection.version_archive.add_summaries(&inspection.version_summaries);
-
-        let stats = self.delete_unreferenced_files(inspection.clone()).await?;
+        let stats = self.delete_unreferenced_files(&inspection).await?;
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
 
-        self.archive_versions(&mut inspection).await?;
+        self.archive_versions(&tagged_versions, &mut inspection).await?;
 
         Ok(final_stats)
     }
@@ -251,12 +239,21 @@ impl<'a> CleanupTask<'a> {
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
-        let transaction = self
-            .dataset
-            .read_transaction_by_version(manifest.version)
-            .await
-            .ok()
-            .flatten();
+        // Check if we need to read the transaction before acquiring the lock
+        let needs_transaction = {
+            let inspection = inspection.lock().unwrap();
+            manifest.version > inspection.version_archive.latest_version_number
+        };
+
+        let transaction = if needs_transaction {
+            self.dataset
+                .read_transaction_by_version(manifest.version)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
 
         let mut inspection = inspection.lock().unwrap();
 
@@ -264,14 +261,15 @@ impl<'a> CleanupTask<'a> {
             let manifest_summary = manifest.summary();
             let (transaction_uuid, read_version, operation_type, transaction_properties) =
                 match &transaction {
-                    Some(tx) => {
-                        (
-                            Some(tx.uuid.clone()),
-                            Some(tx.read_version),
-                            Some(tx.operation.to_string()),
-                            tx.transaction_properties.as_deref().cloned().unwrap_or_default(),
-                        )
-                    }
+                    Some(tx) => (
+                        Some(tx.uuid.clone()),
+                        Some(tx.read_version),
+                        Some(tx.operation.to_string()),
+                        tx.transaction_properties
+                            .as_deref()
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
                     None => (None, None, None, HashMap::new()),
                 };
 
@@ -359,7 +357,7 @@ impl<'a> CleanupTask<'a> {
     #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_removed = tracing::field::Empty))]
     async fn delete_unreferenced_files(
         &self,
-        inspection: CleanupInspection,
+        inspection: &CleanupInspection,
     ) -> Result<RemovalStats> {
         let removal_stats = Mutex::new(RemovalStats::default());
         let verification_threshold = utc_now()
@@ -398,7 +396,7 @@ impl<'a> CleanupTask<'a> {
                     let path_to_remove = self.path_if_not_referenced(
                         obj_meta.location,
                         maybe_in_progress,
-                        &inspection,
+                        inspection,
                     );
                     if matches!(path_to_remove, Ok(Some(..))) {
                         removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
@@ -861,11 +859,23 @@ impl<'a> CleanupTask<'a> {
     ///
     /// This preserves manifest data for historical versions that have been cleaned up.
     /// Also cleans up old archive files.
-    async fn archive_versions(&self, inspection: &mut CleanupInspection) -> Result<()> {
-        if !inspection.version_archive.is_enabled() || inspection.version_archive.versions.is_empty() {
+    async fn archive_versions(&self, tagged_versions: &HashSet<u64>, inspection: &mut CleanupInspection) -> Result<()> {
+        if !inspection.version_archive.is_enabled()
+            || inspection.version_archive.versions.is_empty()
+        {
             return Ok(());
         }
 
+        // Populate is_tagged for version summaries (is_cleaned_up set in archive_versions)
+        for summary in &mut inspection.version_summaries {
+            summary.is_tagged = tagged_versions.contains(&summary.version);
+        }
+
+        inspection
+            .version_archive
+            .add_summaries(&inspection.version_summaries);
+
+        // Set is_cleaned_up flag for versions that were cleaned up
         let old_versions: HashSet<u64> = inspection.old_manifests.values().copied().collect();
         for summary in &mut inspection.version_archive.versions {
             if old_versions.contains(&summary.version) {
@@ -1210,7 +1220,6 @@ mod tests {
         num_index_files: usize,
         num_delete_files: usize,
         num_tx_files: usize,
-        num_archive_files: usize,
         num_bytes: u64,
     }
 
@@ -1448,7 +1457,6 @@ mod tests {
                 num_index_files: 0,
                 num_manifest_files: 0,
                 num_tx_files: 0,
-                num_archive_files: 0,
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
@@ -1463,7 +1471,6 @@ mod tests {
                     Some("arrow") | Some("bin") => file_count.num_delete_files += 1,
                     Some("idx") => file_count.num_index_files += 1,
                     Some("txn") => file_count.num_tx_files += 1,
-                    Some("binpb") => file_count.num_archive_files += 1,
                     _ => (),
                 }
             }
@@ -2540,7 +2547,6 @@ mod tests {
                     num_tx_files: 0,
                     num_delete_files: 0,
                     num_index_files: 0,
-                    num_archive_files: 0,
                     num_bytes: 0,
                 },
             }
@@ -3488,7 +3494,11 @@ mod tests {
 
         let tmpdir = TempStrDir::default();
         let tmpdir_path = tmpdir.as_str();
-        let path_prefix = if tmpdir_path.starts_with('/') { "" } else { "/" };
+        let path_prefix = if tmpdir_path.starts_with('/') {
+            ""
+        } else {
+            "/"
+        };
         let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/test_db");
 
         let db = Dataset::write(
@@ -3501,15 +3511,16 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         let config = VersionArchiveConfig::default();
 
-        let mut archive = VersionArchive::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let mut archive =
+            VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
         assert!(archive.versions.is_empty());
         assert_eq!(archive.latest_version(), 0);
@@ -3527,11 +3538,9 @@ mod tests {
         assert_eq!(archive.versions[1].version, 2);
         assert_eq!(archive.versions[2].version, 3);
 
-        let loaded = VersionArchive::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let loaded = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
 
         assert_eq!(loaded.versions.len(), 3);
         assert_eq!(loaded.latest_version(), 3);
@@ -3540,11 +3549,10 @@ mod tests {
         let path = archive_dir.child(format!("{:020}.binpb", u64::MAX - 3));
         db.object_store.put(&path, b"corrupted data").await.unwrap();
 
-        let corrupted_loaded = VersionArchive::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let corrupted_loaded =
+            VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
         assert!(corrupted_loaded.versions.is_empty());
     }
@@ -3559,28 +3567,67 @@ mod tests {
 
         let db = fixture.open().await.unwrap();
         let policy = CleanupPolicyBuilder::default()
-            .retain_n_versions(&db, 1).await.unwrap()
+            .retain_n_versions(&db, 1)
+            .await
+            .unwrap()
             .error_if_tagged_old_versions(false)
             .build();
         fixture.run_cleanup_with_policy(policy).await.unwrap();
 
         let db = fixture.open().await.unwrap();
         let config = VersionArchiveConfig::from_config(&db.manifest.config);
-        let archive = VersionArchive::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let archive = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
 
         assert_eq!(archive.versions.len(), 3, "Expected 3 versions in archive");
-        
+
         assert_eq!(archive.versions[0].version, 1);
         assert_eq!(archive.versions[1].version, 2);
         assert_eq!(archive.versions[2].version, 3);
 
-        assert!(archive.versions[0].is_cleaned_up, "Version 1 should be cleaned up");
-        assert!(archive.versions[1].is_cleaned_up, "Version 2 should be cleaned up");
-        assert!(!archive.versions[2].is_cleaned_up, "Latest version should not be cleaned up");
+        assert!(
+            archive.versions[0].is_cleaned_up,
+            "Version 1 should be cleaned up"
+        );
+        assert!(
+            archive.versions[1].is_cleaned_up,
+            "Version 2 should be cleaned up"
+        );
+        assert!(
+            !archive.versions[2].is_cleaned_up,
+            "Latest version should not be cleaned up"
+        );
+
+        // Test incremental update: create more versions and cleanup again
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&db, 1)
+            .await
+            .unwrap()
+            .error_if_tagged_old_versions(false)
+            .build();
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let config = VersionArchiveConfig::from_config(&db.manifest.config);
+        let archive = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
+
+        // Should have 5 versions total (1,2,3 from before + 4,5 new)
+        assert_eq!(archive.versions.len(), 5, "Expected 5 versions after incremental update");
+        // Versions 1,2,3,4 should be cleaned up, version 5 is latest
+        for v in &archive.versions {
+            if v.version < 5 {
+                assert!(v.is_cleaned_up, "Version {} should be cleaned up", v.version);
+            } else {
+                assert!(!v.is_cleaned_up, "Version 5 should not be cleaned up");
+            }
+        }
     }
 
     #[tokio::test]
@@ -3603,11 +3650,9 @@ mod tests {
 
         let db = fixture.open().await.unwrap();
         let config = VersionArchiveConfig::from_config(&db.manifest.config);
-        let archive = VersionArchive::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let archive = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
 
         let v1 = archive.versions.iter().find(|v| v.version == 1);
         assert!(v1.is_some(), "Version 1 should exist in archive");
