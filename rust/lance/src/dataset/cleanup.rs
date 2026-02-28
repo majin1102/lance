@@ -865,9 +865,7 @@ impl<'a> CleanupTask<'a> {
         tagged_versions: &HashSet<u64>,
         inspection: &mut CleanupInspection,
     ) -> Result<()> {
-        if !inspection.version_archive.is_enabled()
-            || inspection.version_archive.versions.is_empty()
-        {
+        if !inspection.version_archive.is_enabled() || inspection.version_summaries.is_empty() {
             return Ok(());
         }
 
