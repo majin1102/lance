@@ -326,7 +326,7 @@ impl VersionArchive {
 
         if archives.len() > self.config.max_archive_files {
             let delete_count = archives.len() - self.config.max_archive_files;
-            for (version, _) in archives.iter().take(delete_count) {
+            for (version, _) in archives.iter().rev().take(delete_count) {
                 let inverted = to_inverted_version(*version);
                 let filename = format!("{:020}{}", inverted, VERSION_ARCHIVE_FILE_SUFFIX);
                 let path = self.archive_dir().child(filename);
