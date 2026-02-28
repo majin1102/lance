@@ -405,7 +405,10 @@ mod tests {
     #[tokio::test]
     async fn test_archive_add_summaries_and_flush() {
         let mut fixture = ArchiveTestFixture::new().await;
-        assert!(fixture.archive.is_enabled(), "Archive should be enabled by default");
+        assert!(
+            fixture.archive.is_enabled(),
+            "Archive should be enabled by default"
+        );
 
         fixture.archive.add_summaries(&[
             create_test_version_summary(1),
@@ -465,7 +468,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(loaded2.versions.len(), 1);
-        assert!(loaded2.versions[0].is_tagged, "is_tagged should be preserved");
+        assert!(
+            loaded2.versions[0].is_tagged,
+            "is_tagged should be preserved"
+        );
         assert!(
             loaded2.versions[0].is_cleaned_up,
             "is_cleaned_up should be preserved"
