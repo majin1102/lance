@@ -193,7 +193,8 @@ impl<'a> CleanupTask<'a> {
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
 
-        self.archive_versions(&tagged_versions, &mut inspection).await?;
+        self.archive_versions(&tagged_versions, &mut inspection)
+            .await?;
 
         Ok(final_stats)
     }
@@ -859,7 +860,11 @@ impl<'a> CleanupTask<'a> {
     ///
     /// This preserves manifest data for historical versions that have been cleaned up.
     /// Also cleans up old archive files.
-    async fn archive_versions(&self, tagged_versions: &HashSet<u64>, inspection: &mut CleanupInspection) -> Result<()> {
+    async fn archive_versions(
+        &self,
+        tagged_versions: &HashSet<u64>,
+        inspection: &mut CleanupInspection,
+    ) -> Result<()> {
         if !inspection.version_archive.is_enabled()
             || inspection.version_archive.versions.is_empty()
         {
@@ -3619,11 +3624,19 @@ mod tests {
             .unwrap();
 
         // Should have 5 versions total (1,2,3 from before + 4,5 new)
-        assert_eq!(archive.versions.len(), 5, "Expected 5 versions after incremental update");
+        assert_eq!(
+            archive.versions.len(),
+            5,
+            "Expected 5 versions after incremental update"
+        );
         // Versions 1,2,3,4 should be cleaned up, version 5 is latest
         for v in &archive.versions {
             if v.version < 5 {
-                assert!(v.is_cleaned_up, "Version {} should be cleaned up", v.version);
+                assert!(
+                    v.is_cleaned_up,
+                    "Version {} should be cleaned up",
+                    v.version
+                );
             } else {
                 assert!(!v.is_cleaned_up, "Version 5 should not be cleaned up");
             }
