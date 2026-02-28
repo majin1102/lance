@@ -21,7 +21,6 @@ fn main() -> Result<()> {
             "./protos/table.proto",
             "./protos/transaction.proto",
             "./protos/rowids.proto",
-            "./protos/archive.proto",
         ],
         &["./protos"],
     )?;
