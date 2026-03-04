@@ -3537,8 +3537,13 @@ mod tests {
         assert_eq!(loaded.latest_version(), 3);
 
         let checkpoint_dir = checkpoint.checkpoint_dir();
-        let path = checkpoint_dir.child(format!("{:020}.binpb", u64::MAX - 3));
-        db.object_store.put(&path, b"corrupted data").await.unwrap();
+        
+        // Corrupt both formats to ensure graceful degradation
+        let binpb_path = checkpoint_dir.child(format!("{:020}.binpb", u64::MAX - 3));
+        let _ = db.object_store.put(&binpb_path, b"corrupted data").await;
+        
+        let lance_path = checkpoint_dir.child(format!("{:020}.lance", u64::MAX - 3));
+        db.object_store.put(&lance_path, b"corrupted data").await.unwrap();
 
         let corrupted_loaded = VersionCheckpoint::load_or_new(
             db.base.clone(),

@@ -9,19 +9,247 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::{
+    Array, BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lance_core::{Error, Result};
+use lance_core::datatypes::Schema as LanceSchema;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::previous::writer::{FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{pb_checkpoint, ManifestSummary};
+use lance_table::format::{pb_checkpoint, ManifestSummary, SelfDescribingFileReader};
+use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
 
 pub const CHECKPOINT_DIR: &str = "_checkpoint";
 pub const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".binpb";
+const VERSION_CHECKPOINT_LANCE_FILE_SUFFIX: &str = ".lance";
+const METADATA_KEY_LATEST_VERSION: &str = "lance:checkpoint:latest_version";
+const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
+const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
 
 // Version number inversion for file naming (consistent with manifest V2)
 const INVERTED_VERSION_OFFSET: u64 = u64::MAX;
+
+/// Private helper to get the Arrow schema for VersionSummary
+fn version_summary_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("version", DataType::UInt64, false),
+        Field::new("timestamp_millis", DataType::Int64, false),
+        Field::new("total_fragments", DataType::UInt64, false),
+        Field::new("total_data_files", DataType::UInt64, false),
+        Field::new("total_files_size", DataType::UInt64, false),
+        Field::new("total_deletion_files", DataType::UInt64, false),
+        Field::new("total_data_file_rows", DataType::UInt64, false),
+        Field::new("total_deletion_file_rows", DataType::UInt64, false),
+        Field::new("total_rows", DataType::UInt64, false),
+        Field::new("is_tagged", DataType::Boolean, false),
+        Field::new("is_cleaned_up", DataType::Boolean, false),
+        Field::new("transaction_uuid", DataType::Utf8, true),
+        Field::new("read_version", DataType::UInt64, true),
+        Field::new("operation_type", DataType::Utf8, true),
+        Field::new("transaction_properties", DataType::Utf8, true),
+    ]))
+}
+
+/// Private helper to get the Lance schema for VersionSummary
+fn version_summary_lance_schema() -> Result<LanceSchema> {
+    let arrow_schema = version_summary_schema();
+    LanceSchema::try_from(arrow_schema.as_ref())
+        .map_err(|e| Error::invalid_input(format!("Failed to create Lance schema: {}", e), location!()))
+}
+
+/// Convert a slice of VersionSummary to an Arrow RecordBatch
+fn version_summaries_to_record_batch(summaries: &[VersionSummary]) -> Result<RecordBatch> {
+    let schema = version_summary_schema();
+
+    let versions = UInt64Array::from(summaries.iter().map(|s| Some(s.version)).collect::<Vec<_>>());
+    let timestamps = Int64Array::from(summaries.iter().map(|s| Some(s.timestamp_millis)).collect::<Vec<_>>());
+    let total_fragments = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_fragments)).collect::<Vec<_>>(),
+    );
+    let total_data_files = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_data_files)).collect::<Vec<_>>(),
+    );
+    let total_files_size = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_files_size)).collect::<Vec<_>>(),
+    );
+    let total_deletion_files = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_deletion_files)).collect::<Vec<_>>(),
+    );
+    let total_data_file_rows = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_data_file_rows)).collect::<Vec<_>>(),
+    );
+    let total_deletion_file_rows = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_deletion_file_rows)).collect::<Vec<_>>(),
+    );
+    let total_rows = UInt64Array::from(
+        summaries.iter().map(|s| Some(s.manifest_summary.total_rows)).collect::<Vec<_>>(),
+    );
+    let is_tagged = BooleanArray::from(summaries.iter().map(|s| Some(s.is_tagged)).collect::<Vec<_>>());
+    let is_cleaned_up = BooleanArray::from(summaries.iter().map(|s| Some(s.is_cleaned_up)).collect::<Vec<_>>());
+    let transaction_uuid = StringArray::from(summaries.iter().map(|s| s.transaction_uuid.as_deref()).collect::<Vec<_>>());
+    let read_version = UInt64Array::from(summaries.iter().map(|s| s.read_version).collect::<Vec<_>>());
+    let operation_type = StringArray::from(summaries.iter().map(|s| s.operation_type.as_deref()).collect::<Vec<_>>());
+    let transaction_properties = StringArray::from(
+        summaries.iter().map(|s| {
+            serde_json::to_string(&s.transaction_properties)
+                .ok()
+                .map(|json| json)
+        }).collect::<Vec<_>>()
+    );
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(versions),
+            Arc::new(timestamps),
+            Arc::new(total_fragments),
+            Arc::new(total_data_files),
+            Arc::new(total_files_size),
+            Arc::new(total_deletion_files),
+            Arc::new(total_data_file_rows),
+            Arc::new(total_deletion_file_rows),
+            Arc::new(total_rows),
+            Arc::new(is_tagged),
+            Arc::new(is_cleaned_up),
+            Arc::new(transaction_uuid),
+            Arc::new(read_version),
+            Arc::new(operation_type),
+            Arc::new(transaction_properties),
+        ],
+    )
+    .map_err(|e| Error::invalid_input(format!("Failed to create RecordBatch: {}", e), location!()))
+}
+
+/// Convert an Arrow RecordBatch to a Vec of VersionSummary
+fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionSummary>> {
+    let mut summaries = Vec::with_capacity(batch.num_rows());
+
+    let version_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("version column is not UInt64", location!()))?;
+    let timestamp_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::invalid_input("timestamp_millis column is not Int64", location!()))?;
+    let total_fragments_col = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("total_fragments column is not UInt64", location!()))?;
+    let total_data_files_col = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("total_data_files column is not UInt64", location!()))?;
+    let total_files_size_col = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("total_files_size column is not UInt64", location!()))?;
+    let total_deletion_files_col = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("total_deletion_files column is not UInt64", location!()))?;
+    let total_data_file_rows_col = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("total_data_file_rows column is not UInt64", location!()))?;
+    let total_deletion_file_rows_col = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            Error::invalid_input("total_deletion_file_rows column is not UInt64", location!())
+        })?;
+    let total_rows_col = batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("total_rows column is not UInt64", location!()))?;
+    let is_tagged_col = batch
+        .column(9)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| Error::invalid_input("is_tagged column is not Boolean", location!()))?;
+    let is_cleaned_up_col = batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| Error::invalid_input("is_cleaned_up column is not Boolean", location!()))?;
+    let transaction_uuid_col = batch
+        .column(11)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::invalid_input("transaction_uuid column is not String", location!()))?;
+    let read_version_col = batch
+        .column(12)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("read_version column is not UInt64", location!()))?;
+    let operation_type_col = batch
+        .column(13)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::invalid_input("operation_type column is not String", location!()))?;
+    let transaction_properties_col = batch
+        .column(14)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::invalid_input("transaction_properties column is not String", location!()))?;
+
+    for i in 0..batch.num_rows() {
+        let transaction_properties: HashMap<String, String> = if transaction_properties_col.is_valid(i) {
+            serde_json::from_str(transaction_properties_col.value(i)).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        summaries.push(VersionSummary {
+            version: version_col.value(i),
+            timestamp_millis: timestamp_col.value(i),
+            manifest_summary: ManifestSummary {
+                total_fragments: total_fragments_col.value(i),
+                total_data_files: total_data_files_col.value(i),
+                total_files_size: total_files_size_col.value(i),
+                total_deletion_files: total_deletion_files_col.value(i),
+                total_data_file_rows: total_data_file_rows_col.value(i),
+                total_deletion_file_rows: total_deletion_file_rows_col.value(i),
+                total_rows: total_rows_col.value(i),
+            },
+            is_tagged: is_tagged_col.value(i),
+            is_cleaned_up: is_cleaned_up_col.value(i),
+            transaction_uuid: if transaction_uuid_col.is_valid(i) {
+                Some(transaction_uuid_col.value(i).to_string())
+            } else {
+                None
+            },
+            read_version: if read_version_col.is_valid(i) {
+                Some(read_version_col.value(i))
+            } else {
+                None
+            },
+            operation_type: if operation_type_col.is_valid(i) {
+                Some(operation_type_col.value(i).to_string())
+            } else {
+                None
+            },
+            transaction_properties,
+        });
+    }
+
+    Ok(summaries)
+}
 
 /// Convert version to inverted version for file naming
 pub fn to_inverted_version(version: u64) -> u64 {
@@ -168,22 +396,127 @@ impl VersionCheckpoint {
         object_store: &ObjectStore,
         checkpoint_dir: &Path,
     ) -> Result<Vec<(u64, Path)>> {
-        let mut checkpoints = Vec::new();
+        let mut checkpoints = HashMap::new();
         let mut stream = object_store.list(Some(checkpoint_dir.clone()));
         while let Some(meta) = stream.next().await {
             let meta = meta?;
             if let Some(filename) = meta.location.filename() {
-                if let Some(inverted) = filename
+                let (version, is_lance) = if let Some(inverted) = filename
+                    .strip_suffix(VERSION_CHECKPOINT_LANCE_FILE_SUFFIX)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    (from_inverted_version(inverted), true)
+                } else if let Some(inverted) = filename
                     .strip_suffix(VERSION_CHECKPOINT_FILE_SUFFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    let version = from_inverted_version(inverted);
-                    checkpoints.push((version, meta.location));
+                    (from_inverted_version(inverted), false)
+                } else {
+                    continue;
+                };
+
+                let entry = checkpoints.entry(version).or_insert((false, meta.location.clone()));
+                if is_lance {
+                    entry.0 = true;
+                    entry.1 = meta.location;
                 }
             }
         }
-        checkpoints.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(checkpoints)
+
+        let mut result: Vec<_> = checkpoints
+            .into_iter()
+            .map(|(version, (_, path))| (version, path))
+            .collect();
+        result.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(result)
+    }
+
+    /// Private helper to write a checkpoint in Lance format
+    async fn write_lance_checkpoint(&self) -> Result<()> {
+        let checkpoint_dir = self.checkpoint_dir();
+        let inverted = to_inverted_version(self.latest_version_number);
+        let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_LANCE_FILE_SUFFIX);
+        let path = checkpoint_dir.child(filename);
+
+        let batch = version_summaries_to_record_batch(&self.versions)?;
+        let mut lance_schema = version_summary_lance_schema()?;
+        lance_schema.metadata.insert(
+            METADATA_KEY_LATEST_VERSION.to_string(),
+            self.latest_version_number.to_string(),
+        );
+        lance_schema.metadata.insert(
+            METADATA_KEY_DATASET_CREATED.to_string(),
+            self.dataset_created_millis.to_string(),
+        );
+        lance_schema.metadata.insert(
+            METADATA_KEY_CREATED_AT.to_string(),
+            self.created_at_millis.to_string(),
+        );
+
+        let options = PreviousFileWriterOptions::default();
+        let mut writer =
+            PreviousFileWriter::<ManifestDescribing>::try_new(
+                &self.object_store,
+                &path,
+                lance_schema,
+                &options,
+            )
+            .await?;
+
+        writer.write(&[batch]).await?;
+        writer.finish().await?;
+
+        Ok(())
+    }
+
+    /// Private helper to read a checkpoint from Lance format
+    async fn read_lance_checkpoint(
+        base: &Path,
+        object_store: Arc<ObjectStore>,
+        path: &Path,
+        config: CheckpointConfig,
+    ) -> Result<Self> {
+        let reader = object_store.open(path).await?;
+        let reader = PreviousFileReader::try_new_self_described_from_reader(reader.into(), None)
+            .await?;
+        let num_batches = reader.num_batches();
+
+        let mut all_summaries = Vec::new();
+        for i in 0..num_batches {
+            let batch = reader
+                .read_batch(i as i32, lance_io::ReadBatchParams::RangeFull, reader.schema())
+                .await?;
+            all_summaries.extend(record_batch_to_version_summaries(&batch)?);
+        }
+
+        let schema = reader.schema();
+        let latest_version_number = schema
+            .metadata
+            .get(METADATA_KEY_LATEST_VERSION)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                all_summaries.last().map(|s| s.version).unwrap_or(0)
+            });
+        let dataset_created_millis = schema
+            .metadata
+            .get(METADATA_KEY_DATASET_CREATED)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let created_at_millis = schema
+            .metadata
+            .get(METADATA_KEY_CREATED_AT)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+
+        Ok(Self {
+            versions: all_summaries,
+            latest_version_number,
+            dataset_created_millis,
+            created_at_millis,
+            config,
+            base: base.clone(),
+            object_store,
+        })
     }
 
     /// Load the latest checkpoint from storage, or create a new empty one
@@ -243,6 +576,12 @@ impl VersionCheckpoint {
         path: &Path,
         config: CheckpointConfig,
     ) -> Result<Self> {
+        if let Some(filename) = path.filename() {
+            if filename.ends_with(VERSION_CHECKPOINT_LANCE_FILE_SUFFIX) {
+                return Self::read_lance_checkpoint(base, object_store, path, config).await;
+            }
+        }
+
         let reader = object_store.open(path).await?;
         let data = reader.get_all().await?;
         let proto = pb_checkpoint::VersionCheckpoint::decode(data.as_ref()).map_err(|e| {
@@ -302,18 +641,7 @@ impl VersionCheckpoint {
             return Ok(());
         }
 
-        let checkpoint_dir = self.checkpoint_dir();
-        let inverted = to_inverted_version(self.latest_version_number);
-        let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
-        let path = checkpoint_dir.child(filename);
-
-        let proto: pb_checkpoint::VersionCheckpoint = (&*self).into();
-        let mut bytes = Vec::new();
-        proto.encode(&mut bytes).map_err(|e| {
-            Error::invalid_input(format!("Failed to encode checkpoint: {}", e), location!())
-        })?;
-        self.object_store.put(&path, &bytes).await?;
-
+        self.write_lance_checkpoint().await?;
         self.cleanup_old_checkpoints().await?;
 
         Ok(())
@@ -327,10 +655,17 @@ impl VersionCheckpoint {
             let delete_count = checkpoints.len() - self.config.max_checkpoint_files;
             for (version, _) in checkpoints.iter().take(delete_count) {
                 let inverted = to_inverted_version(*version);
-                let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
-                let path = self.checkpoint_dir().child(filename);
-                if let Err(e) = self.object_store.delete(&path).await {
-                    tracing::warn!("Failed to delete old checkpoint file {}: {}", path, e);
+                
+                let lance_filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_LANCE_FILE_SUFFIX);
+                let lance_path = self.checkpoint_dir().child(lance_filename);
+                if let Err(e) = self.object_store.delete(&lance_path).await {
+                    tracing::warn!("Failed to delete old checkpoint file {}: {}", lance_path, e);
+                }
+
+                let binpb_filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
+                let binpb_path = self.checkpoint_dir().child(binpb_filename);
+                if let Err(e) = self.object_store.delete(&binpb_path).await {
+                    tracing::warn!("Failed to delete old checkpoint file {}: {}", binpb_path, e);
                 }
             }
         }
@@ -519,11 +854,20 @@ mod tests {
         fixture.checkpoint.flush().await.unwrap();
 
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
-        let path = checkpoint_dir.child(format!("{:020}.binpb", to_inverted_version(1)));
+        
+        // Corrupt both formats to ensure graceful degradation
+        let binpb_path = checkpoint_dir.child(format!("{:020}.binpb", to_inverted_version(1)));
+        let _ = fixture
+            .checkpoint
+            .object_store
+            .put(&binpb_path, b"corrupted data")
+            .await;
+        
+        let lance_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(1)));
         fixture
             .checkpoint
             .object_store
-            .put(&path, b"corrupted data")
+            .put(&lance_path, b"corrupted data")
             .await
             .unwrap();
 
@@ -649,14 +993,21 @@ mod tests {
             .add_summaries(&[create_test_version_summary(2)]);
         fixture.checkpoint.flush().await.unwrap();
 
-        let v2_path = fixture
+        let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
+        
+        // Corrupt both formats for v2 to ensure we fall back to v1
+        let v2_binpb_path = checkpoint_dir.child(format!("{:020}.binpb", to_inverted_version(2)));
+        let _ = fixture
             .checkpoint
-            .checkpoint_dir()
-            .child(format!("{:020}.binpb", to_inverted_version(2)));
+            .object_store
+            .put(&v2_binpb_path, b"corrupted")
+            .await;
+        
+        let v2_lance_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(2)));
         fixture
             .checkpoint
             .object_store
-            .put(&v2_path, b"corrupted")
+            .put(&v2_lance_path, b"corrupted")
             .await
             .unwrap();
 
