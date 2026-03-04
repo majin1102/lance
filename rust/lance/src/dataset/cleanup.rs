@@ -1458,12 +1458,17 @@ mod tests {
                 }
                 file_count.num_bytes += path.size;
                 match path.location.extension() {
-                    Some("lance") => file_count.num_data_files += 1,
+                    Some("lance") => {
+                        if path.location.parts().any(|p| p.as_ref() == "_checkpoint") {
+                            file_count.num_checkpoint_files += 1;
+                        } else {
+                            file_count.num_data_files += 1;
+                        }
+                    },
                     Some("manifest") => file_count.num_manifest_files += 1,
                     Some("arrow") | Some("bin") => file_count.num_delete_files += 1,
                     Some("idx") => file_count.num_index_files += 1,
                     Some("txn") => file_count.num_tx_files += 1,
-                    Some("binpb") => file_count.num_checkpoint_files += 1,
                     _ => (),
                 }
             }

@@ -19,15 +19,13 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::{FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{pb_checkpoint, ManifestSummary, SelfDescribingFileReader};
+use lance_table::format::{ManifestSummary, SelfDescribingFileReader};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use prost::Message;
 use snafu::location;
 
 pub const CHECKPOINT_DIR: &str = "_checkpoint";
-pub const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".binpb";
-const VERSION_CHECKPOINT_LANCE_FILE_SUFFIX: &str = ".lance";
+const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".lance";
 const METADATA_KEY_LATEST_VERSION: &str = "lance:checkpoint:latest_version";
 const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
 const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
@@ -318,51 +316,7 @@ pub struct VersionSummary {
     pub transaction_properties: HashMap<String, String>,
 }
 
-impl From<&VersionSummary> for pb_checkpoint::VersionSummary {
-    fn from(s: &VersionSummary) -> Self {
-        Self {
-            version: s.version,
-            timestamp_millis: s.timestamp_millis,
-            total_fragments: s.manifest_summary.total_fragments,
-            total_data_files: s.manifest_summary.total_data_files,
-            total_files_size: s.manifest_summary.total_files_size,
-            total_deletion_files: s.manifest_summary.total_deletion_files,
-            total_data_file_rows: s.manifest_summary.total_data_file_rows,
-            total_deletion_file_rows: s.manifest_summary.total_deletion_file_rows,
-            total_rows: s.manifest_summary.total_rows,
-            is_tagged: s.is_tagged,
-            is_cleaned_up: s.is_cleaned_up,
-            transaction_uuid: s.transaction_uuid.clone(),
-            read_version: s.read_version,
-            operation_type: s.operation_type.clone(),
-            transaction_properties: s.transaction_properties.clone(),
-        }
-    }
-}
 
-impl From<pb_checkpoint::VersionSummary> for VersionSummary {
-    fn from(proto: pb_checkpoint::VersionSummary) -> Self {
-        Self {
-            version: proto.version,
-            timestamp_millis: proto.timestamp_millis,
-            manifest_summary: ManifestSummary {
-                total_fragments: proto.total_fragments,
-                total_data_files: proto.total_data_files,
-                total_files_size: proto.total_files_size,
-                total_deletion_files: proto.total_deletion_files,
-                total_data_file_rows: proto.total_data_file_rows,
-                total_deletion_file_rows: proto.total_deletion_file_rows,
-                total_rows: proto.total_rows,
-            },
-            is_tagged: proto.is_tagged,
-            is_cleaned_up: proto.is_cleaned_up,
-            transaction_uuid: proto.transaction_uuid,
-            read_version: proto.read_version,
-            operation_type: proto.operation_type,
-            transaction_properties: proto.transaction_properties,
-        }
-    }
-}
 
 /// Version checkpoint with persistence capability
 #[derive(Debug, Clone)]
@@ -376,16 +330,7 @@ pub struct VersionCheckpoint {
     object_store: Arc<ObjectStore>,
 }
 
-impl From<&VersionCheckpoint> for pb_checkpoint::VersionCheckpoint {
-    fn from(checkpoint: &VersionCheckpoint) -> Self {
-        Self {
-            versions: checkpoint.versions.iter().map(|v| v.into()).collect(),
-            latest_version_number: checkpoint.latest_version_number,
-            dataset_created_millis: checkpoint.dataset_created_millis as i64,
-            created_at_millis: checkpoint.created_at_millis as i64,
-        }
-    }
-}
+
 
 impl VersionCheckpoint {
     pub fn checkpoint_dir(&self) -> Path {
@@ -396,46 +341,29 @@ impl VersionCheckpoint {
         object_store: &ObjectStore,
         checkpoint_dir: &Path,
     ) -> Result<Vec<(u64, Path)>> {
-        let mut checkpoints = HashMap::new();
+        let mut checkpoints = Vec::new();
         let mut stream = object_store.list(Some(checkpoint_dir.clone()));
         while let Some(meta) = stream.next().await {
             let meta = meta?;
             if let Some(filename) = meta.location.filename() {
-                let (version, is_lance) = if let Some(inverted) = filename
-                    .strip_suffix(VERSION_CHECKPOINT_LANCE_FILE_SUFFIX)
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    (from_inverted_version(inverted), true)
-                } else if let Some(inverted) = filename
+                if let Some(inverted) = filename
                     .strip_suffix(VERSION_CHECKPOINT_FILE_SUFFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    (from_inverted_version(inverted), false)
-                } else {
-                    continue;
-                };
-
-                let entry = checkpoints.entry(version).or_insert((false, meta.location.clone()));
-                if is_lance {
-                    entry.0 = true;
-                    entry.1 = meta.location;
+                    checkpoints.push((from_inverted_version(inverted), meta.location));
                 }
             }
         }
 
-        let mut result: Vec<_> = checkpoints
-            .into_iter()
-            .map(|(version, (_, path))| (version, path))
-            .collect();
-        result.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(result)
+        checkpoints.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(checkpoints)
     }
 
     /// Private helper to write a checkpoint in Lance format
-    async fn write_lance_checkpoint(&self) -> Result<()> {
+    async fn write_checkpoint(&self) -> Result<()> {
         let checkpoint_dir = self.checkpoint_dir();
         let inverted = to_inverted_version(self.latest_version_number);
-        let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_LANCE_FILE_SUFFIX);
+        let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
         let path = checkpoint_dir.child(filename);
 
         let batch = version_summaries_to_record_batch(&self.versions)?;
@@ -470,7 +398,7 @@ impl VersionCheckpoint {
     }
 
     /// Private helper to read a checkpoint from Lance format
-    async fn read_lance_checkpoint(
+    async fn read_checkpoint(
         base: &Path,
         object_store: Arc<ObjectStore>,
         path: &Path,
@@ -576,28 +504,7 @@ impl VersionCheckpoint {
         path: &Path,
         config: CheckpointConfig,
     ) -> Result<Self> {
-        if let Some(filename) = path.filename() {
-            if filename.ends_with(VERSION_CHECKPOINT_LANCE_FILE_SUFFIX) {
-                return Self::read_lance_checkpoint(base, object_store, path, config).await;
-            }
-        }
-
-        let reader = object_store.open(path).await?;
-        let data = reader.get_all().await?;
-        let proto = pb_checkpoint::VersionCheckpoint::decode(data.as_ref()).map_err(|e| {
-            Error::invalid_input(format!("Failed to decode checkpoint: {}", e), location!())
-        })?;
-
-        let versions: Vec<VersionSummary> = proto.versions.into_iter().map(|v| v.into()).collect();
-        Ok(Self {
-            versions,
-            latest_version_number: proto.latest_version_number,
-            dataset_created_millis: proto.dataset_created_millis as u64,
-            created_at_millis: proto.created_at_millis as u64,
-            config,
-            base: base.clone(),
-            object_store,
-        })
+        Self::read_checkpoint(base, object_store, path, config).await
     }
 
     /// Add new version summaries to the checkpoint
@@ -641,7 +548,7 @@ impl VersionCheckpoint {
             return Ok(());
         }
 
-        self.write_lance_checkpoint().await?;
+        self.write_checkpoint().await?;
         self.cleanup_old_checkpoints().await?;
 
         Ok(())
@@ -656,16 +563,10 @@ impl VersionCheckpoint {
             for (version, _) in checkpoints.iter().take(delete_count) {
                 let inverted = to_inverted_version(*version);
                 
-                let lance_filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_LANCE_FILE_SUFFIX);
-                let lance_path = self.checkpoint_dir().child(lance_filename);
-                if let Err(e) = self.object_store.delete(&lance_path).await {
-                    tracing::warn!("Failed to delete old checkpoint file {}: {}", lance_path, e);
-                }
-
-                let binpb_filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
-                let binpb_path = self.checkpoint_dir().child(binpb_filename);
-                if let Err(e) = self.object_store.delete(&binpb_path).await {
-                    tracing::warn!("Failed to delete old checkpoint file {}: {}", binpb_path, e);
+                let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
+                let path = self.checkpoint_dir().child(filename);
+                if let Err(e) = self.object_store.delete(&path).await {
+                    tracing::warn!("Failed to delete old checkpoint file {}: {}", path, e);
                 }
             }
         }
@@ -855,14 +756,7 @@ mod tests {
 
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
         
-        // Corrupt both formats to ensure graceful degradation
-        let binpb_path = checkpoint_dir.child(format!("{:020}.binpb", to_inverted_version(1)));
-        let _ = fixture
-            .checkpoint
-            .object_store
-            .put(&binpb_path, b"corrupted data")
-            .await;
-        
+        // Corrupt the checkpoint file
         let lance_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(1)));
         fixture
             .checkpoint
@@ -995,19 +889,12 @@ mod tests {
 
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
         
-        // Corrupt both formats for v2 to ensure we fall back to v1
-        let v2_binpb_path = checkpoint_dir.child(format!("{:020}.binpb", to_inverted_version(2)));
-        let _ = fixture
-            .checkpoint
-            .object_store
-            .put(&v2_binpb_path, b"corrupted")
-            .await;
-        
-        let v2_lance_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(2)));
+        // Corrupt v2 checkpoint to ensure we fall back to v1
+        let v2_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(2)));
         fixture
             .checkpoint
             .object_store
-            .put(&v2_lance_path, b"corrupted")
+            .put(&v2_path, b"corrupted")
             .await
             .unwrap();
 
