@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Version Archive module
+//! Version Checkpoint module
 //!
-//! This module provides version archival functionality for preserving version metadata
+//! This module provides version checkpoint functionality for preserving version metadata
 //! when manifests are cleaned up.
 
 use std::collections::HashMap;
@@ -12,14 +12,13 @@ use std::sync::Arc;
 use futures::stream::StreamExt;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{pb_archive, ManifestSummary};
+use lance_table::format::{pb_checkpoint, ManifestSummary};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
 
-pub const ARCHIVE_DIR: &str = "_archive";
-pub const VERSION_ARCHIVE_SUBDIR: &str = "versions";
-pub const VERSION_ARCHIVE_FILE_SUFFIX: &str = ".binpb";
+pub const CHECKPOINT_DIR: &str = "_checkpoint";
+pub const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".binpb";
 
 // Version number inversion for file naming (consistent with manifest V2)
 const INVERTED_VERSION_OFFSET: u64 = u64::MAX;
@@ -34,43 +33,43 @@ pub fn from_inverted_version(inverted: u64) -> u64 {
     INVERTED_VERSION_OFFSET - inverted
 }
 
-/// VersionArchive configuration
+/// Checkpoint configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VersionArchiveConfig {
-    /// Whether VersionArchive is enabled
+pub struct CheckpointConfig {
+    /// Whether VersionCheckpoint is enabled
     pub enabled: bool,
 
-    /// Maximum number of version entries to retain in a single archive file
+    /// Maximum number of version entries to retain in a single checkpoint file
     pub max_entries: usize,
 
-    /// Maximum number of archive files to retain
-    pub max_archive_files: usize,
+    /// Maximum number of checkpoint files to retain
+    pub max_checkpoint_files: usize,
 }
 
-impl Default for VersionArchiveConfig {
+impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             max_entries: 10000,
-            max_archive_files: 2,
+            max_checkpoint_files: 2,
         }
     }
 }
 
-impl VersionArchiveConfig {
+impl CheckpointConfig {
     /// Read configuration from manifest config
     pub fn from_config(config: &HashMap<String, String>) -> Self {
         Self {
             enabled: config
-                .get("lance.version_archive.enabled")
+                .get("lance.version_checkpoint.enabled")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(true),
             max_entries: config
-                .get("lance.version_archive.max_entries")
+                .get("lance.version_checkpoint.max_entries")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10000),
-            max_archive_files: config
-                .get("lance.version_archive.max_archive_files")
+            max_checkpoint_files: config
+                .get("lance.version_checkpoint.max_checkpoint_files")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2),
         }
@@ -91,7 +90,7 @@ pub struct VersionSummary {
     pub transaction_properties: HashMap<String, String>,
 }
 
-impl From<&VersionSummary> for pb_archive::VersionSummary {
+impl From<&VersionSummary> for pb_checkpoint::VersionSummary {
     fn from(s: &VersionSummary) -> Self {
         Self {
             version: s.version,
@@ -113,8 +112,8 @@ impl From<&VersionSummary> for pb_archive::VersionSummary {
     }
 }
 
-impl From<pb_archive::VersionSummary> for VersionSummary {
-    fn from(proto: pb_archive::VersionSummary) -> Self {
+impl From<pb_checkpoint::VersionSummary> for VersionSummary {
+    fn from(proto: pb_checkpoint::VersionSummary) -> Self {
         Self {
             version: proto.version,
             timestamp_millis: proto.timestamp_millis,
@@ -137,73 +136,73 @@ impl From<pb_archive::VersionSummary> for VersionSummary {
     }
 }
 
-/// Version archive with persistence capability
+/// Version checkpoint with persistence capability
 #[derive(Debug, Clone)]
-pub struct VersionArchive {
+pub struct VersionCheckpoint {
     pub versions: Vec<VersionSummary>,
     pub latest_version_number: u64,
     pub dataset_created_millis: u64,
     pub created_at_millis: u64,
-    config: VersionArchiveConfig,
+    config: CheckpointConfig,
     base: Path,
     object_store: Arc<ObjectStore>,
 }
 
-impl From<&VersionArchive> for pb_archive::VersionArchive {
-    fn from(archive: &VersionArchive) -> Self {
+impl From<&VersionCheckpoint> for pb_checkpoint::VersionCheckpoint {
+    fn from(checkpoint: &VersionCheckpoint) -> Self {
         Self {
-            versions: archive.versions.iter().map(|v| v.into()).collect(),
-            latest_version_number: archive.latest_version_number,
-            dataset_created_millis: archive.dataset_created_millis as i64,
-            created_at_millis: archive.created_at_millis as i64,
+            versions: checkpoint.versions.iter().map(|v| v.into()).collect(),
+            latest_version_number: checkpoint.latest_version_number,
+            dataset_created_millis: checkpoint.dataset_created_millis as i64,
+            created_at_millis: checkpoint.created_at_millis as i64,
         }
     }
 }
 
-impl VersionArchive {
-    pub fn archive_dir(&self) -> Path {
-        self.base.child(ARCHIVE_DIR).child(VERSION_ARCHIVE_SUBDIR)
+impl VersionCheckpoint {
+    pub fn checkpoint_dir(&self) -> Path {
+        self.base.child(CHECKPOINT_DIR)
     }
 
-    async fn list_archive_files(
+    async fn list_checkpoint_files(
         object_store: &ObjectStore,
-        archive_dir: &Path,
+        checkpoint_dir: &Path,
     ) -> Result<Vec<(u64, Path)>> {
-        let mut archives = Vec::new();
-        let mut stream = object_store.list(Some(archive_dir.clone()));
+        let mut checkpoints = Vec::new();
+        let mut stream = object_store.list(Some(checkpoint_dir.clone()));
         while let Some(meta) = stream.next().await {
             let meta = meta?;
             if let Some(filename) = meta.location.filename() {
                 if let Some(inverted) = filename
-                    .strip_suffix(VERSION_ARCHIVE_FILE_SUFFIX)
+                    .strip_suffix(VERSION_CHECKPOINT_FILE_SUFFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     let version = from_inverted_version(inverted);
-                    archives.push((version, meta.location));
+                    checkpoints.push((version, meta.location));
                 }
             }
         }
-        archives.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(archives)
+        checkpoints.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(checkpoints)
     }
 
-    /// Load the latest archive from storage, or create a new empty one
+    /// Load the latest checkpoint from storage, or create a new empty one
     ///
-    /// Tries to load from the newest archive file. If corrupted, tries older files.
-    /// If no valid archive exists, creates a new empty one.
+    /// Tries to load from the newest checkpoint file. If corrupted, tries older files.
+    /// If no valid checkpoint exists, creates a new empty one.
     pub async fn load_or_new(
         base: Path,
         object_store: Arc<ObjectStore>,
-        config: VersionArchiveConfig,
+        config: CheckpointConfig,
     ) -> Result<Self> {
-        let archive_dir = base.child(ARCHIVE_DIR).child(VERSION_ARCHIVE_SUBDIR);
-        let archives = Self::list_archive_files(&object_store, &archive_dir).await?;
+        let checkpoint_dir = base.child(CHECKPOINT_DIR);
+        let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
 
-        for (_, path) in archives {
-            match Self::load_from_path(&base, &path, object_store.clone(), config).await {
-                Ok(archive) => return Ok(archive),
+        for (_, path) in checkpoints {
+            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+                Ok(checkpoint) => return Ok(checkpoint),
                 Err(e) => {
-                    tracing::warn!("Failed to load archive file {}: {}", path, e);
+                    tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
                 }
             }
         }
@@ -219,35 +218,16 @@ impl VersionArchive {
         })
     }
 
-    /// Load the latest archive from storage
-    pub async fn load_latest(
-        base: Path,
-        object_store: Arc<ObjectStore>,
-        config: VersionArchiveConfig,
-    ) -> Result<Option<Self>> {
-        let archive_dir = base.child(ARCHIVE_DIR).child(VERSION_ARCHIVE_SUBDIR);
-        let archives = Self::list_archive_files(&object_store, &archive_dir).await?;
-        for (_, path) in archives {
-            match Self::load_from_path(&base, &path, object_store.clone(), config).await {
-                Ok(archive) => return Ok(Some(archive)),
-                Err(e) => {
-                    tracing::warn!("Failed to load archive file {}: {}", path, e);
-                }
-            }
-        }
-        Ok(None)
-    }
-
     async fn load_from_path(
         base: &Path,
-        path: &Path,
         object_store: Arc<ObjectStore>,
-        config: VersionArchiveConfig,
+        path: &Path,
+        config: CheckpointConfig,
     ) -> Result<Self> {
         let reader = object_store.open(path).await?;
         let data = reader.get_all().await?;
-        let proto = pb_archive::VersionArchive::decode(data.as_ref()).map_err(|e| {
-            Error::invalid_input(format!("Failed to decode archive: {}", e), location!())
+        let proto = pb_checkpoint::VersionCheckpoint::decode(data.as_ref()).map_err(|e| {
+            Error::invalid_input(format!("Failed to decode checkpoint: {}", e), location!())
         })?;
 
         let versions: Vec<VersionSummary> = proto.versions.into_iter().map(|v| v.into()).collect();
@@ -262,7 +242,7 @@ impl VersionArchive {
         })
     }
 
-    /// Add new version summaries to the archive
+    /// Add new version summaries to the checkpoint
     /// Summaries are sorted by version before adding
     pub fn add_summaries(&mut self, summaries: &[VersionSummary]) {
         if summaries.is_empty() {
@@ -271,7 +251,7 @@ impl VersionArchive {
         self.versions.extend(summaries.iter().cloned());
     }
 
-    /// Finalize the archive before flushing
+    /// Finalize the checkpoint before flushing
     fn finalize_summaries(&mut self) {
         if self.versions.is_empty() {
             return;
@@ -295,7 +275,7 @@ impl VersionArchive {
         self.created_at_millis = chrono::Utc::now().timestamp_millis() as u64;
     }
 
-    /// Flush the archive to storage
+    /// Flush the checkpoint to storage
     pub async fn flush(&mut self) -> Result<()> {
         self.finalize_summaries();
 
@@ -303,35 +283,35 @@ impl VersionArchive {
             return Ok(());
         }
 
-        let archive_dir = self.archive_dir();
+        let checkpoint_dir = self.checkpoint_dir();
         let inverted = to_inverted_version(self.latest_version_number);
-        let filename = format!("{:020}{}", inverted, VERSION_ARCHIVE_FILE_SUFFIX);
-        let path = archive_dir.child(filename);
+        let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
+        let path = checkpoint_dir.child(filename);
 
-        let proto: pb_archive::VersionArchive = (&*self).into();
+        let proto: pb_checkpoint::VersionCheckpoint = (&*self).into();
         let mut bytes = Vec::new();
         proto.encode(&mut bytes).map_err(|e| {
-            Error::invalid_input(format!("Failed to encode archive: {}", e), location!())
+            Error::invalid_input(format!("Failed to encode checkpoint: {}", e), location!())
         })?;
         self.object_store.put(&path, &bytes).await?;
 
-        self.cleanup_old_archives().await?;
+        self.cleanup_old_checkpoints().await?;
 
         Ok(())
     }
 
-    async fn cleanup_old_archives(&self) -> Result<()> {
-        let archive_dir = self.archive_dir();
-        let archives = Self::list_archive_files(&self.object_store, &archive_dir).await?;
+    async fn cleanup_old_checkpoints(&self) -> Result<()> {
+        let checkpoint_dir = self.checkpoint_dir();
+        let checkpoints = Self::list_checkpoint_files(&self.object_store, &checkpoint_dir).await?;
 
-        if archives.len() > self.config.max_archive_files {
-            let delete_count = archives.len() - self.config.max_archive_files;
-            for (version, _) in archives.iter().rev().take(delete_count) {
+        if checkpoints.len() > self.config.max_checkpoint_files {
+            let delete_count = checkpoints.len() - self.config.max_checkpoint_files;
+            for (version, _) in checkpoints.iter().take(delete_count) {
                 let inverted = to_inverted_version(*version);
-                let filename = format!("{:020}{}", inverted, VERSION_ARCHIVE_FILE_SUFFIX);
-                let path = self.archive_dir().child(filename);
+                let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
+                let path = self.checkpoint_dir().child(filename);
                 if let Err(e) = self.object_store.delete(&path).await {
-                    tracing::warn!("Failed to delete old archive file {}: {}", path, e);
+                    tracing::warn!("Failed to delete old checkpoint file {}: {}", path, e);
                 }
             }
         }
@@ -348,7 +328,7 @@ impl VersionArchive {
     }
 
     #[cfg(test)]
-    fn config(&self) -> &VersionArchiveConfig {
+    fn config(&self) -> &CheckpointConfig {
         &self.config
     }
 }
@@ -385,16 +365,16 @@ mod tests {
         }
     }
 
-    struct ArchiveTestFixture {
-        archive: VersionArchive,
+    struct CheckpointTestFixture {
+        checkpoint: VersionCheckpoint,
     }
 
-    impl ArchiveTestFixture {
+    impl CheckpointTestFixture {
         async fn new() -> Self {
-            Self::new_with_config(VersionArchiveConfig::default()).await
+            Self::new_with_config(CheckpointConfig::default()).await
         }
 
-        async fn new_with_config(config: VersionArchiveConfig) -> Self {
+        async fn new_with_config(config: CheckpointConfig) -> Self {
             let object_store = ObjectStore::new(
                 Arc::new(object_store::memory::InMemory::new()),
                 url::Url::parse("memory://").unwrap(),
@@ -406,62 +386,59 @@ mod tests {
                 3,
                 None,
             );
-            let archive =
-                VersionArchive::load_or_new(Path::from("test"), Arc::new(object_store), config)
+            let checkpoint =
+                VersionCheckpoint::load_or_new(Path::from("test"), Arc::new(object_store), config)
                     .await
                     .unwrap();
-            Self { archive }
+            Self { checkpoint }
         }
     }
 
     #[tokio::test]
-    async fn test_archive_load_or_new_empty() {
-        let fixture = ArchiveTestFixture::new().await;
-        assert!(fixture.archive.versions.is_empty());
-        assert_eq!(fixture.archive.latest_version(), 0);
+    async fn test_checkpoint_load_or_new_empty() {
+        let fixture = CheckpointTestFixture::new().await;
+        assert!(fixture.checkpoint.versions.is_empty());
+        assert_eq!(fixture.checkpoint.latest_version(), 0);
     }
 
     #[tokio::test]
-    async fn test_archive_add_summaries_and_flush() {
-        let mut fixture = ArchiveTestFixture::new().await;
-        assert!(
-            fixture.archive.is_enabled(),
-            "Archive should be enabled by default"
-        );
+    async fn test_checkpoint_add_summaries_and_flush() {
+        let mut fixture = CheckpointTestFixture::new().await;
+        assert!(fixture.checkpoint.is_enabled(), "Checkpoint should be enabled by default");
 
-        fixture.archive.add_summaries(&[
+        fixture.checkpoint.add_summaries(&[
             create_test_version_summary(1),
             create_test_version_summary(2),
         ]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
-        assert_eq!(fixture.archive.versions.len(), 2);
-        assert_eq!(fixture.archive.latest_version(), 2);
+        assert_eq!(fixture.checkpoint.versions.len(), 2);
+        assert_eq!(fixture.checkpoint.latest_version(), 2);
 
-        // Test disabled archive - is_enabled() returns false
-        let disabled_fixture = ArchiveTestFixture::new_with_config(VersionArchiveConfig {
+        // Test disabled checkpoint - is_enabled() returns false
+        let disabled_fixture = CheckpointTestFixture::new_with_config(CheckpointConfig {
             enabled: false,
             ..Default::default()
         })
         .await;
         assert!(
-            !disabled_fixture.archive.is_enabled(),
-            "Archive should be disabled when enabled=false"
+            !disabled_fixture.checkpoint.is_enabled(),
+            "Checkpoint should be disabled when enabled=false"
         );
     }
 
     #[tokio::test]
-    async fn test_archive_load_existing() {
-        let mut fixture = ArchiveTestFixture::new().await;
+    async fn test_checkpoint_load_existing() {
+        let mut fixture = CheckpointTestFixture::new().await;
         fixture
-            .archive
+            .checkpoint
             .add_summaries(&[create_test_version_summary(1)]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
-        let loaded = VersionArchive::load_or_new(
-            fixture.archive.base.clone(),
-            fixture.archive.object_store.clone(),
-            *fixture.archive.config(),
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
         )
         .await
         .unwrap();
@@ -471,26 +448,23 @@ mod tests {
         assert_eq!(loaded.latest_version(), 1);
 
         // Test is_tagged field serialization/deserialization
-        let mut fixture2 = ArchiveTestFixture::new().await;
+        let mut fixture2 = CheckpointTestFixture::new().await;
         let mut summary = create_test_version_summary(2);
         summary.is_tagged = true;
         summary.is_cleaned_up = true;
-        fixture2.archive.add_summaries(&[summary]);
-        fixture2.archive.flush().await.unwrap();
+        fixture2.checkpoint.add_summaries(&[summary]);
+        fixture2.checkpoint.flush().await.unwrap();
 
-        let loaded2 = VersionArchive::load_or_new(
-            fixture2.archive.base.clone(),
-            fixture2.archive.object_store.clone(),
-            *fixture2.archive.config(),
+        let loaded2 = VersionCheckpoint::load_or_new(
+            fixture2.checkpoint.base.clone(),
+            fixture2.checkpoint.object_store.clone(),
+            *fixture2.checkpoint.config(),
         )
         .await
         .unwrap();
 
         assert_eq!(loaded2.versions.len(), 1);
-        assert!(
-            loaded2.versions[0].is_tagged,
-            "is_tagged should be preserved"
-        );
+        assert!(loaded2.versions[0].is_tagged, "is_tagged should be preserved");
         assert!(
             loaded2.versions[0].is_cleaned_up,
             "is_cleaned_up should be preserved"
@@ -498,46 +472,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_archive_truncation() {
-        let mut fixture = ArchiveTestFixture::new_with_config(VersionArchiveConfig {
+    async fn test_checkpoint_truncation() {
+        let mut fixture = CheckpointTestFixture::new_with_config(CheckpointConfig {
             max_entries: 2,
             ..Default::default()
         })
         .await;
 
-        fixture.archive.add_summaries(&[
+        fixture.checkpoint.add_summaries(&[
             create_test_version_summary(1),
             create_test_version_summary(2),
             create_test_version_summary(3),
         ]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
-        assert_eq!(fixture.archive.versions.len(), 2);
-        assert_eq!(fixture.archive.versions[0].version, 2);
-        assert_eq!(fixture.archive.versions[1].version, 3);
+        assert_eq!(fixture.checkpoint.versions.len(), 2);
+        assert_eq!(fixture.checkpoint.versions[0].version, 2);
+        assert_eq!(fixture.checkpoint.versions[1].version, 3);
     }
 
     #[tokio::test]
-    async fn test_archive_corruption_graceful_degradation() {
-        let mut fixture = ArchiveTestFixture::new().await;
+    async fn test_checkpoint_corruption_graceful_degradation() {
+        let mut fixture = CheckpointTestFixture::new().await;
         fixture
-            .archive
+            .checkpoint
             .add_summaries(&[create_test_version_summary(1)]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
-        let archive_dir = fixture.archive.archive_dir();
-        let path = archive_dir.child(format!("{:020}.binpb", to_inverted_version(1)));
+        let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
+        let path = checkpoint_dir.child(format!("{:020}.binpb", to_inverted_version(1)));
         fixture
-            .archive
+            .checkpoint
             .object_store
             .put(&path, b"corrupted data")
             .await
             .unwrap();
 
-        let loaded = VersionArchive::load_or_new(
-            fixture.archive.base.clone(),
-            fixture.archive.object_store.clone(),
-            *fixture.archive.config(),
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
         )
         .await
         .unwrap();
@@ -549,43 +523,43 @@ mod tests {
     fn test_config_from_config() {
         let mut config = HashMap::new();
         config.insert(
-            "lance.version_archive.enabled".to_string(),
+            "lance.version_checkpoint.enabled".to_string(),
             "false".to_string(),
         );
         config.insert(
-            "lance.version_archive.max_entries".to_string(),
+            "lance.version_checkpoint.max_entries".to_string(),
             "100".to_string(),
         );
         config.insert(
-            "lance.version_archive.max_archive_files".to_string(),
+            "lance.version_checkpoint.max_checkpoint_files".to_string(),
             "5".to_string(),
         );
 
-        let archive_config = VersionArchiveConfig::from_config(&config);
-        assert!(!archive_config.enabled);
-        assert_eq!(archive_config.max_entries, 100);
-        assert_eq!(archive_config.max_archive_files, 5);
+        let checkpoint_config = VersionCheckpointConfig::from_config(&config);
+        assert!(!checkpoint_config.enabled);
+        assert_eq!(checkpoint_config.max_entries, 100);
+        assert_eq!(checkpoint_config.max_checkpoint_files, 5);
     }
 
     #[test]
     fn test_config_from_config_defaults() {
         let config = HashMap::new();
-        let archive_config = VersionArchiveConfig::from_config(&config);
-        assert!(archive_config.enabled);
-        assert_eq!(archive_config.max_entries, 10000);
-        assert_eq!(archive_config.max_archive_files, 2);
+        let checkpoint_config = VersionCheckpointConfig::from_config(&config);
+        assert!(checkpoint_config.enabled);
+        assert_eq!(checkpoint_config.max_entries, 10000);
+        assert_eq!(checkpoint_config.max_checkpoint_files, 2);
     }
 
     #[tokio::test]
     async fn test_add_summaries_empty() {
-        let mut fixture = ArchiveTestFixture::new().await;
-        fixture.archive.add_summaries(&[]);
-        fixture.archive.flush().await.unwrap();
+        let mut fixture = CheckpointTestFixture::new().await;
+        fixture.checkpoint.add_summaries(&[]);
+        fixture.checkpoint.flush().await.unwrap();
 
-        let loaded = VersionArchive::load_or_new(
-            fixture.archive.base.clone(),
-            fixture.archive.object_store.clone(),
-            *fixture.archive.config(),
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
         )
         .await
         .unwrap();
@@ -595,19 +569,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_summaries_sorts_by_version() {
-        let mut fixture = ArchiveTestFixture::new().await;
+        let mut fixture = CheckpointTestFixture::new().await;
 
-        fixture.archive.add_summaries(&[
+        fixture.checkpoint.add_summaries(&[
             create_test_version_summary(3),
             create_test_version_summary(1),
             create_test_version_summary(2),
         ]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
-        let loaded = VersionArchive::load_or_new(
-            fixture.archive.base.clone(),
-            fixture.archive.object_store.clone(),
-            *fixture.archive.config(),
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
         )
         .await
         .unwrap();
@@ -619,23 +593,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_archive_files_cleanup() {
-        let mut fixture = ArchiveTestFixture::new_with_config(VersionArchiveConfig {
-            max_archive_files: 2,
+    async fn test_max_checkpoint_files_cleanup() {
+        let mut fixture = CheckpointTestFixture::new_with_config(CheckpointConfig {
+            max_checkpoint_files: 2,
             ..Default::default()
         })
         .await;
 
         for i in 1..=4 {
             fixture
-                .archive
+                .checkpoint
                 .add_summaries(&[create_test_version_summary(i)]);
-            fixture.archive.flush().await.unwrap();
+            fixture.checkpoint.flush().await.unwrap();
         }
 
-        let archive_dir = fixture.archive.archive_dir();
+        let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
         let mut count = 0;
-        let mut stream = fixture.archive.object_store.list(Some(archive_dir));
+        let mut stream = fixture.checkpoint.object_store.list(Some(checkpoint_dir));
         while stream.next().await.transpose().unwrap().is_some() {
             count += 1;
         }
@@ -643,34 +617,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_newest_valid_archive() {
-        let mut fixture = ArchiveTestFixture::new().await;
+    async fn test_load_newest_valid_checkpoint() {
+        let mut fixture = CheckpointTestFixture::new().await;
 
         fixture
-            .archive
+            .checkpoint
             .add_summaries(&[create_test_version_summary(1)]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
         fixture
-            .archive
+            .checkpoint
             .add_summaries(&[create_test_version_summary(2)]);
-        fixture.archive.flush().await.unwrap();
+        fixture.checkpoint.flush().await.unwrap();
 
         let v2_path = fixture
-            .archive
-            .archive_dir()
+            .checkpoint
+            .checkpoint_dir()
             .child(format!("{:020}.binpb", to_inverted_version(2)));
         fixture
-            .archive
+            .checkpoint
             .object_store
             .put(&v2_path, b"corrupted")
             .await
             .unwrap();
 
-        let loaded = VersionArchive::load_or_new(
-            fixture.archive.base.clone(),
-            fixture.archive.object_store.clone(),
-            *fixture.archive.config(),
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
         )
         .await
         .unwrap();

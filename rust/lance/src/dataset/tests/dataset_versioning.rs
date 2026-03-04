@@ -768,7 +768,7 @@ async fn test_branch() {
 #[tokio::test]
 async fn test_versions_with_archive_partial() {
     // This test verifies that versions() correctly merges archive and manifest data
-    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionSummary};
+    use crate::dataset::checkpoint::{VersionCheckpoint, CheckpointConfig, VersionSummary};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
 
@@ -807,8 +807,8 @@ async fn test_versions_with_archive_partial() {
     let object_store = dataset.object_store.clone();
     let base_path = dataset.base.clone();
 
-    let config = VersionArchiveConfig::default();
-    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+    let config = CheckpointConfig::default();
+    let mut checkpoint = VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
         .await
         .unwrap();
 
@@ -824,8 +824,8 @@ async fn test_versions_with_archive_partial() {
         transaction_properties: HashMap::new(),
     }];
 
-    archive.add_summaries(&summaries);
-    archive.flush().await.unwrap();
+    checkpoint.add_summaries(&summaries);
+    checkpoint.flush().await.unwrap();
 
     // Open dataset and get versions
     let dataset = Dataset::open(test_uri).await.unwrap();
@@ -894,7 +894,7 @@ async fn test_versions_no_archive() {
 #[tokio::test]
 async fn test_versions_full_archive() {
     // This test verifies that versions() works when all versions are in archive
-    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionSummary};
+    use crate::dataset::checkpoint::{VersionCheckpoint, CheckpointConfig, VersionSummary};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
 
@@ -932,8 +932,8 @@ async fn test_versions_full_archive() {
     let object_store = dataset.object_store.clone();
     let base_path = dataset.base.clone();
 
-    let config = VersionArchiveConfig::default();
-    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+    let config = CheckpointConfig::default();
+    let mut checkpoint = VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
         .await
         .unwrap();
 
@@ -962,8 +962,8 @@ async fn test_versions_full_archive() {
         },
     ];
 
-    archive.add_summaries(&summaries);
-    archive.flush().await.unwrap();
+    checkpoint.add_summaries(&summaries);
+    checkpoint.flush().await.unwrap();
 
     // Open dataset and get versions
     let dataset = Dataset::open(test_uri).await.unwrap();

@@ -3,12 +3,12 @@
 
 syntax = "proto3";
 
-package lance.archive;
+package lance.checkpoint;
 
 // Version summary metadata.
 //
 // Stores a summary of a single manifest version's metadata,
-// used for timeline queries and archival.
+// used for timeline queries and checkpoints.
 message VersionSummary {
   // The manifest version number.
   uint64 version = 1;
@@ -46,19 +46,19 @@ message VersionSummary {
   map<string, string> transaction_properties = 15;
 }
 
-// Version archive file content.
-message VersionArchive {
+// Version checkpoint file content.
+message VersionCheckpoint {
   // List of version summaries, sorted by version number in ascending order.
   repeated VersionSummary versions = 1;
 
   // Dataset creation time (timestamp of the earliest version).
-  // This value is inherited during archival and never changes.
+  // This value is inherited during checkpointing and never changes.
   int64 dataset_created_millis = 2;
 
-  // Archive file creation timestamp in milliseconds.
+  // Checkpoint file creation timestamp in milliseconds.
   int64 created_at_millis = 3;
 
-  // The latest version number in this archive file.
+  // The latest version number in this checkpoint file.
   // Used for quick lookup without iterating through the versions list.
   uint64 latest_version_number = 4;
 }

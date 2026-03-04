@@ -190,5 +190,18 @@ harness = false
 name = "mem_wal_read"
 harness = false
 
+[[bench]]
+name = "version_archive"
+harness = false
+
+[[bench]]
+name = "version_archive_s3"
+harness = false
+
+[[bin]]
+name = "init_benchmark_data"
+path = "benches/bin/init_benchmark_data.rs"
+required-features = ["cli"]
+
 [lints]
 workspace = true

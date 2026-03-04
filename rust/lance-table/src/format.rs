@@ -42,8 +42,8 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
 }
 
-/// Protobuf definitions for Archive Format
-pub mod pb_archive {
+/// Protobuf definitions for Checkpoint Format
+pub mod pb_checkpoint {
     #![allow(clippy::all)]
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]
@@ -52,7 +52,7 @@ pub mod pb_archive {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.archive.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lance.checkpoint.rs"));
 }
 
 /// These version/magic values are written at the end of manifest files (e.g. versions/1.version)
