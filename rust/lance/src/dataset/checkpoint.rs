@@ -218,6 +218,25 @@ impl VersionCheckpoint {
         })
     }
 
+    /// Load the latest checkpoint from storage
+    pub async fn load_latest(
+        base: Path,
+        object_store: Arc<ObjectStore>,
+        config: CheckpointConfig,
+    ) -> Result<Option<Self>> {
+        let checkpoint_dir = base.child(CHECKPOINT_DIR);
+        let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
+        for (_, path) in checkpoints {
+            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+                Ok(checkpoint) => return Ok(Some(checkpoint)),
+                Err(e) => {
+                    tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn load_from_path(
         base: &Path,
         object_store: Arc<ObjectStore>,
@@ -535,7 +554,7 @@ mod tests {
             "5".to_string(),
         );
 
-        let checkpoint_config = VersionCheckpointConfig::from_config(&config);
+        let checkpoint_config = CheckpointConfig::from_config(&config);
         assert!(!checkpoint_config.enabled);
         assert_eq!(checkpoint_config.max_entries, 100);
         assert_eq!(checkpoint_config.max_checkpoint_files, 5);
@@ -544,7 +563,7 @@ mod tests {
     #[test]
     fn test_config_from_config_defaults() {
         let config = HashMap::new();
-        let checkpoint_config = VersionCheckpointConfig::from_config(&config);
+        let checkpoint_config = CheckpointConfig::from_config(&config);
         assert!(checkpoint_config.enabled);
         assert_eq!(checkpoint_config.max_entries, 10000);
         assert_eq!(checkpoint_config.max_checkpoint_files, 2);

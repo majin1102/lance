@@ -1848,25 +1848,24 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let config = CheckpointConfig::from_config(&self.manifest.config);
         let (checkpointed_latest_version, mut versions): (u64, Vec<Version>) = if config.enabled {
-            let checkpoint = VersionCheckpoint::load_or_new(
+            VersionCheckpoint::load_latest(
                 self.base.clone(),
                 self.object_store.clone(),
                 config,
             )
-            .await?;
-            if !checkpoint.versions.is_empty() {
+            .await?
+            .map(|version_checkpoint| {
                 (
-                    checkpoint.latest_version(),
-                    checkpoint
+                    version_checkpoint.latest_version(),
+                    version_checkpoint
                         .versions
                         .iter()
                         .filter(|version| !version.is_cleaned_up)
                         .map(|s| s.into())
                         .collect(),
                 )
-            } else {
-                (0, Vec::new())
-            }
+            })
+            .unwrap_or_default()
         } else {
             (0, Vec::new())
         };
