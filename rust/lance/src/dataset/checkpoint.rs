@@ -22,9 +22,8 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::{ManifestSummary, SelfDescribingFileReader};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::location;
 
-pub const CHECKPOINT_DIR: &str = "_checkpoint";
+pub const CHECKPOINT_DIR: &str = "_checkpoints";
 const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".lance";
 const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
 const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
@@ -59,7 +58,7 @@ fn version_summary_schema() -> Arc<ArrowSchema> {
 fn version_summary_lance_schema() -> Result<LanceSchema> {
     let arrow_schema = version_summary_schema();
     LanceSchema::try_from(arrow_schema.as_ref()).map_err(|e| {
-        Error::invalid_input(format!("Failed to create Lance schema: {}", e), location!())
+        Error::invalid_input(format!("Failed to create Lance schema: {}", e))
     })
 }
 
@@ -175,7 +174,7 @@ fn version_summaries_to_record_batch(summaries: &[VersionSummary]) -> Result<Rec
             Arc::new(StringArray::from(transaction_properties)),
         ],
     )
-    .map_err(|e| Error::invalid_input(format!("Failed to create RecordBatch: {}", e), location!()))
+    .map_err(|e| Error::invalid_input(format!("Failed to create RecordBatch: {}", e)))
 }
 
 /// Macro to extract and downcast a column from a RecordBatch
@@ -183,11 +182,11 @@ macro_rules! get_column {
     ($batch:expr, $name:expr, $type:ty, $type_str:expr) => {
         $batch
             .column_by_name($name)
-            .ok_or_else(|| Error::invalid_input(concat!($name, " column not found"), location!()))?
+            .ok_or_else(|| Error::invalid_input(concat!($name, " column not found")))?
             .as_any()
             .downcast_ref::<$type>()
             .ok_or_else(|| {
-                Error::invalid_input(concat!($name, " column is not ", $type_str), location!())
+                Error::invalid_input(concat!($name, " column is not ", $type_str))
             })?
     };
 }
