@@ -33,7 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::checkpoint::{CHECKPOINT_DIR, CheckpointConfig, VersionCheckpoint, VersionSummary};
+use super::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
@@ -1135,6 +1135,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::dataset::checkpoint::CHECKPOINT_DIR;
     use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
