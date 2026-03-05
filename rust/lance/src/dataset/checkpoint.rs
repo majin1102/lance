@@ -31,6 +31,13 @@ const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
 const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
 
 // Version number inversion for file naming (consistent with manifest V2)
+// 
+// This offset is used to create inverted version numbers that sort in descending order
+// when files are listed alphabetically. This ensures that newer versions appear
+// first in directory listings, For example:
+//   - Version 1: u64::MAX - 1 = 18446744073709551614
+//   - Version 2: u64::MAX - 2 = 18446744073709551613
+// When sorted alphabetically, version 2's file appears before version 1's file.
 const INVERTED_VERSION_OFFSET: u64 = u64::MAX;
 
 /// Private helper to get the Arrow schema for VersionSummary
@@ -95,9 +102,13 @@ fn version_summaries_to_record_batch(summaries: &[VersionSummary]) -> Result<Rec
     let operation_type = StringArray::from(summaries.iter().map(|s| s.operation_type.as_deref()).collect::<Vec<_>>());
     let transaction_properties = StringArray::from(
         summaries.iter().map(|s| {
-            serde_json::to_string(&s.transaction_properties)
-                .ok()
-                .map(|json| json)
+            match serde_json::to_string(&s.transaction_properties) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    tracing::warn!("Failed to serialize transaction_properties: {}", e);
+                    None
+                }
+            }
         }).collect::<Vec<_>>()
     );
 
@@ -208,7 +219,13 @@ fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionS
 
     for i in 0..batch.num_rows() {
         let transaction_properties: HashMap<String, String> = if transaction_properties_col.is_valid(i) {
-            serde_json::from_str(transaction_properties_col.value(i)).unwrap_or_default()
+            match serde_json::from_str(transaction_properties_col.value(i)) {
+                Ok(props) => props,
+                Err(e) => {
+                    tracing::warn!("Failed to parse transaction_properties: {}", e);
+                    HashMap::new()
+                }
+            }
         } else {
             HashMap::new()
         };
@@ -425,6 +442,16 @@ impl VersionCheckpoint {
             .unwrap_or_else(|| {
                 all_summaries.last().map(|s| s.version).unwrap_or(0)
             });
+
+        // Validate metadata consistency
+        let actual_max_version = all_summaries.iter().map(|s| s.version).max().unwrap_or(0);
+        if latest_version_number != actual_max_version {
+            tracing::warn!(
+                "Checkpoint metadata mismatch: latest_version_number={} but actual max={}",
+                latest_version_number,
+                actual_max_version
+            );
+        }
         let dataset_created_millis = schema
             .metadata
             .get(METADATA_KEY_DATASET_CREATED)
