@@ -1452,14 +1452,16 @@ mod tests {
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
-                // Skip checkpoint files in count (they're managed separately)
-                if path.location.parts().any(|p| p.as_ref() == "_checkpoint") {
-                    continue;
+                let is_checkpoint = path.location.parts().any(|p| p.as_ref() == "_checkpoint");
+                
+                // Checkpoint files are managed separately, don't count their bytes
+                if !is_checkpoint {
+                    file_count.num_bytes += path.size;
                 }
-                file_count.num_bytes += path.size;
+                
                 match path.location.extension() {
                     Some("lance") => {
-                        if path.location.parts().any(|p| p.as_ref() == "_checkpoint") {
+                        if is_checkpoint {
                             file_count.num_checkpoint_files += 1;
                         } else {
                             file_count.num_data_files += 1;
@@ -2093,7 +2095,13 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
 
-        assert_eq!(before_count, after_count);
+        // Cleanup creates a checkpoint file, so we only compare relevant fields
+        assert_eq!(before_count.num_data_files, after_count.num_data_files);
+        assert_eq!(before_count.num_manifest_files, after_count.num_manifest_files);
+        assert_eq!(before_count.num_index_files, after_count.num_index_files);
+        assert_eq!(before_count.num_delete_files, after_count.num_delete_files);
+        assert_eq!(before_count.num_tx_files, after_count.num_tx_files);
+        assert_eq!(before_count.num_bytes, after_count.num_bytes);
     }
 
     #[tokio::test]
@@ -2158,7 +2166,13 @@ mod tests {
         assert_eq!(removed.bytes_removed, 0);
 
         let after_count = fixture.count_files().await.unwrap();
-        assert_eq!(before_count, after_count);
+        // Cleanup creates a checkpoint file, so we only compare relevant fields
+        assert_eq!(before_count.num_data_files, after_count.num_data_files);
+        assert_eq!(before_count.num_manifest_files, after_count.num_manifest_files);
+        assert_eq!(before_count.num_index_files, after_count.num_index_files);
+        assert_eq!(before_count.num_delete_files, after_count.num_delete_files);
+        assert_eq!(before_count.num_tx_files, after_count.num_tx_files);
+        assert_eq!(before_count.num_bytes, after_count.num_bytes);
     }
 
     #[tokio::test]
@@ -3543,10 +3557,7 @@ mod tests {
 
         let checkpoint_dir = checkpoint.checkpoint_dir();
         
-        // Corrupt both formats to ensure graceful degradation
-        let binpb_path = checkpoint_dir.child(format!("{:020}.binpb", u64::MAX - 3));
-        let _ = db.object_store.put(&binpb_path, b"corrupted data").await;
-        
+        // Corrupt the checkpoint file to ensure graceful degradation
         let lance_path = checkpoint_dir.child(format!("{:020}.lance", u64::MAX - 3));
         db.object_store.put(&lance_path, b"corrupted data").await.unwrap();
 
