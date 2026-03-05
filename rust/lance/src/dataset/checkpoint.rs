@@ -9,15 +9,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array,
-};
+use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
-use lance_core::{Error, Result};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::{Error, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::previous::writer::{FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions};
+use lance_file::previous::writer::{
+    FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{ManifestSummary, SelfDescribingFileReader};
 use lance_table::io::manifest::ManifestDescribing;
@@ -26,12 +26,11 @@ use snafu::location;
 
 pub const CHECKPOINT_DIR: &str = "_checkpoint";
 const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".lance";
-const METADATA_KEY_LATEST_VERSION: &str = "lance:checkpoint:latest_version";
 const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
 const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
 
 // Version number inversion for file naming (consistent with manifest V2)
-// 
+//
 // This offset is used to create inverted version numbers that sort in descending order
 // when files are listed alphabetically. This ensures that newer versions appear
 // first in directory listings, For example:
@@ -64,52 +63,106 @@ fn version_summary_schema() -> Arc<ArrowSchema> {
 /// Private helper to get the Lance schema for VersionSummary
 fn version_summary_lance_schema() -> Result<LanceSchema> {
     let arrow_schema = version_summary_schema();
-    LanceSchema::try_from(arrow_schema.as_ref())
-        .map_err(|e| Error::invalid_input(format!("Failed to create Lance schema: {}", e), location!()))
+    LanceSchema::try_from(arrow_schema.as_ref()).map_err(|e| {
+        Error::invalid_input(format!("Failed to create Lance schema: {}", e), location!())
+    })
 }
 
 /// Convert a slice of VersionSummary to an Arrow RecordBatch
 fn version_summaries_to_record_batch(summaries: &[VersionSummary]) -> Result<RecordBatch> {
     let schema = version_summary_schema();
 
-    let versions = UInt64Array::from(summaries.iter().map(|s| Some(s.version)).collect::<Vec<_>>());
-    let timestamps = Int64Array::from(summaries.iter().map(|s| Some(s.timestamp_millis)).collect::<Vec<_>>());
+    let versions = UInt64Array::from(
+        summaries
+            .iter()
+            .map(|s| Some(s.version))
+            .collect::<Vec<_>>(),
+    );
+    let timestamps = Int64Array::from(
+        summaries
+            .iter()
+            .map(|s| Some(s.timestamp_millis))
+            .collect::<Vec<_>>(),
+    );
     let total_fragments = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_fragments)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_fragments))
+            .collect::<Vec<_>>(),
     );
     let total_data_files = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_data_files)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_data_files))
+            .collect::<Vec<_>>(),
     );
     let total_files_size = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_files_size)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_files_size))
+            .collect::<Vec<_>>(),
     );
     let total_deletion_files = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_deletion_files)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_deletion_files))
+            .collect::<Vec<_>>(),
     );
     let total_data_file_rows = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_data_file_rows)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_data_file_rows))
+            .collect::<Vec<_>>(),
     );
     let total_deletion_file_rows = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_deletion_file_rows)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_deletion_file_rows))
+            .collect::<Vec<_>>(),
     );
     let total_rows = UInt64Array::from(
-        summaries.iter().map(|s| Some(s.manifest_summary.total_rows)).collect::<Vec<_>>(),
+        summaries
+            .iter()
+            .map(|s| Some(s.manifest_summary.total_rows))
+            .collect::<Vec<_>>(),
     );
-    let is_tagged = BooleanArray::from(summaries.iter().map(|s| Some(s.is_tagged)).collect::<Vec<_>>());
-    let is_cleaned_up = BooleanArray::from(summaries.iter().map(|s| Some(s.is_cleaned_up)).collect::<Vec<_>>());
-    let transaction_uuid = StringArray::from(summaries.iter().map(|s| s.transaction_uuid.as_deref()).collect::<Vec<_>>());
-    let read_version = UInt64Array::from(summaries.iter().map(|s| s.read_version).collect::<Vec<_>>());
-    let operation_type = StringArray::from(summaries.iter().map(|s| s.operation_type.as_deref()).collect::<Vec<_>>());
+    let is_tagged = BooleanArray::from(
+        summaries
+            .iter()
+            .map(|s| Some(s.is_tagged))
+            .collect::<Vec<_>>(),
+    );
+    let is_cleaned_up = BooleanArray::from(
+        summaries
+            .iter()
+            .map(|s| Some(s.is_cleaned_up))
+            .collect::<Vec<_>>(),
+    );
+    let transaction_uuid = StringArray::from(
+        summaries
+            .iter()
+            .map(|s| s.transaction_uuid.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let read_version =
+        UInt64Array::from(summaries.iter().map(|s| s.read_version).collect::<Vec<_>>());
+    let operation_type = StringArray::from(
+        summaries
+            .iter()
+            .map(|s| s.operation_type.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let transaction_properties = StringArray::from(
-        summaries.iter().map(|s| {
-            match serde_json::to_string(&s.transaction_properties) {
+        summaries
+            .iter()
+            .map(|s| match serde_json::to_string(&s.transaction_properties) {
                 Ok(json) => Some(json),
                 Err(e) => {
                     tracing::warn!("Failed to serialize transaction_properties: {}", e);
                     None
                 }
-            }
-        }).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
     );
 
     RecordBatch::try_new(
@@ -140,95 +193,127 @@ fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionS
     let mut summaries = Vec::with_capacity(batch.num_rows());
 
     let version_col = batch
-        .column(0)
+        .column_by_name("version")
+        .ok_or_else(|| Error::invalid_input("version column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| Error::invalid_input("version column is not UInt64", location!()))?;
     let timestamp_col = batch
-        .column(1)
+        .column_by_name("timestamp_millis")
+        .ok_or_else(|| Error::invalid_input("timestamp_millis column not found", location!()))?
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| Error::invalid_input("timestamp_millis column is not Int64", location!()))?;
     let total_fragments_col = batch
-        .column(2)
+        .column_by_name("total_fragments")
+        .ok_or_else(|| Error::invalid_input("total_fragments column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| Error::invalid_input("total_fragments column is not UInt64", location!()))?;
     let total_data_files_col = batch
-        .column(3)
+        .column_by_name("total_data_files")
+        .ok_or_else(|| Error::invalid_input("total_data_files column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("total_data_files column is not UInt64", location!()))?;
+        .ok_or_else(|| {
+            Error::invalid_input("total_data_files column is not UInt64", location!())
+        })?;
     let total_files_size_col = batch
-        .column(4)
+        .column_by_name("total_files_size")
+        .ok_or_else(|| Error::invalid_input("total_files_size column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("total_files_size column is not UInt64", location!()))?;
+        .ok_or_else(|| {
+            Error::invalid_input("total_files_size column is not UInt64", location!())
+        })?;
     let total_deletion_files_col = batch
-        .column(5)
+        .column_by_name("total_deletion_files")
+        .ok_or_else(|| Error::invalid_input("total_deletion_files column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("total_deletion_files column is not UInt64", location!()))?;
+        .ok_or_else(|| {
+            Error::invalid_input("total_deletion_files column is not UInt64", location!())
+        })?;
     let total_data_file_rows_col = batch
-        .column(6)
+        .column_by_name("total_data_file_rows")
+        .ok_or_else(|| Error::invalid_input("total_data_file_rows column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("total_data_file_rows column is not UInt64", location!()))?;
+        .ok_or_else(|| {
+            Error::invalid_input("total_data_file_rows column is not UInt64", location!())
+        })?;
     let total_deletion_file_rows_col = batch
-        .column(7)
+        .column_by_name("total_deletion_file_rows")
+        .ok_or_else(|| {
+            Error::invalid_input("total_deletion_file_rows column not found", location!())
+        })?
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| {
             Error::invalid_input("total_deletion_file_rows column is not UInt64", location!())
         })?;
     let total_rows_col = batch
-        .column(8)
+        .column_by_name("total_rows")
+        .ok_or_else(|| Error::invalid_input("total_rows column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| Error::invalid_input("total_rows column is not UInt64", location!()))?;
     let is_tagged_col = batch
-        .column(9)
+        .column_by_name("is_tagged")
+        .ok_or_else(|| Error::invalid_input("is_tagged column not found", location!()))?
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| Error::invalid_input("is_tagged column is not Boolean", location!()))?;
     let is_cleaned_up_col = batch
-        .column(10)
+        .column_by_name("is_cleaned_up")
+        .ok_or_else(|| Error::invalid_input("is_cleaned_up column not found", location!()))?
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| Error::invalid_input("is_cleaned_up column is not Boolean", location!()))?;
     let transaction_uuid_col = batch
-        .column(11)
+        .column_by_name("transaction_uuid")
+        .ok_or_else(|| Error::invalid_input("transaction_uuid column not found", location!()))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::invalid_input("transaction_uuid column is not String", location!()))?;
+        .ok_or_else(|| {
+            Error::invalid_input("transaction_uuid column is not String", location!())
+        })?;
     let read_version_col = batch
-        .column(12)
+        .column_by_name("read_version")
+        .ok_or_else(|| Error::invalid_input("read_version column not found", location!()))?
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| Error::invalid_input("read_version column is not UInt64", location!()))?;
     let operation_type_col = batch
-        .column(13)
+        .column_by_name("operation_type")
+        .ok_or_else(|| Error::invalid_input("operation_type column not found", location!()))?
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| Error::invalid_input("operation_type column is not String", location!()))?;
     let transaction_properties_col = batch
-        .column(14)
+        .column_by_name("transaction_properties")
+        .ok_or_else(|| {
+            Error::invalid_input("transaction_properties column not found", location!())
+        })?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::invalid_input("transaction_properties column is not String", location!()))?;
+        .ok_or_else(|| {
+            Error::invalid_input("transaction_properties column is not String", location!())
+        })?;
 
     for i in 0..batch.num_rows() {
-        let transaction_properties: HashMap<String, String> = if transaction_properties_col.is_valid(i) {
-            match serde_json::from_str(transaction_properties_col.value(i)) {
-                Ok(props) => props,
-                Err(e) => {
-                    tracing::warn!("Failed to parse transaction_properties: {}", e);
-                    HashMap::new()
+        let transaction_properties: HashMap<String, String> =
+            if transaction_properties_col.is_valid(i) {
+                match serde_json::from_str(transaction_properties_col.value(i)) {
+                    Ok(props) => props,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse transaction_properties: {}", e);
+                        HashMap::new()
+                    }
                 }
-            }
-        } else {
-            HashMap::new()
-        };
+            } else {
+                HashMap::new()
+            };
 
         summaries.push(VersionSummary {
             version: version_col.value(i),
@@ -333,21 +418,17 @@ pub struct VersionSummary {
     pub transaction_properties: HashMap<String, String>,
 }
 
-
-
 /// Version checkpoint with persistence capability
 #[derive(Debug, Clone)]
 pub struct VersionCheckpoint {
     pub versions: Vec<VersionSummary>,
     pub latest_version_number: u64,
-    pub dataset_created_millis: u64,
-    pub created_at_millis: u64,
+    pub dataset_created_millis: i64,
+    pub created_at_millis: i64,
     config: CheckpointConfig,
     base: Path,
     object_store: Arc<ObjectStore>,
 }
-
-
 
 impl VersionCheckpoint {
     pub fn checkpoint_dir(&self) -> Path {
@@ -386,10 +467,6 @@ impl VersionCheckpoint {
         let batch = version_summaries_to_record_batch(&self.versions)?;
         let mut lance_schema = version_summary_lance_schema()?;
         lance_schema.metadata.insert(
-            METADATA_KEY_LATEST_VERSION.to_string(),
-            self.latest_version_number.to_string(),
-        );
-        lance_schema.metadata.insert(
             METADATA_KEY_DATASET_CREATED.to_string(),
             self.dataset_created_millis.to_string(),
         );
@@ -399,14 +476,13 @@ impl VersionCheckpoint {
         );
 
         let options = PreviousFileWriterOptions::default();
-        let mut writer =
-            PreviousFileWriter::<ManifestDescribing>::try_new(
-                &self.object_store,
-                &path,
-                lance_schema,
-                &options,
-            )
-            .await?;
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
+            &self.object_store,
+            &path,
+            lance_schema,
+            &options,
+        )
+        .await?;
 
         writer.write(&[batch]).await?;
         writer.finish().await?;
@@ -422,46 +498,35 @@ impl VersionCheckpoint {
         config: CheckpointConfig,
     ) -> Result<Self> {
         let reader = object_store.open(path).await?;
-        let reader = PreviousFileReader::try_new_self_described_from_reader(reader.into(), None)
-            .await?;
+        let reader =
+            PreviousFileReader::try_new_self_described_from_reader(reader.into(), None).await?;
         let num_batches = reader.num_batches();
 
         let mut all_summaries = Vec::new();
         for i in 0..num_batches {
             let batch = reader
-                .read_batch(i as i32, lance_io::ReadBatchParams::RangeFull, reader.schema())
+                .read_batch(
+                    i as i32,
+                    lance_io::ReadBatchParams::RangeFull,
+                    reader.schema(),
+                )
                 .await?;
             all_summaries.extend(record_batch_to_version_summaries(&batch)?);
         }
 
-        let schema = reader.schema();
-        let latest_version_number = schema
-            .metadata
-            .get(METADATA_KEY_LATEST_VERSION)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| {
-                all_summaries.last().map(|s| s.version).unwrap_or(0)
-            });
+        let latest_version_number = all_summaries.iter().map(|s| s.version).max().unwrap_or(0);
 
-        // Validate metadata consistency
-        let actual_max_version = all_summaries.iter().map(|s| s.version).max().unwrap_or(0);
-        if latest_version_number != actual_max_version {
-            tracing::warn!(
-                "Checkpoint metadata mismatch: latest_version_number={} but actual max={}",
-                latest_version_number,
-                actual_max_version
-            );
-        }
+        let schema = reader.schema();
         let dataset_created_millis = schema
             .metadata
             .get(METADATA_KEY_DATASET_CREATED)
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let created_at_millis = schema
             .metadata
             .get(METADATA_KEY_CREATED_AT)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
         Ok(Self {
             versions: all_summaries,
@@ -487,7 +552,7 @@ impl VersionCheckpoint {
         let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
 
         for (_, path) in checkpoints {
-            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+            match Self::read_checkpoint(&base, object_store.clone(), &path, config).await {
                 Ok(checkpoint) => return Ok(checkpoint),
                 Err(e) => {
                     tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
@@ -499,7 +564,7 @@ impl VersionCheckpoint {
             versions: Vec::new(),
             latest_version_number: 0,
             dataset_created_millis: 0,
-            created_at_millis: chrono::Utc::now().timestamp_millis() as u64,
+            created_at_millis: chrono::Utc::now().timestamp_millis(),
             config,
             base,
             object_store,
@@ -515,7 +580,7 @@ impl VersionCheckpoint {
         let checkpoint_dir = base.child(CHECKPOINT_DIR);
         let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
         for (_, path) in checkpoints {
-            match Self::load_from_path(&base, object_store.clone(), &path, config).await {
+            match Self::read_checkpoint(&base, object_store.clone(), &path, config).await {
                 Ok(checkpoint) => return Ok(Some(checkpoint)),
                 Err(e) => {
                     tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
@@ -523,15 +588,6 @@ impl VersionCheckpoint {
             }
         }
         Ok(None)
-    }
-
-    async fn load_from_path(
-        base: &Path,
-        object_store: Arc<ObjectStore>,
-        path: &Path,
-        config: CheckpointConfig,
-    ) -> Result<Self> {
-        Self::read_checkpoint(base, object_store, path, config).await
     }
 
     /// Add new version summaries to the checkpoint
@@ -554,7 +610,7 @@ impl VersionCheckpoint {
             self.dataset_created_millis = self
                 .versions
                 .first()
-                .map(|v| v.timestamp_millis as u64)
+                .map(|v| v.timestamp_millis)
                 .unwrap_or(0);
         }
 
@@ -564,7 +620,7 @@ impl VersionCheckpoint {
         }
 
         self.latest_version_number = self.versions.iter().map(|v| v.version).max().unwrap_or(0);
-        self.created_at_millis = chrono::Utc::now().timestamp_millis() as u64;
+        self.created_at_millis = chrono::Utc::now().timestamp_millis();
     }
 
     /// Flush the checkpoint to storage
@@ -589,7 +645,7 @@ impl VersionCheckpoint {
             let delete_count = checkpoints.len() - self.config.max_checkpoint_files;
             for (version, _) in checkpoints.iter().take(delete_count) {
                 let inverted = to_inverted_version(*version);
-                
+
                 let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
                 let path = self.checkpoint_dir().child(filename);
                 if let Err(e) = self.object_store.delete(&path).await {
@@ -686,7 +742,10 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_add_summaries_and_flush() {
         let mut fixture = CheckpointTestFixture::new().await;
-        assert!(fixture.checkpoint.is_enabled(), "Checkpoint should be enabled by default");
+        assert!(
+            fixture.checkpoint.is_enabled(),
+            "Checkpoint should be enabled by default"
+        );
 
         fixture.checkpoint.add_summaries(&[
             create_test_version_summary(1),
@@ -746,7 +805,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(loaded2.versions.len(), 1);
-        assert!(loaded2.versions[0].is_tagged, "is_tagged should be preserved");
+        assert!(
+            loaded2.versions[0].is_tagged,
+            "is_tagged should be preserved"
+        );
         assert!(
             loaded2.versions[0].is_cleaned_up,
             "is_cleaned_up should be preserved"
@@ -782,7 +844,7 @@ mod tests {
         fixture.checkpoint.flush().await.unwrap();
 
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
-        
+
         // Corrupt the checkpoint file
         let lance_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(1)));
         fixture
@@ -915,7 +977,7 @@ mod tests {
         fixture.checkpoint.flush().await.unwrap();
 
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
-        
+
         // Corrupt v2 checkpoint to ensure we fall back to v1
         let v2_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(2)));
         fixture

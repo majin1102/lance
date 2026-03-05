@@ -23,7 +23,6 @@ Checkpoints are stored in the `_checkpoint/` directory at the dataset root:
 {dataset_root}/
     _checkpoint/
         {inverted_version}.lance    -- Checkpoint file in Lance format
-        {inverted_version}.binpb    -- Legacy checkpoint file (protobuf format)
 ```
 
 ### File Naming Convention
@@ -60,7 +59,7 @@ Checkpoint files store a table with the following schema:
 | `transaction_uuid` | `Utf8` | Yes | Transaction UUID for transaction file lookup |
 | `read_version` | `UInt64` | Yes | The base version read by the transaction |
 | `operation_type` | `Utf8` | Yes | Operation type (e.g., \"Append\", \"Delete\", \"Rewrite\") |
-| `transaction_properties` | `Map<Utf8, Utf8>` | Yes | Additional transaction properties as key-value pairs |
+| `transaction_properties` | `Utf8` (JSON) | Yes | Additional transaction properties as JSON-encoded key-value pairs |
 
 ### Schema Definition Code
 
@@ -84,21 +83,7 @@ fn version_summary_schema() -> Arc<ArrowSchema> {
         Field::new("transaction_uuid", DataType::Utf8, true),
         Field::new("read_version", DataType::UInt64, true),
         Field::new("operation_type", DataType::Utf8, true),
-        Field::new(
-            "transaction_properties",
-            DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(vec![
-                        Field::new("key", DataType::Utf8, false),
-                        Field::new("value", DataType::Utf8, true),
-                    ].into()),
-                    false,
-                )),
-                false,
-            ),
-            true,
-        ),
+        Field::new("transaction_properties", DataType::Utf8, true),
     ]))
 }
 ```
@@ -109,28 +94,12 @@ Checkpoint files store additional metadata in the Lance file's schema metadata:
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `dataset_created_millis` | `Int64` | Dataset creation time (timestamp of the earliest version) in milliseconds since epoch |
-| `created_at_millis` | `Int64` | Checkpoint file creation timestamp in milliseconds since epoch |
-| `latest_version_number` | `UInt64` | The latest version number included in this checkpoint |
+| `lance:checkpoint:dataset_created` | `Int64` (as string) | Dataset creation time (timestamp of the earliest version) in milliseconds since epoch |
+| `lance:checkpoint:created_at` | `Int64` (as string) | Checkpoint file creation timestamp in milliseconds since epoch |
 
 These values are stored as strings in the schema metadata for simplicity.
 
-## Backward Compatibility
-
-### Reading Legacy Format
-
-Readers should:
-1. First attempt to read the `.lance` format for a given version
-2. If that fails, fall back to reading the legacy `.binpb` (protobuf) format
-3. Log a warning when falling back to the legacy format
-
-### Writing New Format
-
-Writers should always write in the new `.lance` format. Legacy `.binpb` files will eventually be cleaned up by the cleanup policy.
-
-### Migration
-
-No explicit migration is required. As new checkpoints are written in the `.lance` format, old `.binpb` files will naturally be replaced and eventually cleaned up according to the checkpoint retention policy.
+The `latest_version_number` is computed directly from the version summaries (maximum version in the data) rather than stored in metadata.
 
 ## Example
 
@@ -154,7 +123,7 @@ schema = pa.schema([
     pa.field("transaction_uuid", pa.utf8(), nullable=True),
     pa.field("read_version", pa.uint64(), nullable=True),
     pa.field("operation_type", pa.utf8(), nullable=True),
-    pa.field("transaction_properties", pa.map_(pa.utf8(), pa.utf8()), nullable=True),
+    pa.field("transaction_properties", pa.utf8(), nullable=True),
 ])
 
 data = [
@@ -174,9 +143,9 @@ data = [
     pa.array(["Append", "Delete", "Rewrite"], type=pa.utf8()),
     pa.array([
         None,
-        [("reason", "cleanup")],
-        [("source", "import"), ("format", "parquet")]
-    ], type=pa.map_(pa.utf8(), pa.utf8())),
+        "{\"reason\": \"cleanup\"}",
+        "{\"source\": \"import\", \"format\": \"parquet\"}"
+    ], type=pa.utf8()),
 ]
 
 batch = pa.RecordBatch.from_arrays(data, schema=schema)
@@ -186,9 +155,8 @@ batch = pa.RecordBatch.from_arrays(data, schema=schema)
 
 ```python
 metadata = {
-    "dataset_created_millis": "1000000",
-    "created_at_millis": "4000000",
-    "latest_version_number": "3",
+    "lance:checkpoint:dataset_created": "1000000",
+    "lance:checkpoint:created_at": "4000000",
 }
 ```
 
@@ -207,9 +175,3 @@ Checkpoint files follow the retention policy configured by:
 When these limits are exceeded:
 1. Older entries are truncated from the checkpoint file
 2. Older checkpoint files are deleted
-
-### File Extension Precedence
-
-When both `.lance` and `.binpb` files exist for the same version:
-- The `.lance` file should be preferred
-- The `.binpb` file can be safely deleted once the `.lance` file is verified
