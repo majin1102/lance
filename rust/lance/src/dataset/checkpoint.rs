@@ -186,7 +186,9 @@ macro_rules! get_column {
             .ok_or_else(|| Error::invalid_input(concat!($name, " column not found"), location!()))?
             .as_any()
             .downcast_ref::<$type>()
-            .ok_or_else(|| Error::invalid_input(concat!($name, " column is not ", $type_str), location!()))?
+            .ok_or_else(|| {
+                Error::invalid_input(concat!($name, " column is not ", $type_str), location!())
+            })?
     };
 }
 
@@ -219,16 +221,20 @@ fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionS
     let total_fragments_col = get_column!(batch, "total_fragments", UInt64Array, "UInt64");
     let total_data_files_col = get_column!(batch, "total_data_files", UInt64Array, "UInt64");
     let total_files_size_col = get_column!(batch, "total_files_size", UInt64Array, "UInt64");
-    let total_deletion_files_col = get_column!(batch, "total_deletion_files", UInt64Array, "UInt64");
-    let total_data_file_rows_col = get_column!(batch, "total_data_file_rows", UInt64Array, "UInt64");
-    let total_deletion_file_rows_col = get_column!(batch, "total_deletion_file_rows", UInt64Array, "UInt64");
+    let total_deletion_files_col =
+        get_column!(batch, "total_deletion_files", UInt64Array, "UInt64");
+    let total_data_file_rows_col =
+        get_column!(batch, "total_data_file_rows", UInt64Array, "UInt64");
+    let total_deletion_file_rows_col =
+        get_column!(batch, "total_deletion_file_rows", UInt64Array, "UInt64");
     let total_rows_col = get_column!(batch, "total_rows", UInt64Array, "UInt64");
     let is_tagged_col = get_column!(batch, "is_tagged", BooleanArray, "Boolean");
     let is_cleaned_up_col = get_column!(batch, "is_cleaned_up", BooleanArray, "Boolean");
     let transaction_uuid_col = get_column!(batch, "transaction_uuid", StringArray, "String");
     let read_version_col = get_column!(batch, "read_version", UInt64Array, "UInt64");
     let operation_type_col = get_column!(batch, "operation_type", StringArray, "String");
-    let transaction_properties_col = get_column!(batch, "transaction_properties", StringArray, "String");
+    let transaction_properties_col =
+        get_column!(batch, "transaction_properties", StringArray, "String");
 
     for i in 0..batch.num_rows() {
         let transaction_properties: HashMap<String, String> = if transaction_properties_col
@@ -270,7 +276,9 @@ fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionS
             transaction_uuid: transaction_uuid_col
                 .is_valid(i)
                 .then(|| transaction_uuid_col.value(i).to_string()),
-            read_version: read_version_col.is_valid(i).then(|| read_version_col.value(i)),
+            read_version: read_version_col
+                .is_valid(i)
+                .then(|| read_version_col.value(i)),
             operation_type: operation_type_col
                 .is_valid(i)
                 .then(|| operation_type_col.value(i).to_string()),
@@ -528,8 +536,7 @@ impl VersionCheckpoint {
         object_store: Arc<ObjectStore>,
         config: CheckpointConfig,
     ) -> Result<Self> {
-        if let Some(checkpoint) =
-            Self::load_from_files(&base, object_store.clone(), config).await?
+        if let Some(checkpoint) = Self::load_from_files(&base, object_store.clone(), config).await?
         {
             return Ok(checkpoint);
         }

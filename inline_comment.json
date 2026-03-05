@@ -1,0 +1,6 @@
+{
+  "body": "**P1: Documentation inconsistency**\n\nThe documentation (checkpoint.md line 69) specifies `Map<Utf8, Utf8>` type for `transaction_properties`, but the implementation uses `Utf8` (JSON string) at checkpoint.rs line 274.\n\nPlease clarify which approach is intentional.",
+  "commit_id": "ba68209c52c7c6a091b91d9e59ea2cca3c53caae",
+  "path": "rust/lance/src/dataset/checkpoint.rs",
+  "line": 274
+}

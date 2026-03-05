@@ -33,7 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary, CHECKPOINT_DIR};
+use super::checkpoint::{CHECKPOINT_DIR, CheckpointConfig, VersionCheckpoint, VersionSummary};
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
