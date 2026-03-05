@@ -33,7 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
+use super::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary, CHECKPOINT_DIR};
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
@@ -1458,7 +1458,7 @@ mod tests {
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
-                let is_checkpoint = path.location.parts().any(|p| p.as_ref() == "_checkpoint");
+                let is_checkpoint = path.location.parts().any(|p| p.as_ref() == CHECKPOINT_DIR);
 
                 // Checkpoint files are managed separately, don't count their bytes
                 if !is_checkpoint {

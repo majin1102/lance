@@ -29,6 +29,11 @@ const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".lance";
 const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
 const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
 
+/// Generate checkpoint filename for a given version
+fn checkpoint_filename(version: u64) -> String {
+    format!("{:020}{}", version, VERSION_CHECKPOINT_FILE_SUFFIX)
+}
+
 /// Private helper to get the Arrow schema for VersionSummary
 fn version_summary_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
@@ -59,251 +64,194 @@ fn version_summary_lance_schema() -> Result<LanceSchema> {
 }
 
 /// Convert a slice of VersionSummary to an Arrow RecordBatch
+///
+/// This function serializes version summaries into a columnar format
+/// suitable for storage in Lance files. Transaction properties are
+/// serialized to JSON strings with a size limit of 10KB.
+///
+/// # Arguments
+/// * `summaries` - Slice of version summaries to convert
+///
+/// # Returns
+/// * `Ok(RecordBatch)` - The converted record batch with all version data
+/// * `Err(Error)` - If conversion fails (e.g., serialization error)
+///
+/// # Performance
+/// This function uses a single-pass algorithm that pre-allocates all vectors
+/// for optimal cache locality and minimal memory allocations.
+///
+/// # Errors
+/// - Fails if any summary's transaction properties cannot be serialized to JSON
+/// - Fails if the record batch cannot be constructed from the arrays
 fn version_summaries_to_record_batch(summaries: &[VersionSummary]) -> Result<RecordBatch> {
     let schema = version_summary_schema();
+    let capacity = summaries.len();
 
-    let versions = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.version))
-            .collect::<Vec<_>>(),
-    );
-    let timestamps = Int64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.timestamp_millis))
-            .collect::<Vec<_>>(),
-    );
-    let total_fragments = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_fragments))
-            .collect::<Vec<_>>(),
-    );
-    let total_data_files = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_data_files))
-            .collect::<Vec<_>>(),
-    );
-    let total_files_size = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_files_size))
-            .collect::<Vec<_>>(),
-    );
-    let total_deletion_files = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_deletion_files))
-            .collect::<Vec<_>>(),
-    );
-    let total_data_file_rows = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_data_file_rows))
-            .collect::<Vec<_>>(),
-    );
-    let total_deletion_file_rows = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_deletion_file_rows))
-            .collect::<Vec<_>>(),
-    );
-    let total_rows = UInt64Array::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.manifest_summary.total_rows))
-            .collect::<Vec<_>>(),
-    );
-    let is_tagged = BooleanArray::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.is_tagged))
-            .collect::<Vec<_>>(),
-    );
-    let is_cleaned_up = BooleanArray::from(
-        summaries
-            .iter()
-            .map(|s| Some(s.is_cleaned_up))
-            .collect::<Vec<_>>(),
-    );
-    let transaction_uuid = StringArray::from(
-        summaries
-            .iter()
-            .map(|s| s.transaction_uuid.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let read_version =
-        UInt64Array::from(summaries.iter().map(|s| s.read_version).collect::<Vec<_>>());
-    let operation_type = StringArray::from(
-        summaries
-            .iter()
-            .map(|s| s.operation_type.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let transaction_properties = StringArray::from(
-        summaries
-            .iter()
-            .map(|s| match serde_json::to_string(&s.transaction_properties) {
-                Ok(json) => Some(json),
+    // Pre-allocate all vectors with known capacity for better performance
+    let mut versions = Vec::with_capacity(capacity);
+    let mut timestamps = Vec::with_capacity(capacity);
+    let mut total_fragments = Vec::with_capacity(capacity);
+    let mut total_data_files = Vec::with_capacity(capacity);
+    let mut total_files_size = Vec::with_capacity(capacity);
+    let mut total_deletion_files = Vec::with_capacity(capacity);
+    let mut total_data_file_rows = Vec::with_capacity(capacity);
+    let mut total_deletion_file_rows = Vec::with_capacity(capacity);
+    let mut total_rows = Vec::with_capacity(capacity);
+    let mut is_tagged = Vec::with_capacity(capacity);
+    let mut is_cleaned_up = Vec::with_capacity(capacity);
+    let mut transaction_uuid = Vec::with_capacity(capacity);
+    let mut read_version = Vec::with_capacity(capacity);
+    let mut operation_type = Vec::with_capacity(capacity);
+    let mut transaction_properties = Vec::with_capacity(capacity);
+
+    // Single pass through summaries - more cache friendly
+    for s in summaries {
+        versions.push(Some(s.version));
+        timestamps.push(Some(s.timestamp_millis));
+        total_fragments.push(Some(s.manifest_summary.total_fragments));
+        total_data_files.push(Some(s.manifest_summary.total_data_files));
+        total_files_size.push(Some(s.manifest_summary.total_files_size));
+        total_deletion_files.push(Some(s.manifest_summary.total_deletion_files));
+        total_data_file_rows.push(Some(s.manifest_summary.total_data_file_rows));
+        total_deletion_file_rows.push(Some(s.manifest_summary.total_deletion_file_rows));
+        total_rows.push(Some(s.manifest_summary.total_rows));
+        is_tagged.push(Some(s.is_tagged));
+        is_cleaned_up.push(Some(s.is_cleaned_up));
+        transaction_uuid.push(s.transaction_uuid.as_deref());
+        read_version.push(s.read_version);
+        operation_type.push(s.operation_type.as_deref());
+
+        // Handle transaction_properties with size limit
+        if s.transaction_properties.is_empty() {
+            transaction_properties.push(None);
+        } else {
+            match serde_json::to_string(&s.transaction_properties) {
+                Ok(json) => {
+                    const MAX_TRANSACTION_PROPERTIES_SIZE: usize = 10 * 1024;
+                    if json.len() > MAX_TRANSACTION_PROPERTIES_SIZE {
+                        tracing::warn!(
+                            "Transaction properties size ({}) exceeds limit ({}), truncating",
+                            json.len(),
+                            MAX_TRANSACTION_PROPERTIES_SIZE
+                        );
+                        // Wrap truncated content to indicate it's incomplete
+                        // Keep first 10KB of original JSON for debugging
+                        let preview_len = MAX_TRANSACTION_PROPERTIES_SIZE.min(json.len());
+                        let wrapped = format!(
+                            "{{\"_truncated\":true,\"_size\":{},\"_data\":{}}}",
+                            json.len(),
+                            &json[..preview_len]
+                        );
+                        transaction_properties.push(Some(wrapped));
+                    } else {
+                        transaction_properties.push(Some(json));
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("Failed to serialize transaction_properties: {}", e);
-                    None
+                    transaction_properties.push(None);
                 }
-            })
-            .collect::<Vec<_>>(),
-    );
+            }
+        }
+    }
 
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(versions),
-            Arc::new(timestamps),
-            Arc::new(total_fragments),
-            Arc::new(total_data_files),
-            Arc::new(total_files_size),
-            Arc::new(total_deletion_files),
-            Arc::new(total_data_file_rows),
-            Arc::new(total_deletion_file_rows),
-            Arc::new(total_rows),
-            Arc::new(is_tagged),
-            Arc::new(is_cleaned_up),
-            Arc::new(transaction_uuid),
-            Arc::new(read_version),
-            Arc::new(operation_type),
-            Arc::new(transaction_properties),
+            Arc::new(UInt64Array::from(versions)),
+            Arc::new(Int64Array::from(timestamps)),
+            Arc::new(UInt64Array::from(total_fragments)),
+            Arc::new(UInt64Array::from(total_data_files)),
+            Arc::new(UInt64Array::from(total_files_size)),
+            Arc::new(UInt64Array::from(total_deletion_files)),
+            Arc::new(UInt64Array::from(total_data_file_rows)),
+            Arc::new(UInt64Array::from(total_deletion_file_rows)),
+            Arc::new(UInt64Array::from(total_rows)),
+            Arc::new(BooleanArray::from(is_tagged)),
+            Arc::new(BooleanArray::from(is_cleaned_up)),
+            Arc::new(StringArray::from(transaction_uuid)),
+            Arc::new(UInt64Array::from(read_version)),
+            Arc::new(StringArray::from(operation_type)),
+            Arc::new(StringArray::from(transaction_properties)),
         ],
     )
     .map_err(|e| Error::invalid_input(format!("Failed to create RecordBatch: {}", e), location!()))
 }
 
+/// Macro to extract and downcast a column from a RecordBatch
+macro_rules! get_column {
+    ($batch:expr, $name:expr, $type:ty, $type_str:expr) => {
+        $batch
+            .column_by_name($name)
+            .ok_or_else(|| Error::invalid_input(concat!($name, " column not found"), location!()))?
+            .as_any()
+            .downcast_ref::<$type>()
+            .ok_or_else(|| Error::invalid_input(concat!($name, " column is not ", $type_str), location!()))?
+    };
+}
+
 /// Convert an Arrow RecordBatch to a Vec of VersionSummary
+///
+/// This function deserializes a record batch (read from a Lance checkpoint file)
+/// back into version summaries. It handles JSON deserialization of transaction
+/// properties and provides fallback error handling for corrupted data.
+///
+/// # Arguments
+/// * `batch` - The Arrow record batch to convert
+///
+/// # Returns
+/// * `Ok(Vec<VersionSummary>)` - The converted version summaries
+/// * `Err(Error)` - If conversion fails (e.g., column not found, type mismatch)
+///
+/// # Error Handling
+/// - If a column is missing or has the wrong type, returns an error
+/// - If transaction properties JSON cannot be parsed, preserves the raw value
+///   in a fallback HashMap for debugging purposes
+///
+/// # Performance
+/// This function uses column-by-name access for clarity and maintains
+/// the order of summaries as they appear in the record batch.
 fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionSummary>> {
     let mut summaries = Vec::with_capacity(batch.num_rows());
 
-    let version_col = batch
-        .column_by_name("version")
-        .ok_or_else(|| Error::invalid_input("version column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("version column is not UInt64", location!()))?;
-    let timestamp_col = batch
-        .column_by_name("timestamp_millis")
-        .ok_or_else(|| Error::invalid_input("timestamp_millis column not found", location!()))?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| Error::invalid_input("timestamp_millis column is not Int64", location!()))?;
-    let total_fragments_col = batch
-        .column_by_name("total_fragments")
-        .ok_or_else(|| Error::invalid_input("total_fragments column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("total_fragments column is not UInt64", location!()))?;
-    let total_data_files_col = batch
-        .column_by_name("total_data_files")
-        .ok_or_else(|| Error::invalid_input("total_data_files column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            Error::invalid_input("total_data_files column is not UInt64", location!())
-        })?;
-    let total_files_size_col = batch
-        .column_by_name("total_files_size")
-        .ok_or_else(|| Error::invalid_input("total_files_size column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            Error::invalid_input("total_files_size column is not UInt64", location!())
-        })?;
-    let total_deletion_files_col = batch
-        .column_by_name("total_deletion_files")
-        .ok_or_else(|| Error::invalid_input("total_deletion_files column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            Error::invalid_input("total_deletion_files column is not UInt64", location!())
-        })?;
-    let total_data_file_rows_col = batch
-        .column_by_name("total_data_file_rows")
-        .ok_or_else(|| Error::invalid_input("total_data_file_rows column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            Error::invalid_input("total_data_file_rows column is not UInt64", location!())
-        })?;
-    let total_deletion_file_rows_col = batch
-        .column_by_name("total_deletion_file_rows")
-        .ok_or_else(|| {
-            Error::invalid_input("total_deletion_file_rows column not found", location!())
-        })?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            Error::invalid_input("total_deletion_file_rows column is not UInt64", location!())
-        })?;
-    let total_rows_col = batch
-        .column_by_name("total_rows")
-        .ok_or_else(|| Error::invalid_input("total_rows column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("total_rows column is not UInt64", location!()))?;
-    let is_tagged_col = batch
-        .column_by_name("is_tagged")
-        .ok_or_else(|| Error::invalid_input("is_tagged column not found", location!()))?
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| Error::invalid_input("is_tagged column is not Boolean", location!()))?;
-    let is_cleaned_up_col = batch
-        .column_by_name("is_cleaned_up")
-        .ok_or_else(|| Error::invalid_input("is_cleaned_up column not found", location!()))?
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| Error::invalid_input("is_cleaned_up column is not Boolean", location!()))?;
-    let transaction_uuid_col = batch
-        .column_by_name("transaction_uuid")
-        .ok_or_else(|| Error::invalid_input("transaction_uuid column not found", location!()))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            Error::invalid_input("transaction_uuid column is not String", location!())
-        })?;
-    let read_version_col = batch
-        .column_by_name("read_version")
-        .ok_or_else(|| Error::invalid_input("read_version column not found", location!()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| Error::invalid_input("read_version column is not UInt64", location!()))?;
-    let operation_type_col = batch
-        .column_by_name("operation_type")
-        .ok_or_else(|| Error::invalid_input("operation_type column not found", location!()))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::invalid_input("operation_type column is not String", location!()))?;
-    let transaction_properties_col = batch
-        .column_by_name("transaction_properties")
-        .ok_or_else(|| {
-            Error::invalid_input("transaction_properties column not found", location!())
-        })?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            Error::invalid_input("transaction_properties column is not String", location!())
-        })?;
+    let version_col = get_column!(batch, "version", UInt64Array, "UInt64");
+    let timestamp_col = get_column!(batch, "timestamp_millis", Int64Array, "Int64");
+    let total_fragments_col = get_column!(batch, "total_fragments", UInt64Array, "UInt64");
+    let total_data_files_col = get_column!(batch, "total_data_files", UInt64Array, "UInt64");
+    let total_files_size_col = get_column!(batch, "total_files_size", UInt64Array, "UInt64");
+    let total_deletion_files_col = get_column!(batch, "total_deletion_files", UInt64Array, "UInt64");
+    let total_data_file_rows_col = get_column!(batch, "total_data_file_rows", UInt64Array, "UInt64");
+    let total_deletion_file_rows_col = get_column!(batch, "total_deletion_file_rows", UInt64Array, "UInt64");
+    let total_rows_col = get_column!(batch, "total_rows", UInt64Array, "UInt64");
+    let is_tagged_col = get_column!(batch, "is_tagged", BooleanArray, "Boolean");
+    let is_cleaned_up_col = get_column!(batch, "is_cleaned_up", BooleanArray, "Boolean");
+    let transaction_uuid_col = get_column!(batch, "transaction_uuid", StringArray, "String");
+    let read_version_col = get_column!(batch, "read_version", UInt64Array, "UInt64");
+    let operation_type_col = get_column!(batch, "operation_type", StringArray, "String");
+    let transaction_properties_col = get_column!(batch, "transaction_properties", StringArray, "String");
 
     for i in 0..batch.num_rows() {
-        let transaction_properties: HashMap<String, String> =
-            if transaction_properties_col.is_valid(i) {
-                match serde_json::from_str(transaction_properties_col.value(i)) {
-                    Ok(props) => props,
-                    Err(e) => {
-                        tracing::warn!("Failed to parse transaction_properties: {}", e);
-                        HashMap::new()
-                    }
+        let transaction_properties: HashMap<String, String> = if transaction_properties_col
+            .is_valid(i)
+        {
+            match serde_json::from_str(transaction_properties_col.value(i)) {
+                Ok(props) => props,
+                Err(e) => {
+                    let raw_value = transaction_properties_col.value(i);
+                    tracing::warn!(
+                        "Failed to parse transaction_properties: {}, raw value: {}",
+                        e,
+                        raw_value
+                    );
+                    // Preserve raw value for debugging
+                    let mut fallback = HashMap::with_capacity(1);
+                    fallback.insert("transaction_properties".to_string(), raw_value.to_string());
+                    fallback
                 }
-            } else {
-                HashMap::new()
-            };
+            }
+        } else {
+            HashMap::new()
+        };
 
         summaries.push(VersionSummary {
             version: version_col.value(i),
@@ -319,21 +267,13 @@ fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionS
             },
             is_tagged: is_tagged_col.value(i),
             is_cleaned_up: is_cleaned_up_col.value(i),
-            transaction_uuid: if transaction_uuid_col.is_valid(i) {
-                Some(transaction_uuid_col.value(i).to_string())
-            } else {
-                None
-            },
-            read_version: if read_version_col.is_valid(i) {
-                Some(read_version_col.value(i))
-            } else {
-                None
-            },
-            operation_type: if operation_type_col.is_valid(i) {
-                Some(operation_type_col.value(i).to_string())
-            } else {
-                None
-            },
+            transaction_uuid: transaction_uuid_col
+                .is_valid(i)
+                .then(|| transaction_uuid_col.value(i).to_string()),
+            read_version: read_version_col.is_valid(i).then(|| read_version_col.value(i)),
+            operation_type: operation_type_col
+                .is_valid(i)
+                .then(|| operation_type_col.value(i).to_string()),
             transaction_properties,
         });
     }
@@ -366,47 +306,81 @@ impl Default for CheckpointConfig {
 
 impl CheckpointConfig {
     /// Read configuration from manifest config
+    ///
+    /// Ensures that `max_entries` and `max_checkpoint_files` are at least 1
+    /// to prevent data loss during checkpoint finalization.
     pub fn from_config(config: &HashMap<String, String>) -> Self {
+        let max_entries = config
+            .get("lance.version_checkpoint.max_entries")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10000)
+            .max(1);
+
+        let max_checkpoint_files = config
+            .get("lance.version_checkpoint.max_checkpoint_files")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+            .max(1);
+
         Self {
             enabled: config
                 .get("lance.version_checkpoint.enabled")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(true),
-            max_entries: config
-                .get("lance.version_checkpoint.max_entries")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10000),
-            max_checkpoint_files: config
-                .get("lance.version_checkpoint.max_checkpoint_files")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
+            max_entries,
+            max_checkpoint_files,
         }
     }
 }
 
 /// Version summary with flattened manifest statistics
+///
+/// This structure contains metadata about a specific version of the dataset,
+/// including statistics about fragments, data files, deletion files, and rows.
+/// It is used for checkpoint preservation when manifests are cleaned up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionSummary {
+    /// The version number of this dataset version
     pub version: u64,
+    /// Timestamp when this version was created (milliseconds since epoch)
     pub timestamp_millis: i64,
+    /// Summary statistics about the manifest for this version
     pub manifest_summary: ManifestSummary,
+    /// Whether this version is tagged (should be retained)
     pub is_tagged: bool,
+    /// Whether this version has been cleaned up (manifest and data files removed)
     pub is_cleaned_up: bool,
+    /// Unique identifier for the transaction that created this version
     pub transaction_uuid: Option<String>,
+    /// The version that was read when this transaction was committed
     pub read_version: Option<u64>,
+    /// The type of operation that created this version (e.g., "append", "overwrite")
     pub operation_type: Option<String>,
+    /// Additional properties from the transaction
     pub transaction_properties: HashMap<String, String>,
 }
 
 /// Version checkpoint with persistence capability
+///
+/// This structure maintains version metadata for dataset versions, preserving
+/// information about versions even after their manifests have been cleaned up.
+/// Checkpoints are stored in Lance format and support automatic cleanup of
+/// old checkpoint files based on configuration.
 #[derive(Debug, Clone)]
 pub struct VersionCheckpoint {
+    /// List of version summaries stored in this checkpoint
     pub versions: Vec<VersionSummary>,
+    /// The highest version number in this checkpoint
     pub latest_version_number: u64,
+    /// Timestamp when the dataset was created (milliseconds since epoch)
     pub dataset_created_millis: i64,
+    /// Timestamp when this checkpoint was created (milliseconds since epoch)
     pub created_at_millis: i64,
+    /// Configuration for checkpoint behavior
     config: CheckpointConfig,
+    /// Base path for the dataset
     base: Path,
+    /// Object store for persistence
     object_store: Arc<ObjectStore>,
 }
 
@@ -440,10 +414,7 @@ impl VersionCheckpoint {
     /// Private helper to write a checkpoint in Lance format
     async fn write_checkpoint(&self) -> Result<()> {
         let checkpoint_dir = self.checkpoint_dir();
-        let filename = format!(
-            "{:020}{}",
-            self.latest_version_number, VERSION_CHECKPOINT_FILE_SUFFIX
-        );
+        let filename = checkpoint_filename(self.latest_version_number);
         let path = checkpoint_dir.child(filename);
 
         let batch = version_summaries_to_record_batch(&self.versions)?;
@@ -499,16 +470,20 @@ impl VersionCheckpoint {
         let latest_version_number = all_summaries.iter().map(|s| s.version).max().unwrap_or(0);
 
         let schema = reader.schema();
-        let dataset_created_millis = schema
-            .metadata
-            .get(METADATA_KEY_DATASET_CREATED)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        let created_at_millis = schema
-            .metadata
-            .get(METADATA_KEY_CREATED_AT)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let dataset_created_millis = Self::parse_metadata(
+            &schema.metadata,
+            METADATA_KEY_DATASET_CREATED,
+            0i64,
+            path,
+            "i64",
+        );
+        let created_at_millis = Self::parse_metadata(
+            &schema.metadata,
+            METADATA_KEY_CREATED_AT,
+            chrono::Utc::now().timestamp_millis(),
+            path,
+            "i64",
+        );
 
         Ok(Self {
             versions: all_summaries,
@@ -521,6 +496,29 @@ impl VersionCheckpoint {
         })
     }
 
+    /// Load checkpoint files from storage
+    ///
+    /// Attempts to load checkpoint files in order (newest first) and returns
+    /// the first successfully loaded checkpoint.
+    async fn load_from_files(
+        base: &Path,
+        object_store: Arc<ObjectStore>,
+        config: CheckpointConfig,
+    ) -> Result<Option<Self>> {
+        let checkpoint_dir = base.child(CHECKPOINT_DIR);
+        let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
+
+        for (_, path) in checkpoints {
+            match Self::read_checkpoint(base, object_store.clone(), &path, config).await {
+                Ok(checkpoint) => return Ok(Some(checkpoint)),
+                Err(e) => {
+                    tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Load the latest checkpoint from storage, or create a new empty one
     ///
     /// Tries to load from the newest checkpoint file. If corrupted, tries older files.
@@ -530,16 +528,10 @@ impl VersionCheckpoint {
         object_store: Arc<ObjectStore>,
         config: CheckpointConfig,
     ) -> Result<Self> {
-        let checkpoint_dir = base.child(CHECKPOINT_DIR);
-        let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
-
-        for (_, path) in checkpoints {
-            match Self::read_checkpoint(&base, object_store.clone(), &path, config).await {
-                Ok(checkpoint) => return Ok(checkpoint),
-                Err(e) => {
-                    tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
-                }
-            }
+        if let Some(checkpoint) =
+            Self::load_from_files(&base, object_store.clone(), config).await?
+        {
+            return Ok(checkpoint);
         }
 
         Ok(Self {
@@ -559,17 +551,7 @@ impl VersionCheckpoint {
         object_store: Arc<ObjectStore>,
         config: CheckpointConfig,
     ) -> Result<Option<Self>> {
-        let checkpoint_dir = base.child(CHECKPOINT_DIR);
-        let checkpoints = Self::list_checkpoint_files(&object_store, &checkpoint_dir).await?;
-        for (_, path) in checkpoints {
-            match Self::read_checkpoint(&base, object_store.clone(), &path, config).await {
-                Ok(checkpoint) => return Ok(Some(checkpoint)),
-                Err(e) => {
-                    tracing::warn!("Failed to load checkpoint file {}: {}", path, e);
-                }
-            }
-        }
-        Ok(None)
+        Self::load_from_files(&base, object_store, config).await
     }
 
     /// Add new version summaries to the checkpoint
@@ -624,11 +606,10 @@ impl VersionCheckpoint {
         let checkpoints = Self::list_checkpoint_files(&self.object_store, &checkpoint_dir).await?;
 
         if checkpoints.len() > self.config.max_checkpoint_files {
-            let delete_count = checkpoints.len() - self.config.max_checkpoint_files;
-            for (version, _) in checkpoints.iter().take(delete_count) {
-                let filename = format!("{:020}{}", version, VERSION_CHECKPOINT_FILE_SUFFIX);
-                let path = self.checkpoint_dir().child(filename);
-                if let Err(e) = self.object_store.delete(&path).await {
+            // checkpoints is sorted in descending order (newest first)
+            // skip the newest max_checkpoint_files, delete the rest (older ones)
+            for (_, path) in checkpoints.iter().skip(self.config.max_checkpoint_files) {
+                if let Err(e) = self.object_store.delete(path).await {
                     tracing::warn!("Failed to delete old checkpoint file {}: {}", path, e);
                 }
             }
@@ -643,6 +624,71 @@ impl VersionCheckpoint {
 
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Parse typed metadata from schema with default value on error
+    ///
+    /// This generic function attempts to parse a metadata value as the specified type T.
+    /// If the key is missing or parsing fails, it logs a warning and returns the default value.
+    ///
+    /// # Type Parameters
+    /// * `T` - The target type to parse the metadata value as (must implement FromStr and Default)
+    ///
+    /// # Arguments
+    /// * `metadata` - The metadata HashMap to read from
+    /// * `key` - The metadata key to look up
+    /// * `default` - The default value to use if the key is missing or parsing fails
+    /// * `path` - The checkpoint file path for error reporting
+    /// * `type_name` - Human-readable type name for error messages (e.g., "i64", "u64")
+    ///
+    /// # Returns
+    /// The parsed value or the default value
+    ///
+    /// # Example
+    /// ```ignore
+    /// let value = Self::parse_metadata(
+    ///     &schema.metadata,
+    ///     "lance:checkpoint:dataset_created",
+    ///     0,
+    ///     &path,
+    ///     "i64"
+    /// );
+    /// ```
+    fn parse_metadata<T: std::str::FromStr + Default + std::fmt::Debug>(
+        metadata: &HashMap<String, String>,
+        key: &str,
+        default: T,
+        path: &Path,
+        type_name: &str,
+    ) -> T
+    where
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+    {
+        match metadata.get(key) {
+            Some(metadata_value) => match metadata_value.parse::<T>() {
+                Ok(parsed_value) => parsed_value,
+                Err(parse_error) => {
+                    tracing::warn!(
+                        "Failed to parse {} metadata '{}' as {}: {}, using default {:?}",
+                        key,
+                        metadata_value,
+                        type_name,
+                        parse_error,
+                        default
+                    );
+                    default
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "Missing {} metadata in checkpoint file {}, using default {:?}",
+                    key,
+                    path,
+                    default
+                );
+                default
+            }
+        }
     }
 
     #[cfg(test)]
@@ -826,7 +872,7 @@ mod tests {
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
 
         // Corrupt the checkpoint file
-        let lance_path = checkpoint_dir.child(format!("{:020}.lance", 1));
+        let lance_path = checkpoint_dir.child(checkpoint_filename(1));
         fixture
             .checkpoint
             .object_store
@@ -934,12 +980,29 @@ mod tests {
         }
 
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
-        let mut count = 0;
+        let mut versions = Vec::new();
         let mut stream = fixture.checkpoint.object_store.list(Some(checkpoint_dir));
-        while stream.next().await.transpose().unwrap().is_some() {
-            count += 1;
+        while let Some(meta) = stream.next().await.transpose().unwrap() {
+            if let Some(filename) = meta.location.filename() {
+                if let Some(version) = filename
+                    .strip_suffix(VERSION_CHECKPOINT_FILE_SUFFIX)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    versions.push(version);
+                }
+            }
         }
-        assert_eq!(count, 2);
+
+        // Verify only 2 files remain
+        assert_eq!(versions.len(), 2, "Expected 2 checkpoint files");
+
+        // Verify the newest files are retained (v3 and v4)
+        versions.sort();
+        assert_eq!(
+            versions,
+            vec![3, 4],
+            "Expected to retain the newest checkpoint files (v3 and v4)"
+        );
     }
 
     #[tokio::test]
@@ -959,7 +1022,7 @@ mod tests {
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
 
         // Corrupt v2 checkpoint to ensure we fall back to v1
-        let v2_path = checkpoint_dir.child(format!("{:020}.lance", 2));
+        let v2_path = checkpoint_dir.child(checkpoint_filename(2));
         fixture
             .checkpoint
             .object_store
@@ -976,5 +1039,91 @@ mod tests {
         .unwrap();
 
         assert_eq!(loaded.latest_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_transaction_properties_size_limit() {
+        // Test that transaction_properties exceeding 10KB is truncated
+        // and the raw value is preserved for debugging when parsing fails
+        let mut fixture = CheckpointTestFixture::new().await;
+
+        // Create a large transaction_properties (exceeds 10KB)
+        let large_value = "x".repeat(15 * 1024); // 15KB
+        let mut summary = create_test_version_summary(1);
+        summary
+            .transaction_properties
+            .insert("large_key".to_string(), large_value);
+
+        fixture.checkpoint.add_summaries(&[summary]);
+        fixture.checkpoint.flush().await.unwrap();
+
+        // Load and verify
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(loaded.versions.len(), 1);
+        let loaded_props = &loaded.versions[0].transaction_properties;
+
+        // When JSON is truncated and becomes invalid, it falls back to preserving
+        // the raw value in the "transaction_properties" key
+        assert!(
+            loaded_props.contains_key("transaction_properties"),
+            "Should preserve raw value when truncated JSON parsing fails"
+        );
+
+        // Verify the raw value contains indicators of truncation
+        let raw_value = loaded_props.get("transaction_properties").unwrap();
+        assert!(
+            raw_value.contains("_truncated"),
+            "Raw value should contain _truncated marker"
+        );
+        assert!(
+            raw_value.contains("_size"),
+            "Raw value should contain _size marker"
+        );
+        assert!(
+            raw_value.contains("_data"),
+            "Raw value should contain _data marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transaction_properties_under_limit() {
+        // Test that transaction_properties under 10KB is preserved intact
+        let mut fixture = CheckpointTestFixture::new().await;
+
+        // Create a small transaction_properties (under 10KB)
+        let mut summary = create_test_version_summary(1);
+        summary
+            .transaction_properties
+            .insert("key1".to_string(), "value1".to_string());
+        summary
+            .transaction_properties
+            .insert("key2".to_string(), "value2".to_string());
+
+        fixture.checkpoint.add_summaries(&[summary.clone()]);
+        fixture.checkpoint.flush().await.unwrap();
+
+        // Load and verify
+        let loaded = VersionCheckpoint::load_or_new(
+            fixture.checkpoint.base.clone(),
+            fixture.checkpoint.object_store.clone(),
+            *fixture.checkpoint.config(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(loaded.versions.len(), 1);
+        let loaded_props = &loaded.versions[0].transaction_properties;
+
+        // Should preserve original keys
+        assert_eq!(loaded_props.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(loaded_props.get("key2"), Some(&"value2".to_string()));
+        assert!(!loaded_props.contains_key("_truncated"));
     }
 }

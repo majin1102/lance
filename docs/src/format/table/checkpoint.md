@@ -22,20 +22,19 @@ Checkpoints are stored in the `_checkpoint/` directory at the dataset root:
 ```
 {dataset_root}/
     _checkpoint/
-        {inverted_version}.lance    -- Checkpoint file in Lance format
+        {version:020}.lance    -- Checkpoint file in Lance format
 ```
 
 ### File Naming Convention
 
-Checkpoint files use the same inverted version naming convention as manifest files for efficient listing:
+Checkpoint files use a straightforward version-based naming convention:
 
-- **Pattern**: `{inverted_version}.lance`
-- **Inversion formula**: `inverted_version = u64::MAX - version`
-- **Purpose**: Ensures lexicographical sorting matches version order (newest first)
+- **Pattern**: `{version:020}.lance`
+- **Purpose**: Simple and readable naming with zero-padded version numbers
 
 Example:
-- Version 1 → `18446744073709551614.lance`
-- Version 100 → `18446744073709551515.lance`
+- Version 1 → `00000000000000000001.lance`
+- Version 100 → `00000000000000000100.lance`
 
 ## Arrow Schema Specification
 
