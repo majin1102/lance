@@ -766,8 +766,8 @@ async fn test_branch() {
 }
 
 #[tokio::test]
-async fn test_versions_with_archive_partial() {
-    // This test verifies that versions() correctly merges archive and manifest data
+async fn test_versions_with_checkpoint_partial() {
+    // This test verifies that versions() correctly merges checkpoint and manifest data
     use crate::dataset::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
@@ -802,7 +802,7 @@ async fn test_versions_with_archive_partial() {
     .await
     .unwrap();
 
-    // Now manually create an archive with version 1
+    // Now manually create a checkpoint with version 1
     let dataset = Dataset::open(test_uri).await.unwrap();
     let object_store = dataset.object_store.clone();
     let base_path = dataset.base.clone();
@@ -832,15 +832,15 @@ async fn test_versions_with_archive_partial() {
     let dataset = Dataset::open(test_uri).await.unwrap();
     let versions = dataset.versions().await.unwrap();
 
-    // Should have 2 versions (1 from archive, 1 from manifest)
+    // Should have 2 versions (1 from checkpoint, 1 from manifest)
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].version, 1);
     assert_eq!(versions[1].version, 2);
 }
 
 #[tokio::test]
-async fn test_versions_no_archive() {
-    // This test verifies that versions() works when no archive exists
+async fn test_versions_no_checkpoint() {
+    // This test verifies that versions() works when no checkpoint exists
     let test_dir = TempStdDir::default();
     let test_uri = test_dir.to_str().unwrap();
 
@@ -893,8 +893,8 @@ async fn test_versions_no_archive() {
 }
 
 #[tokio::test]
-async fn test_versions_full_archive() {
-    // This test verifies that versions() works when all versions are in archive
+async fn test_versions_full_checkpoint() {
+    // This test verifies that versions() works when all versions are in checkpoint
     use crate::dataset::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
@@ -928,7 +928,7 @@ async fn test_versions_full_archive() {
     .await
     .unwrap();
 
-    // Create archive with BOTH versions
+    // Create checkpoint with BOTH versions
     let dataset = Dataset::open(test_uri).await.unwrap();
     let object_store = dataset.object_store.clone();
     let base_path = dataset.base.clone();
@@ -971,7 +971,7 @@ async fn test_versions_full_archive() {
     let dataset = Dataset::open(test_uri).await.unwrap();
     let versions = dataset.versions().await.unwrap();
 
-    // Should have 2 versions (both from archive)
+    // Should have 2 versions (both from checkpoint)
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].version, 1);
     assert_eq!(versions[1].version, 2);
