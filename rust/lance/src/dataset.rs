@@ -66,8 +66,8 @@ use tracing::{info, instrument};
 pub use checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
 pub(crate) mod blob;
 mod branch_location;
-pub mod checkpoint;
 pub mod builder;
+pub mod checkpoint;
 pub mod cleanup;
 pub mod delta;
 pub mod fragment;
@@ -1848,24 +1848,20 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let config = CheckpointConfig::from_config(&self.manifest.config);
         let (checkpointed_latest_version, mut versions): (u64, Vec<Version>) = if config.enabled {
-            VersionCheckpoint::load_latest(
-                self.base.clone(),
-                self.object_store.clone(),
-                config,
-            )
-            .await?
-            .map(|version_checkpoint| {
-                (
-                    version_checkpoint.latest_version(),
-                    version_checkpoint
-                        .versions
-                        .iter()
-                        .filter(|version| !version.is_cleaned_up)
-                        .map(|s| s.into())
-                        .collect(),
-                )
-            })
-            .unwrap_or_default()
+            VersionCheckpoint::load_latest(self.base.clone(), self.object_store.clone(), config)
+                .await?
+                .map(|version_checkpoint| {
+                    (
+                        version_checkpoint.latest_version(),
+                        version_checkpoint
+                            .versions
+                            .iter()
+                            .filter(|version| !version.is_cleaned_up)
+                            .map(|s| s.into())
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default()
         } else {
             (0, Vec::new())
         };

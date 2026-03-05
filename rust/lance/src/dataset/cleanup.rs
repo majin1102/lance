@@ -33,7 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::checkpoint::{VersionCheckpoint, CheckpointConfig, VersionSummary};
+use super::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
@@ -122,7 +122,8 @@ impl CleanupInspection {
             dataset.base.clone(),
             dataset.object_store.clone(),
             config,
-        ).await?;
+        )
+        .await?;
         Ok(Self {
             old_manifests: HashMap::new(),
             referenced_files: ReferencedFiles::default(),
@@ -199,7 +200,9 @@ impl<'a> CleanupTask<'a> {
         }
 
         // Add collected summaries to checkpoint (sorts internally)
-        inspection.version_checkpoint.add_summaries(&inspection.version_summaries);
+        inspection
+            .version_checkpoint
+            .add_summaries(&inspection.version_summaries);
 
         let stats = self.delete_unreferenced_files(inspection.clone()).await?;
         final_stats.bytes_removed += stats.bytes_removed;
@@ -264,14 +267,15 @@ impl<'a> CleanupTask<'a> {
             let manifest_summary = manifest.summary();
             let (transaction_uuid, read_version, operation_type, transaction_properties) =
                 match &transaction {
-                    Some(tx) => {
-                        (
-                            Some(tx.uuid.clone()),
-                            Some(tx.read_version),
-                            Some(tx.operation.to_string()),
-                            tx.transaction_properties.as_deref().cloned().unwrap_or_default(),
-                        )
-                    }
+                    Some(tx) => (
+                        Some(tx.uuid.clone()),
+                        Some(tx.read_version),
+                        Some(tx.operation.to_string()),
+                        tx.transaction_properties
+                            .as_deref()
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
                     None => (None, None, None, HashMap::new()),
                 };
 
@@ -862,7 +866,9 @@ impl<'a> CleanupTask<'a> {
     /// This preserves manifest data for historical versions that have been cleaned up.
     /// Also cleans up old checkpoint files.
     async fn checkpoint_versions(&self, inspection: &mut CleanupInspection) -> Result<()> {
-        if !inspection.version_checkpoint.is_enabled() || inspection.version_checkpoint.versions.is_empty() {
+        if !inspection.version_checkpoint.is_enabled()
+            || inspection.version_checkpoint.versions.is_empty()
+        {
             return Ok(());
         }
 
@@ -1453,12 +1459,12 @@ mod tests {
             };
             while let Some(path) = file_stream.try_next().await? {
                 let is_checkpoint = path.location.parts().any(|p| p.as_ref() == "_checkpoint");
-                
+
                 // Checkpoint files are managed separately, don't count their bytes
                 if !is_checkpoint {
                     file_count.num_bytes += path.size;
                 }
-                
+
                 match path.location.extension() {
                     Some("lance") => {
                         if is_checkpoint {
@@ -1466,7 +1472,7 @@ mod tests {
                         } else {
                             file_count.num_data_files += 1;
                         }
-                    },
+                    }
                     Some("manifest") => file_count.num_manifest_files += 1,
                     Some("arrow") | Some("bin") => file_count.num_delete_files += 1,
                     Some("idx") => file_count.num_index_files += 1,
@@ -2097,7 +2103,10 @@ mod tests {
 
         // Cleanup creates a checkpoint file, so we only compare relevant fields
         assert_eq!(before_count.num_data_files, after_count.num_data_files);
-        assert_eq!(before_count.num_manifest_files, after_count.num_manifest_files);
+        assert_eq!(
+            before_count.num_manifest_files,
+            after_count.num_manifest_files
+        );
         assert_eq!(before_count.num_index_files, after_count.num_index_files);
         assert_eq!(before_count.num_delete_files, after_count.num_delete_files);
         assert_eq!(before_count.num_tx_files, after_count.num_tx_files);
@@ -2168,7 +2177,10 @@ mod tests {
         let after_count = fixture.count_files().await.unwrap();
         // Cleanup creates a checkpoint file, so we only compare relevant fields
         assert_eq!(before_count.num_data_files, after_count.num_data_files);
-        assert_eq!(before_count.num_manifest_files, after_count.num_manifest_files);
+        assert_eq!(
+            before_count.num_manifest_files,
+            after_count.num_manifest_files
+        );
         assert_eq!(before_count.num_index_files, after_count.num_index_files);
         assert_eq!(before_count.num_delete_files, after_count.num_delete_files);
         assert_eq!(before_count.num_tx_files, after_count.num_tx_files);
@@ -3507,7 +3519,11 @@ mod tests {
 
         let tmpdir = TempStrDir::default();
         let tmpdir_path = tmpdir.as_str();
-        let path_prefix = if tmpdir_path.starts_with('/') { "" } else { "/" };
+        let path_prefix = if tmpdir_path.starts_with('/') {
+            ""
+        } else {
+            "/"
+        };
         let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/test_db");
 
         let db = Dataset::write(
@@ -3520,15 +3536,16 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         let config = CheckpointConfig::default();
 
-        let mut checkpoint = VersionCheckpoint::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let mut checkpoint =
+            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
         assert!(checkpoint.versions.is_empty());
         assert_eq!(checkpoint.latest_version(), 0);
@@ -3546,26 +3563,27 @@ mod tests {
         assert_eq!(checkpoint.versions[1].version, 2);
         assert_eq!(checkpoint.versions[2].version, 3);
 
-        let loaded = VersionCheckpoint::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let loaded =
+            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
         assert_eq!(loaded.versions.len(), 3);
         assert_eq!(loaded.latest_version(), 3);
 
         let checkpoint_dir = checkpoint.checkpoint_dir();
-        
+
         // Corrupt the checkpoint file to ensure graceful degradation
         let lance_path = checkpoint_dir.child(format!("{:020}.lance", u64::MAX - 3));
-        db.object_store.put(&lance_path, b"corrupted data").await.unwrap();
+        db.object_store
+            .put(&lance_path, b"corrupted data")
+            .await
+            .unwrap();
 
-        let corrupted_loaded = VersionCheckpoint::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let corrupted_loaded =
+            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
         assert!(corrupted_loaded.versions.is_empty());
     }
@@ -3580,28 +3598,42 @@ mod tests {
 
         let db = fixture.open().await.unwrap();
         let policy = CleanupPolicyBuilder::default()
-            .retain_n_versions(&db, 1).await.unwrap()
+            .retain_n_versions(&db, 1)
+            .await
+            .unwrap()
             .error_if_tagged_old_versions(false)
             .build();
         fixture.run_cleanup_with_policy(policy).await.unwrap();
 
         let db = fixture.open().await.unwrap();
         let config = CheckpointConfig::from_config(&db.manifest.config);
-        let checkpoint = VersionCheckpoint::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let checkpoint =
+            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
-        assert_eq!(checkpoint.versions.len(), 3, "Expected 3 versions in checkpoint");
-        
+        assert_eq!(
+            checkpoint.versions.len(),
+            3,
+            "Expected 3 versions in checkpoint"
+        );
+
         assert_eq!(checkpoint.versions[0].version, 1);
         assert_eq!(checkpoint.versions[1].version, 2);
         assert_eq!(checkpoint.versions[2].version, 3);
 
-        assert!(checkpoint.versions[0].is_cleaned_up, "Version 1 should be cleaned up");
-        assert!(checkpoint.versions[1].is_cleaned_up, "Version 2 should be cleaned up");
-        assert!(!checkpoint.versions[2].is_cleaned_up, "Latest version should not be cleaned up");
+        assert!(
+            checkpoint.versions[0].is_cleaned_up,
+            "Version 1 should be cleaned up"
+        );
+        assert!(
+            checkpoint.versions[1].is_cleaned_up,
+            "Version 2 should be cleaned up"
+        );
+        assert!(
+            !checkpoint.versions[2].is_cleaned_up,
+            "Latest version should not be cleaned up"
+        );
     }
 
     #[tokio::test]
@@ -3624,11 +3656,10 @@ mod tests {
 
         let db = fixture.open().await.unwrap();
         let config = CheckpointConfig::from_config(&db.manifest.config);
-        let checkpoint = VersionCheckpoint::load_or_new(
-            db.base.clone(),
-            db.object_store.clone(),
-            config,
-        ).await.unwrap();
+        let checkpoint =
+            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+                .await
+                .unwrap();
 
         let v1 = checkpoint.versions.iter().find(|v| v.version == 1);
         assert!(v1.is_some(), "Version 1 should exist in checkpoint");

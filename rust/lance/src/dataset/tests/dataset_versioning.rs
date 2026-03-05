@@ -768,7 +768,7 @@ async fn test_branch() {
 #[tokio::test]
 async fn test_versions_with_archive_partial() {
     // This test verifies that versions() correctly merges archive and manifest data
-    use crate::dataset::checkpoint::{VersionCheckpoint, CheckpointConfig, VersionSummary};
+    use crate::dataset::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
 
@@ -808,9 +808,10 @@ async fn test_versions_with_archive_partial() {
     let base_path = dataset.base.clone();
 
     let config = CheckpointConfig::default();
-    let mut checkpoint = VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
-        .await
-        .unwrap();
+    let mut checkpoint =
+        VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
+            .await
+            .unwrap();
 
     let summaries = vec![VersionSummary {
         version: 1,
@@ -894,7 +895,7 @@ async fn test_versions_no_archive() {
 #[tokio::test]
 async fn test_versions_full_archive() {
     // This test verifies that versions() works when all versions are in archive
-    use crate::dataset::checkpoint::{VersionCheckpoint, CheckpointConfig, VersionSummary};
+    use crate::dataset::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
 
@@ -933,9 +934,10 @@ async fn test_versions_full_archive() {
     let base_path = dataset.base.clone();
 
     let config = CheckpointConfig::default();
-    let mut checkpoint = VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
-        .await
-        .unwrap();
+    let mut checkpoint =
+        VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
+            .await
+            .unwrap();
 
     let summaries = vec![
         VersionSummary {
