@@ -29,16 +29,6 @@ const VERSION_CHECKPOINT_FILE_SUFFIX: &str = ".lance";
 const METADATA_KEY_DATASET_CREATED: &str = "lance:checkpoint:dataset_created";
 const METADATA_KEY_CREATED_AT: &str = "lance:checkpoint:created_at";
 
-// Version number inversion for file naming (consistent with manifest V2)
-//
-// This offset is used to create inverted version numbers that sort in descending order
-// when files are listed alphabetically. This ensures that newer versions appear
-// first in directory listings, For example:
-//   - Version 1: u64::MAX - 1 = 18446744073709551614
-//   - Version 2: u64::MAX - 2 = 18446744073709551613
-// When sorted alphabetically, version 2's file appears before version 1's file.
-const INVERTED_VERSION_OFFSET: u64 = u64::MAX;
-
 /// Private helper to get the Arrow schema for VersionSummary
 fn version_summary_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
@@ -351,16 +341,6 @@ fn record_batch_to_version_summaries(batch: &RecordBatch) -> Result<Vec<VersionS
     Ok(summaries)
 }
 
-/// Convert version to inverted version for file naming
-pub fn to_inverted_version(version: u64) -> u64 {
-    INVERTED_VERSION_OFFSET - version
-}
-
-/// Convert inverted version back to original version
-pub fn from_inverted_version(inverted: u64) -> u64 {
-    INVERTED_VERSION_OFFSET - inverted
-}
-
 /// Checkpoint configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointConfig {
@@ -444,11 +424,11 @@ impl VersionCheckpoint {
         while let Some(meta) = stream.next().await {
             let meta = meta?;
             if let Some(filename) = meta.location.filename() {
-                if let Some(inverted) = filename
+                if let Some(version) = filename
                     .strip_suffix(VERSION_CHECKPOINT_FILE_SUFFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    checkpoints.push((from_inverted_version(inverted), meta.location));
+                    checkpoints.push((version, meta.location));
                 }
             }
         }
@@ -460,8 +440,10 @@ impl VersionCheckpoint {
     /// Private helper to write a checkpoint in Lance format
     async fn write_checkpoint(&self) -> Result<()> {
         let checkpoint_dir = self.checkpoint_dir();
-        let inverted = to_inverted_version(self.latest_version_number);
-        let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
+        let filename = format!(
+            "{:020}{}",
+            self.latest_version_number, VERSION_CHECKPOINT_FILE_SUFFIX
+        );
         let path = checkpoint_dir.child(filename);
 
         let batch = version_summaries_to_record_batch(&self.versions)?;
@@ -644,9 +626,7 @@ impl VersionCheckpoint {
         if checkpoints.len() > self.config.max_checkpoint_files {
             let delete_count = checkpoints.len() - self.config.max_checkpoint_files;
             for (version, _) in checkpoints.iter().take(delete_count) {
-                let inverted = to_inverted_version(*version);
-
-                let filename = format!("{:020}{}", inverted, VERSION_CHECKPOINT_FILE_SUFFIX);
+                let filename = format!("{:020}{}", version, VERSION_CHECKPOINT_FILE_SUFFIX);
                 let path = self.checkpoint_dir().child(filename);
                 if let Err(e) = self.object_store.delete(&path).await {
                     tracing::warn!("Failed to delete old checkpoint file {}: {}", path, e);
@@ -846,7 +826,7 @@ mod tests {
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
 
         // Corrupt the checkpoint file
-        let lance_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(1)));
+        let lance_path = checkpoint_dir.child(format!("{:020}.lance", 1));
         fixture
             .checkpoint
             .object_store
@@ -979,7 +959,7 @@ mod tests {
         let checkpoint_dir = fixture.checkpoint.checkpoint_dir();
 
         // Corrupt v2 checkpoint to ensure we fall back to v1
-        let v2_path = checkpoint_dir.child(format!("{:020}.lance", to_inverted_version(2)));
+        let v2_path = checkpoint_dir.child(format!("{:020}.lance", 2));
         fixture
             .checkpoint
             .object_store
@@ -996,16 +976,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(loaded.latest_version(), 1);
-    }
-
-    #[test]
-    fn test_version_inversion() {
-        assert_eq!(from_inverted_version(to_inverted_version(1)), 1);
-        assert_eq!(from_inverted_version(to_inverted_version(100)), 100);
-        assert_eq!(
-            from_inverted_version(to_inverted_version(u64::MAX)),
-            u64::MAX
-        );
-        assert!(to_inverted_version(1) > to_inverted_version(2));
     }
 }

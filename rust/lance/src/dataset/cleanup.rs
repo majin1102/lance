@@ -3574,7 +3574,7 @@ mod tests {
         let checkpoint_dir = checkpoint.checkpoint_dir();
 
         // Corrupt the checkpoint file to ensure graceful degradation
-        let lance_path = checkpoint_dir.child(format!("{:020}.lance", u64::MAX - 3));
+        let lance_path = checkpoint_dir.child(format!("{:020}.lance", 3));
         db.object_store
             .put(&lance_path, b"corrupted data")
             .await
