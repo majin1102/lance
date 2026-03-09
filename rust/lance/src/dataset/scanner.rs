@@ -4322,7 +4322,6 @@ impl Scanner {
         required_frags: RoaringBitmap,
     ) -> Result<PreFilterSource> {
         if filter_plan.is_empty() && self.fragments.is_none() {
-            log::trace!("no filter plan, no prefilter");
             return Ok(PreFilterSource::None);
         }
 
@@ -9720,6 +9719,63 @@ mod test {
             scanner
         })
         .await;
+    }
+
+    /// Test that fragments parameter is respected in prefilter mode with flat search
+    ///
+    /// This test verifies the fix for the bug where specifying fragments with prefilter=true
+    /// and use_index=false would ignore the fragments parameter and scan all fragments.
+    #[tokio::test]
+    async fn test_prefilter_fragment_list_flat_search() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        let fragments = test_ds.dataset.fragments();
+        assert!(fragments.len() >= 2);
+
+        // Test fragment 0: should only return results from fragment 0 (i=0..200)
+        let mut scanner = test_ds.dataset.scan();
+        scanner.project(&["i"]).unwrap();
+        scanner.prefilter(true);
+        scanner.with_fragments(vec![fragments[0].clone()]);
+        scanner.nearest("vec", &query, 10_000).unwrap();
+        scanner.use_index(false); // Force flat search
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(
+            i_array,
+            0..200,
+            "Fragment 0 should only return i in range 0..200",
+        );
+
+        // Test fragment 1: should only return results from fragment 1 (i=200..400)
+        let mut scanner = test_ds.dataset.scan();
+        scanner.project(&["i"]).unwrap();
+        scanner.prefilter(true);
+        scanner.with_fragments(vec![fragments[1].clone()]);
+        scanner.nearest("vec", &query, 10_000).unwrap();
+        scanner.use_index(false); // Force flat search
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_values_in_range(
+            i_array,
+            200..400,
+            "Fragment 1 should only return i in range 200..400",
+        );
     }
 
     #[tokio::test]
