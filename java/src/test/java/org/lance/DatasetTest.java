@@ -318,13 +318,15 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         dataset.tags().create("tag1", Ref.ofMain());
-        assertEquals(1, dataset.tags().list().size());
-        assertEquals(1, dataset.tags().list().get(0).getVersion());
-        assertTrue(dataset.tags().list().get(0).getCreatedAt().isPresent());
-        assertTrue(dataset.tags().list().get(0).getUpdatedAt().isPresent());
-        assertEquals(
-            dataset.tags().list().get(0).getCreatedAt(),
-            dataset.tags().list().get(0).getUpdatedAt());
+        List<Tag> tags = dataset.tags().list();
+        Tag tag1 = tags.get(0);
+        assertEquals(1, tags.size());
+        assertEquals(1, tag1.getVersion());
+        assertEquals(new Tag("tag1", null, 1, tag1.getManifestSize()), tag1);
+        assertTrue(new HashSet<>(tags).contains(new Tag("tag1", null, 1, tag1.getManifestSize())));
+        assertTrue(tag1.getCreatedAt().isPresent());
+        assertTrue(tag1.getUpdatedAt().isPresent());
+        assertEquals(tag1.getCreatedAt(), tag1.getUpdatedAt());
         assertEquals(1, dataset.tags().getVersion("tag1"));
       }
 
