@@ -2880,19 +2880,11 @@ components:
       required:
         - version
       properties:
-        branch:
-          type: string
-          description: Branch name that the tag points to. If absent, the tag points to main.
         version:
           type: integer
           format: int64
           minimum: 0
           description: Version number that the tag points to
-        manifestSize:
-          type: integer
-          format: int64
-          minimum: 0
-          description: Size of the referenced manifest file in bytes.
 
     RestoreTableRequest:
       type: object
