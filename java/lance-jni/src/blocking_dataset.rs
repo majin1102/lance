@@ -2397,10 +2397,8 @@ fn inner_list_tags<'local>(
         } else {
             JObject::null()
         };
-        let created_at =
-            optional_datetime_to_java_instant(env, tag_contents.created_at.as_ref())?;
-        let updated_at =
-            optional_datetime_to_java_instant(env, tag_contents.updated_at.as_ref())?;
+        let created_at = optional_datetime_to_java_instant(env, tag_contents.created_at.as_ref())?;
+        let updated_at = optional_datetime_to_java_instant(env, tag_contents.updated_at.as_ref())?;
         let java_tag = env.new_object(
             "org/lance/Tag",
             "(Ljava/lang/String;Ljava/lang/String;JILjava/time/Instant;Ljava/time/Instant;)V",
