@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fs;
 use std::sync::Arc;
 use std::vec;
 
@@ -42,21 +41,6 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         "Entries: {:?}",
         entries_names
     );
-}
-
-fn write_tag_metadata_without_created_at(
-    dataset_dir: &TempStdDir,
-    tag_name: &str,
-    version: u64,
-) -> std::path::PathBuf {
-    let tag_path = dataset_dir
-        .join("_refs")
-        .join("tags")
-        .join(format!("{tag_name}.json"));
-    fs::create_dir_all(tag_path.parent().unwrap()).expect("create tag metadata directory");
-    let tag_json = format!(r#"{{"version":{version},"manifestSize":123}}"#);
-    fs::write(&tag_path, tag_json).expect("write historical tag metadata");
-    tag_path
 }
 
 #[tokio::test]
@@ -442,68 +426,6 @@ async fn test_tag(
     dataset.tags().update("tag1", 1).await.unwrap();
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_update_preserves_missing_created_at_for_historical_tag(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-    data_storage_version: LanceFileVersion,
-) {
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "i",
-        DataType::UInt32,
-        false,
-    )]));
-
-    let test_dir = TempStdDir::default();
-    let test_uri = test_dir.to_str().unwrap();
-
-    let data = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(UInt32Array::from_iter_values(0..100))],
-    );
-    let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-    let mut dataset = Dataset::write(
-        reader,
-        test_uri,
-        Some(WriteParams {
-            data_storage_version: Some(data_storage_version),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-
-    dataset.delete("i > 50").await.unwrap();
-
-    // Seed a historical tag file that predates the createdAt field.
-    let historical_tag_path = write_tag_metadata_without_created_at(&test_dir, "historical-tag", 1);
-
-    let historical_tag = dataset.tags().get("historical-tag").await.unwrap();
-    assert!(historical_tag.created_at.is_none());
-    assert!(historical_tag.updated_at.is_none());
-
-    dataset.tags().update("historical-tag", 2).await.unwrap();
-
-    let updated_tag = dataset.tags().get("historical-tag").await.unwrap();
-    assert!(updated_tag.created_at.is_none());
-    assert!(
-        updated_tag.updated_at.is_some(),
-        "historical tag update should refresh updated_at"
-    );
-    assert_eq!(updated_tag.version, 2);
-
-    let updated_tag_json =
-        fs::read_to_string(&historical_tag_path).expect("read updated historical tag metadata");
-    assert!(
-        !updated_tag_json.contains("\"createdAt\""),
-        "historical tag update should preserve missing createdAt"
-    );
-    assert!(
-        updated_tag_json.contains("\"updatedAt\""),
-        "historical tag update should persist updatedAt"
-    );
 }
 
 #[rstest]

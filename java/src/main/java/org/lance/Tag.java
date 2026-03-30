@@ -31,11 +31,21 @@ public class Tag {
     this(name, branch, version, manifestSize, null, null);
   }
 
-  public Tag(String name, String branch, long version, int manifestSize, Instant updatedAt) {
+  /**
+   * Constructor used by JNI when reading tag metadata from native code.
+   *
+   * <p>Timestamps are system-generated metadata and are not part of the public Java input surface.
+   */
+  private Tag(String name, String branch, long version, int manifestSize, Instant updatedAt) {
     this(name, branch, version, manifestSize, null, updatedAt);
   }
 
-  public Tag(
+  /**
+   * Constructor used by JNI when reading tag metadata from native code.
+   *
+   * <p>Timestamps are system-generated metadata and are not part of the public Java input surface.
+   */
+  private Tag(
       String name,
       String branch,
       long version,
