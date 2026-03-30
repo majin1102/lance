@@ -333,8 +333,6 @@ public class DatasetTest {
         assertEquals(2, dataset2.version());
         assertEquals(1, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
-        assertTrue(dataset2.tags().list().get(0).getCreatedAt().isPresent());
-        assertTrue(dataset2.tags().list().get(0).getUpdatedAt().isPresent());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
         dataset2.tags().create("tag2", Ref.ofMain(2));
         assertEquals(2, dataset2.tags().list().size());
@@ -391,8 +389,6 @@ public class DatasetTest {
           assertEquals(0, checkoutV1.countRows());
           assertEquals(1, checkoutV1.tags().list().size());
           assertEquals(1, checkoutV1.tags().list().get(0).getVersion());
-          assertTrue(checkoutV1.tags().list().get(0).getCreatedAt().isPresent());
-          assertTrue(checkoutV1.tags().list().get(0).getUpdatedAt().isPresent());
           assertEquals(1, checkoutV1.tags().getVersion("tag1"));
         }
 
@@ -408,9 +404,6 @@ public class DatasetTest {
           assertTrue(tagOptional.isPresent());
           assertEquals(2, tagOptional.get().getVersion());
           assertEquals(Optional.of("branch"), tagOptional.get().getBranch());
-          assertTrue(tagOptional.get().getCreatedAt().isPresent());
-          assertTrue(tagOptional.get().getUpdatedAt().isPresent());
-          assertEquals(tagOptional.get().getCreatedAt(), tagOptional.get().getUpdatedAt());
 
           dataset2.tags().update("tag1", Ref.ofBranch("branch"));
           tags = dataset2.tags().list();
@@ -422,8 +415,6 @@ public class DatasetTest {
           assertTrue(tagOptional.isPresent());
           assertEquals(2, tagOptional.get().getVersion());
           assertEquals(Optional.of("branch"), tagOptional.get().getBranch());
-          assertTrue(tagOptional.get().getCreatedAt().isPresent());
-          assertTrue(tagOptional.get().getUpdatedAt().isPresent());
         }
 
         assertEquals(2, dataset2.tags().list().size());

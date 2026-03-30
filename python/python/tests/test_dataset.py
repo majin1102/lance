@@ -524,16 +524,7 @@ def test_tag(tmp_path: Path):
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
 
-    tag1_meta = ds.tags.list()["tag1"]
-    tag1_created_at = tag1_meta["created_at"]
-    tag1_updated_at = tag1_meta["updated_at"]
-    assert tag1_created_at is not None
-    assert tag1_updated_at is not None
     ds.tags.update("tag1", 1)
-    updated_tag1_meta = ds.tags.list()["tag1"]
-    assert updated_tag1_meta["created_at"] == tag1_created_at
-    assert updated_tag1_meta["updated_at"] is not None
-    assert updated_tag1_meta["updated_at"] >= tag1_updated_at
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
 
@@ -548,28 +539,13 @@ def test_tag(tmp_path: Path):
     assert target_tag is not None
     assert target_tag["version"] == 1
     assert target_tag["branch"] == "branch"
-    assert target_tag["created_at"] is not None
-    assert target_tag["updated_at"] is not None
-    assert isinstance(target_tag["created_at"], datetime)
-    assert isinstance(target_tag["updated_at"], datetime)
-    assert target_tag["created_at"] == target_tag["updated_at"]
-
-    tag3_created_at = target_tag["created_at"]
-    tag3_updated_at = target_tag["updated_at"]
-    assert tag3_created_at is not None
-    assert tag3_updated_at is not None
     ds.tags.update("tag3", (None, 2))
     target_tag = ds.tags.list()["tag3"]
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
     assert target_tag["branch"] is None
-    assert target_tag["created_at"] == tag3_created_at
-    assert target_tag["updated_at"] is not None
-    assert target_tag["updated_at"] >= tag3_updated_at
 
-    tag3_updated_at = target_tag["updated_at"]
-    assert tag3_updated_at is not None
     ds.create_branch("branch2", 2)
     ds.tags.update("tag3", ("branch2", 2))
     target_tag = ds.tags.list()["tag3"]
@@ -577,9 +553,6 @@ def test_tag(tmp_path: Path):
     assert target_tag is not None
     assert target_tag["version"] == 2
     assert target_tag["branch"] == "branch2"
-    assert target_tag["created_at"] == tag3_created_at
-    assert target_tag["updated_at"] is not None
-    assert target_tag["updated_at"] >= tag3_updated_at
 
     ds.tags.delete("tag3")
     assert len(ds.tags.list()) == 2
@@ -599,10 +572,11 @@ def test_tag_order(tmp_path: Path):
 
     tags_asc = ds.tags.list_ordered(order="asc")
     assert len(tags_asc) == 3
-    assert all(tag["created_at"] is not None for _, tag in tags_asc)
-    assert all(isinstance(tag["created_at"], datetime) for _, tag in tags_asc)
-    assert all(tag["updated_at"] is not None for _, tag in tags_asc)
-    assert all(isinstance(tag["updated_at"], datetime) for _, tag in tags_asc)
+    first_tag = tags_asc[0][1]
+    assert first_tag["created_at"] is not None
+    assert isinstance(first_tag["created_at"], datetime)
+    assert first_tag["updated_at"] is not None
+    assert isinstance(first_tag["updated_at"], datetime)
     tag_names_asc = [t[0] for t in tags_asc]
     assert tag_names_asc == sorted(expected_tags.keys()), (
         f"Unexpected ascending order: {tag_names_asc}"

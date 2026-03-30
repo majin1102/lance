@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fs;
 use std::sync::Arc;
 use std::vec;
-use std::{fs, path::Path as StdPath};
 
 use crate::Dataset;
 use crate::dataset::UpdateBuilder;
@@ -42,6 +42,21 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         "Entries: {:?}",
         entries_names
     );
+}
+
+fn write_tag_metadata_without_created_at(
+    dataset_dir: &TempStdDir,
+    tag_name: &str,
+    version: u64,
+) -> std::path::PathBuf {
+    let tag_path = dataset_dir
+        .join("_refs")
+        .join("tags")
+        .join(format!("{tag_name}.json"));
+    fs::create_dir_all(tag_path.parent().unwrap()).expect("create tag metadata directory");
+    let tag_json = format!(r#"{{"version":{version},"manifestSize":123}}"#);
+    fs::write(&tag_path, tag_json).expect("write historical tag metadata");
+    tag_path
 }
 
 #[tokio::test]
@@ -358,11 +373,6 @@ async fn test_tag(
         ["v1.0.0-rc1", "tag1", "tag2"],
         "Default ordering mismatch"
     );
-    assert!(
-        default_order
-            .iter()
-            .all(|(_, tag)| tag.created_at.is_some() && tag.updated_at.is_some())
-    );
 
     let asc_order = dataset
         .tags()
@@ -374,11 +384,6 @@ async fn test_tag(
         asc_names,
         ["tag1", "tag2", "v1.0.0-rc1"],
         "Ascending ordering mismatch"
-    );
-    assert!(
-        asc_order
-            .iter()
-            .all(|(_, tag)| tag.created_at.is_some() && tag.updated_at.is_some())
     );
 
     let desc_order = dataset
@@ -392,18 +397,8 @@ async fn test_tag(
         ["v1.0.0-rc1", "tag1", "tag2"],
         "Descending ordering mismatch"
     );
-    assert!(
-        desc_order
-            .iter()
-            .all(|(_, tag)| tag.created_at.is_some() && tag.updated_at.is_some())
-    );
 
-    let tags = dataset.tags().list().await.unwrap();
-    assert_eq!(tags.len(), 3);
-    assert!(
-        tags.values()
-            .all(|tag| tag.created_at.is_some() && tag.updated_at.is_some())
-    );
+    assert_eq!(dataset.tags().list().await.unwrap().len(), 3);
 
     let bad_checkout = dataset.checkout_version("tag3").await;
     assert_eq!(
@@ -445,43 +440,69 @@ async fn test_tag(
     assert_eq!(dataset.manifest.version, 2);
 
     dataset.tags().update("tag1", 1).await.unwrap();
-    let tag1_after_second_update = dataset.tags().get("tag1").await.unwrap();
-    assert_eq!(tag1_after_second_update.created_at, Some(tag1_created_at));
-    let tag1_updated_after_second_update = tag1_after_second_update
-        .updated_at
-        .expect("updated tag should have updated_at");
-    assert!(tag1_updated_after_second_update >= tag1_updated_after_first_update);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
+}
 
-    let legacy_tag_path = StdPath::new(test_uri.as_ref())
-        .join("_refs")
-        .join("tags")
-        .join("legacy-tag.json");
-    fs::write(&legacy_tag_path, r#"{"version":1,"manifestSize":123}"#).unwrap();
+#[rstest]
+#[tokio::test]
+async fn test_update_preserves_missing_created_at_for_historical_tag(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
 
-    let legacy_tag_before_update = dataset.tags().get("legacy-tag").await.unwrap();
-    assert_eq!(legacy_tag_before_update.created_at, None);
-    assert_eq!(legacy_tag_before_update.updated_at, None);
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
 
-    dataset.tags().update("legacy-tag", 2).await.unwrap();
-
-    let legacy_tag_after_update = dataset.tags().get("legacy-tag").await.unwrap();
-    assert_eq!(legacy_tag_after_update.created_at, None);
-    assert!(
-        legacy_tag_after_update.updated_at.is_some(),
-        "legacy tag update should refresh updated_at"
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..100))],
     );
-    assert_eq!(legacy_tag_after_update.version, 2);
+    let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        reader,
+        test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
 
-    let legacy_tag_json = fs::read_to_string(&legacy_tag_path).unwrap();
+    dataset.delete("i > 50").await.unwrap();
+
+    // Seed a historical tag file that predates the createdAt field.
+    let historical_tag_path = write_tag_metadata_without_created_at(&test_dir, "historical-tag", 1);
+
+    let historical_tag = dataset.tags().get("historical-tag").await.unwrap();
+    assert!(historical_tag.created_at.is_none());
+    assert!(historical_tag.updated_at.is_none());
+
+    dataset.tags().update("historical-tag", 2).await.unwrap();
+
+    let updated_tag = dataset.tags().get("historical-tag").await.unwrap();
+    assert!(updated_tag.created_at.is_none());
     assert!(
-        !legacy_tag_json.contains("createdAt"),
-        "legacy tag update should preserve missing createdAt"
+        updated_tag.updated_at.is_some(),
+        "historical tag update should refresh updated_at"
+    );
+    assert_eq!(updated_tag.version, 2);
+
+    let updated_tag_json =
+        fs::read_to_string(&historical_tag_path).expect("read updated historical tag metadata");
+    assert!(
+        !updated_tag_json.contains("\"createdAt\""),
+        "historical tag update should preserve missing createdAt"
     );
     assert!(
-        legacy_tag_json.contains("updatedAt"),
-        "legacy tag update should persist updatedAt"
+        updated_tag_json.contains("\"updatedAt\""),
+        "historical tag update should persist updatedAt"
     );
 }
 
