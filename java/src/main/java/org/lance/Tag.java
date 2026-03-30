@@ -24,17 +24,29 @@ public class Tag {
   private final Optional<String> branch;
   private final long version;
   private final int manifestSize;
+  private final Optional<Instant> createdAt;
   private final Optional<Instant> updatedAt;
 
   public Tag(String name, String branch, long version, int manifestSize) {
-    this(name, branch, version, manifestSize, null);
+    this(name, branch, version, manifestSize, null, null);
   }
 
   public Tag(String name, String branch, long version, int manifestSize, Instant updatedAt) {
+    this(name, branch, version, manifestSize, null, updatedAt);
+  }
+
+  public Tag(
+      String name,
+      String branch,
+      long version,
+      int manifestSize,
+      Instant createdAt,
+      Instant updatedAt) {
     this.name = name;
     this.branch = Optional.ofNullable(branch);
     this.version = version;
     this.manifestSize = manifestSize;
+    this.createdAt = Optional.ofNullable(createdAt);
     this.updatedAt = Optional.ofNullable(updatedAt);
   }
 
@@ -54,6 +66,10 @@ public class Tag {
     return manifestSize;
   }
 
+  public Optional<Instant> getCreatedAt() {
+    return createdAt;
+  }
+
   public Optional<Instant> getUpdatedAt() {
     return updatedAt;
   }
@@ -65,6 +81,7 @@ public class Tag {
         .add("branch", branch)
         .add("version", version)
         .add("manifestSize", manifestSize)
+        .add("createdAt", createdAt)
         .add("updatedAt", updatedAt)
         .toString();
   }
@@ -81,12 +98,13 @@ public class Tag {
     return version == tag.version
         && Objects.equals(branch, tag.branch)
         && manifestSize == tag.manifestSize
+        && Objects.equals(createdAt, tag.createdAt)
         && Objects.equals(updatedAt, tag.updatedAt)
         && Objects.equals(name, tag.name);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, branch, version, manifestSize, updatedAt);
+    return Objects.hash(name, branch, version, manifestSize, createdAt, updatedAt);
   }
 }

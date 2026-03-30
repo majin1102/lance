@@ -4370,6 +4370,7 @@ class Transaction:
 class Tag(TypedDict):
     branch: Optional[str]
     version: int
+    created_at: Optional[datetime]
     updated_at: Optional[datetime]
     manifest_size: int
 

@@ -1681,6 +1681,7 @@ impl Dataset {
         for (tag_name, tag_content) in tags {
             let dict = PyDict::new(py);
             dict.set_item("version", tag_content.version)?;
+            dict.set_item("created_at", tag_content.created_at)?;
             dict.set_item("updated_at", tag_content.updated_at)?;
             dict.set_item("manifest_size", tag_content.manifest_size)?;
 
@@ -1699,6 +1700,7 @@ impl Dataset {
             let dict = PyDict::new(py);
             dict.set_item("branch", v.branch.clone())?;
             dict.set_item("version", v.version)?;
+            dict.set_item("created_at", v.created_at)?;
             dict.set_item("updated_at", v.updated_at)?;
             dict.set_item("manifest_size", v.manifest_size)?;
             pytags.set_item(k, dict.into_py_any(py)?)?;

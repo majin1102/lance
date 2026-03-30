@@ -2888,10 +2888,16 @@ components:
           format: int64
           minimum: 0
           description: Version number that the tag points to
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp when the tag was first created. Historical tags may omit this field.
         updatedAt:
           type: string
           format: date-time
-          description: Timestamp when the tag was last created or updated. Historical tags may omit this field.
+          nullable: true
+          description: Timestamp when the tag was last modified. On creation, this equals createdAt. Historical tags may omit this field.
         manifestSize:
           type: integer
           format: int64

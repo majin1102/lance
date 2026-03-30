@@ -2364,6 +2364,26 @@ fn inner_list_tags<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
+    fn optional_datetime_to_java_instant<'local>(
+        env: &mut JNIEnv<'local>,
+        timestamp: Option<&DateTime<Utc>>,
+    ) -> Result<JObject<'local>> {
+        if let Some(timestamp) = timestamp {
+            let seconds = timestamp.timestamp();
+            let nanos = timestamp.timestamp_subsec_nanos() as i64;
+            Ok(env
+                .call_static_method(
+                    "java/time/Instant",
+                    "ofEpochSecond",
+                    "(JJ)Ljava/time/Instant;",
+                    &[JValue::Long(seconds), JValue::Long(nanos)],
+                )?
+                .l()?)
+        } else {
+            Ok(JObject::null())
+        }
+    }
+
     let tag_map = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
@@ -2377,27 +2397,19 @@ fn inner_list_tags<'local>(
         } else {
             JObject::null()
         };
-        let updated_at = if let Some(updated_at) = tag_contents.updated_at.as_ref() {
-            let seconds = updated_at.timestamp();
-            let nanos = updated_at.timestamp_subsec_nanos() as i64;
-            env.call_static_method(
-                "java/time/Instant",
-                "ofEpochSecond",
-                "(JJ)Ljava/time/Instant;",
-                &[JValue::Long(seconds), JValue::Long(nanos)],
-            )?
-            .l()?
-        } else {
-            JObject::null()
-        };
+        let created_at =
+            optional_datetime_to_java_instant(env, tag_contents.created_at.as_ref())?;
+        let updated_at =
+            optional_datetime_to_java_instant(env, tag_contents.updated_at.as_ref())?;
         let java_tag = env.new_object(
             "org/lance/Tag",
-            "(Ljava/lang/String;Ljava/lang/String;JILjava/time/Instant;)V",
+            "(Ljava/lang/String;Ljava/lang/String;JILjava/time/Instant;Ljava/time/Instant;)V",
             &[
                 JValue::Object(&env.new_string(tag_name)?.into()),
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
+                JValue::Object(&created_at),
                 JValue::Object(&updated_at),
             ],
         )?;

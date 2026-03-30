@@ -223,8 +223,9 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
+        let now = utc_now();
         let tag_contents = self
-            .build_tag_content_by_ref(reference, Some(utc_now()))
+            .build_tag_content_by_ref(reference, Some(now), Some(now))
             .await?;
 
         self.object_store()
@@ -261,8 +262,9 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
+        let previous_tag = self.get(tag).await?;
         let tag_contents = self
-            .build_tag_content_by_ref(reference, Some(utc_now()))
+            .build_tag_content_by_ref(reference, previous_tag.created_at, Some(utc_now()))
             .await?;
 
         self.object_store()
@@ -277,6 +279,7 @@ impl Tags<'_> {
     async fn build_tag_content_by_ref(
         &self,
         reference: impl Into<Ref>,
+        created_at: Option<DateTime<Utc>>,
         updated_at: Option<DateTime<Utc>>,
     ) -> Result<TagContents> {
         let reference = reference.into();
@@ -323,6 +326,7 @@ impl Tags<'_> {
         let tag_contents = TagContents {
             branch,
             version: manifest_file.version,
+            created_at,
             updated_at,
             manifest_size,
         };
@@ -665,6 +669,8 @@ impl<'a> BranchRelativePath<'a> {
 pub struct TagContents {
     pub branch: Option<String>,
     pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub manifest_size: usize,
 }
@@ -1107,6 +1113,7 @@ mod tests {
         let tag_contents = TagContents {
             branch: Some("feature".to_string()),
             version: 10,
+            created_at: Some(chrono::DateTime::from_timestamp(1_234_567_000, 456_000_000).unwrap()),
             updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
             manifest_size: 2048,
         };
@@ -1115,6 +1122,7 @@ mod tests {
         let json = serde_json::to_string(&tag_contents).unwrap();
         assert!(json.contains("branch"));
         assert!(json.contains("version"));
+        assert!(json.contains("createdAt"));
         assert!(json.contains("updatedAt"));
         assert!(json.contains("manifestSize"));
 
@@ -1122,12 +1130,40 @@ mod tests {
         let deserialized: TagContents = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
+        assert_eq!(deserialized.created_at, tag_contents.created_at);
         assert_eq!(deserialized.updated_at, tag_contents.updated_at);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
 
+        let tag_contents_without_created_at = TagContents {
+            branch: Some("feature".to_string()),
+            version: 10,
+            created_at: None,
+            updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
+            manifest_size: 2048,
+        };
+        let json_without_created_at =
+            serde_json::to_string(&tag_contents_without_created_at).unwrap();
+        assert!(!json_without_created_at.contains("createdAt"));
+        assert!(json_without_created_at.contains("updatedAt"));
+
         let legacy_json = r#"{"branch":"feature","version":10,"manifestSize":2048}"#;
         let legacy_deserialized: TagContents = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_deserialized.created_at, None);
         assert_eq!(legacy_deserialized.updated_at, None);
+
+        let legacy_updated_only_json = r#"{"branch":"feature","version":10,"updatedAt":"2009-02-13T23:31:30.123Z","manifestSize":2048}"#;
+        let legacy_updated_only_deserialized: TagContents =
+            serde_json::from_str(legacy_updated_only_json).unwrap();
+        assert_eq!(legacy_updated_only_deserialized.created_at, None);
+        assert_eq!(
+            legacy_updated_only_deserialized.updated_at,
+            Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap())
+        );
+
+        let null_created_at_json = r#"{"branch":"feature","version":10,"createdAt":null,"updatedAt":"2009-02-13T23:31:30.123Z","manifestSize":2048}"#;
+        let null_created_at_deserialized: TagContents =
+            serde_json::from_str(null_created_at_json).unwrap();
+        assert_eq!(null_created_at_deserialized.created_at, None);
     }
 
     #[rstest]

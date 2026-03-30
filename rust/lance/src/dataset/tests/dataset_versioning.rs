@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::vec;
+use std::{fs, path::Path as StdPath};
 
 use crate::Dataset;
 use crate::dataset::UpdateBuilder;
@@ -327,13 +328,14 @@ async fn test_tag(
     dataset.tags().create("tag1", 1).await.unwrap();
 
     assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
-    let tag1_updated_at = dataset
-        .tags()
-        .get("tag1")
-        .await
-        .unwrap()
+    let tag1_metadata = dataset.tags().get("tag1").await.unwrap();
+    let tag1_created_at = tag1_metadata
+        .created_at
+        .expect("newly created tag should have created_at");
+    let tag1_updated_at = tag1_metadata
         .updated_at
         .expect("newly created tag should have updated_at");
+    assert_eq!(tag1_created_at, tag1_updated_at);
 
     let another_bad_tag_creation = dataset.tags().create("tag1", 1).await;
     assert_eq!(
@@ -359,7 +361,7 @@ async fn test_tag(
     assert!(
         default_order
             .iter()
-            .all(|(_, tag)| tag.updated_at.is_some())
+            .all(|(_, tag)| tag.created_at.is_some() && tag.updated_at.is_some())
     );
 
     let asc_order = dataset
@@ -373,7 +375,11 @@ async fn test_tag(
         ["tag1", "tag2", "v1.0.0-rc1"],
         "Ascending ordering mismatch"
     );
-    assert!(asc_order.iter().all(|(_, tag)| tag.updated_at.is_some()));
+    assert!(
+        asc_order
+            .iter()
+            .all(|(_, tag)| tag.created_at.is_some() && tag.updated_at.is_some())
+    );
 
     let desc_order = dataset
         .tags()
@@ -386,11 +392,18 @@ async fn test_tag(
         ["v1.0.0-rc1", "tag1", "tag2"],
         "Descending ordering mismatch"
     );
-    assert!(desc_order.iter().all(|(_, tag)| tag.updated_at.is_some()));
+    assert!(
+        desc_order
+            .iter()
+            .all(|(_, tag)| tag.created_at.is_some() && tag.updated_at.is_some())
+    );
 
     let tags = dataset.tags().list().await.unwrap();
     assert_eq!(tags.len(), 3);
-    assert!(tags.values().all(|tag| tag.updated_at.is_some()));
+    assert!(
+        tags.values()
+            .all(|tag| tag.created_at.is_some() && tag.updated_at.is_some())
+    );
 
     let bad_checkout = dataset.checkout_version("tag3").await;
     assert_eq!(
@@ -422,11 +435,9 @@ async fn test_tag(
     );
 
     dataset.tags().update("tag1", 2).await.unwrap();
-    let tag1_updated_after_first_update = dataset
-        .tags()
-        .get("tag1")
-        .await
-        .unwrap()
+    let tag1_after_first_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(tag1_after_first_update.created_at, Some(tag1_created_at));
+    let tag1_updated_after_first_update = tag1_after_first_update
         .updated_at
         .expect("updated tag should have updated_at");
     assert!(tag1_updated_after_first_update >= tag1_updated_at);
@@ -434,16 +445,44 @@ async fn test_tag(
     assert_eq!(dataset.manifest.version, 2);
 
     dataset.tags().update("tag1", 1).await.unwrap();
-    let tag1_updated_after_second_update = dataset
-        .tags()
-        .get("tag1")
-        .await
-        .unwrap()
+    let tag1_after_second_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(tag1_after_second_update.created_at, Some(tag1_created_at));
+    let tag1_updated_after_second_update = tag1_after_second_update
         .updated_at
         .expect("updated tag should have updated_at");
     assert!(tag1_updated_after_second_update >= tag1_updated_after_first_update);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
+
+    let legacy_tag_path = StdPath::new(test_uri.as_ref())
+        .join("_refs")
+        .join("tags")
+        .join("legacy-tag.json");
+    fs::write(&legacy_tag_path, r#"{"version":1,"manifestSize":123}"#).unwrap();
+
+    let legacy_tag_before_update = dataset.tags().get("legacy-tag").await.unwrap();
+    assert_eq!(legacy_tag_before_update.created_at, None);
+    assert_eq!(legacy_tag_before_update.updated_at, None);
+
+    dataset.tags().update("legacy-tag", 2).await.unwrap();
+
+    let legacy_tag_after_update = dataset.tags().get("legacy-tag").await.unwrap();
+    assert_eq!(legacy_tag_after_update.created_at, None);
+    assert!(
+        legacy_tag_after_update.updated_at.is_some(),
+        "legacy tag update should refresh updated_at"
+    );
+    assert_eq!(legacy_tag_after_update.version, 2);
+
+    let legacy_tag_json = fs::read_to_string(&legacy_tag_path).unwrap();
+    assert!(
+        !legacy_tag_json.contains("createdAt"),
+        "legacy tag update should preserve missing createdAt"
+    );
+    assert!(
+        legacy_tag_json.contains("updatedAt"),
+        "legacy tag update should persist updatedAt"
+    );
 }
 
 #[rstest]
