@@ -15,6 +15,7 @@ package org.lance;
 
 import com.google.common.base.MoreObjects;
 
+import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -23,12 +24,18 @@ public class Tag {
   private final Optional<String> branch;
   private final long version;
   private final int manifestSize;
+  private final Optional<Instant> updatedAt;
 
   public Tag(String name, String branch, long version, int manifestSize) {
+    this(name, branch, version, manifestSize, null);
+  }
+
+  public Tag(String name, String branch, long version, int manifestSize, Instant updatedAt) {
     this.name = name;
     this.branch = Optional.ofNullable(branch);
     this.version = version;
     this.manifestSize = manifestSize;
+    this.updatedAt = Optional.ofNullable(updatedAt);
   }
 
   public String getName() {
@@ -47,6 +54,10 @@ public class Tag {
     return manifestSize;
   }
 
+  public Optional<Instant> getUpdatedAt() {
+    return updatedAt;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -54,6 +65,7 @@ public class Tag {
         .add("branch", branch)
         .add("version", version)
         .add("manifestSize", manifestSize)
+        .add("updatedAt", updatedAt)
         .toString();
   }
 
@@ -69,11 +81,12 @@ public class Tag {
     return version == tag.version
         && Objects.equals(branch, tag.branch)
         && manifestSize == tag.manifestSize
+        && Objects.equals(updatedAt, tag.updatedAt)
         && Objects.equals(name, tag.name);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, branch, version, manifestSize);
+    return Objects.hash(name, branch, version, manifestSize, updatedAt);
   }
 }

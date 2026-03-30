@@ -2377,14 +2377,28 @@ fn inner_list_tags<'local>(
         } else {
             JObject::null()
         };
+        let updated_at = if let Some(updated_at) = tag_contents.updated_at.as_ref() {
+            let seconds = updated_at.timestamp();
+            let nanos = updated_at.timestamp_subsec_nanos() as i64;
+            env.call_static_method(
+                "java/time/Instant",
+                "ofEpochSecond",
+                "(JJ)Ljava/time/Instant;",
+                &[JValue::Long(seconds), JValue::Long(nanos)],
+            )?
+            .l()?
+        } else {
+            JObject::null()
+        };
         let java_tag = env.new_object(
             "org/lance/Tag",
-            "(Ljava/lang/String;Ljava/lang/String;JI)V",
+            "(Ljava/lang/String;Ljava/lang/String;JILjava/time/Instant;)V",
             &[
                 JValue::Object(&env.new_string(tag_name)?.into()),
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
+                JValue::Object(&updated_at),
             ],
         )?;
         env.call_method(

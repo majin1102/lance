@@ -114,8 +114,9 @@ Tags are always stored at the root dataset level, regardless of which branch the
 
 Each tag file is a JSON file with the following fields:
 
-| JSON Key        | Type   | Optional | Description                                                              |
-|-----------------|--------|----------|--------------------------------------------------------------------------|
-| `branch`        | string | Yes      | Branch name being tagged. `null` or absent indicates main branch.        |
-| `version`       | number |          | Version number being tagged within that branch.                          |
-| `manifest_size` | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |
+| JSON Key       | Type   | Optional | Description                                                              |
+|----------------|--------|----------|--------------------------------------------------------------------------|
+| `branch`       | string | Yes      | Branch name being tagged. `null` or absent indicates main branch.        |
+| `version`      | number |          | Version number being tagged within that branch.                          |
+| `updatedAt`    | string | Yes      | RFC 3339 UTC timestamp when the tag was last created or updated.         |
+| `manifestSize` | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |

@@ -4370,6 +4370,7 @@ class Transaction:
 class Tag(TypedDict):
     branch: Optional[str]
     version: int
+    updated_at: Optional[datetime]
     manifest_size: int
 
 
@@ -5727,7 +5728,7 @@ class Tags:
         Returns
         -------
         dict[str, Tag]
-            A dictionary mapping tag names to version numbers.
+            A dictionary mapping tag names to tag metadata.
         """
         return self._ds.tags()
 

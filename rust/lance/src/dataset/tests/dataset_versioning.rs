@@ -327,6 +327,13 @@ async fn test_tag(
     dataset.tags().create("tag1", 1).await.unwrap();
 
     assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
+    let tag1_updated_at = dataset
+        .tags()
+        .get("tag1")
+        .await
+        .unwrap()
+        .updated_at
+        .expect("newly created tag should have updated_at");
 
     let another_bad_tag_creation = dataset.tags().create("tag1", 1).await;
     assert_eq!(
@@ -349,6 +356,11 @@ async fn test_tag(
         ["v1.0.0-rc1", "tag1", "tag2"],
         "Default ordering mismatch"
     );
+    assert!(
+        default_order
+            .iter()
+            .all(|(_, tag)| tag.updated_at.is_some())
+    );
 
     let asc_order = dataset
         .tags()
@@ -361,6 +373,7 @@ async fn test_tag(
         ["tag1", "tag2", "v1.0.0-rc1"],
         "Ascending ordering mismatch"
     );
+    assert!(asc_order.iter().all(|(_, tag)| tag.updated_at.is_some()));
 
     let desc_order = dataset
         .tags()
@@ -373,8 +386,11 @@ async fn test_tag(
         ["v1.0.0-rc1", "tag1", "tag2"],
         "Descending ordering mismatch"
     );
+    assert!(desc_order.iter().all(|(_, tag)| tag.updated_at.is_some()));
 
-    assert_eq!(dataset.tags().list().await.unwrap().len(), 3);
+    let tags = dataset.tags().list().await.unwrap();
+    assert_eq!(tags.len(), 3);
+    assert!(tags.values().all(|tag| tag.updated_at.is_some()));
 
     let bad_checkout = dataset.checkout_version("tag3").await;
     assert_eq!(
@@ -406,10 +422,26 @@ async fn test_tag(
     );
 
     dataset.tags().update("tag1", 2).await.unwrap();
+    let tag1_updated_after_first_update = dataset
+        .tags()
+        .get("tag1")
+        .await
+        .unwrap()
+        .updated_at
+        .expect("updated tag should have updated_at");
+    assert!(tag1_updated_after_first_update >= tag1_updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 2);
 
     dataset.tags().update("tag1", 1).await.unwrap();
+    let tag1_updated_after_second_update = dataset
+        .tags()
+        .get("tag1")
+        .await
+        .unwrap()
+        .updated_at
+        .expect("updated tag should have updated_at");
+    assert!(tag1_updated_after_second_update >= tag1_updated_after_first_update);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
 }

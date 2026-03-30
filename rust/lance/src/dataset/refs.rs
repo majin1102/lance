@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
@@ -221,7 +223,9 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference).await?;
+        let tag_contents = self
+            .build_tag_content_by_ref(reference, Some(utc_now()))
+            .await?;
 
         self.object_store()
             .put(
@@ -257,7 +261,9 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference).await?;
+        let tag_contents = self
+            .build_tag_content_by_ref(reference, Some(utc_now()))
+            .await?;
 
         self.object_store()
             .put(
@@ -268,7 +274,11 @@ impl Tags<'_> {
             .map(|_| ())
     }
 
-    async fn build_tag_content_by_ref(&self, reference: impl Into<Ref>) -> Result<TagContents> {
+    async fn build_tag_content_by_ref(
+        &self,
+        reference: impl Into<Ref>,
+        updated_at: Option<DateTime<Utc>>,
+    ) -> Result<TagContents> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
             Version(branch, version_number) => (branch, version_number),
@@ -313,6 +323,7 @@ impl Tags<'_> {
         let tag_contents = TagContents {
             branch,
             version: manifest_file.version,
+            updated_at,
             manifest_size,
         };
         Ok(tag_contents)
@@ -654,6 +665,7 @@ impl<'a> BranchRelativePath<'a> {
 pub struct TagContents {
     pub branch: Option<String>,
     pub version: u64,
+    pub updated_at: Option<DateTime<Utc>>,
     pub manifest_size: usize,
 }
 
@@ -1095,6 +1107,7 @@ mod tests {
         let tag_contents = TagContents {
             branch: Some("feature".to_string()),
             version: 10,
+            updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
             manifest_size: 2048,
         };
 
@@ -1102,13 +1115,19 @@ mod tests {
         let json = serde_json::to_string(&tag_contents).unwrap();
         assert!(json.contains("branch"));
         assert!(json.contains("version"));
+        assert!(json.contains("updatedAt"));
         assert!(json.contains("manifestSize"));
 
         // Test deserialization
         let deserialized: TagContents = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
+        assert_eq!(deserialized.updated_at, tag_contents.updated_at);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
+
+        let legacy_json = r#"{"branch":"feature","version":10,"manifestSize":2048}"#;
+        let legacy_deserialized: TagContents = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_deserialized.updated_at, None);
     }
 
     #[rstest]
