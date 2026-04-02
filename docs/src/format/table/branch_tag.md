@@ -42,6 +42,7 @@ Each branch metadata file is a JSON file with the following fields:
 | `parent_version` | number |          | Version number of the parent branch at the time this branch was created.       |
 | `create_at`      | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
 | `manifest_size`  | number |          | Size of the initial manifest file in bytes.                                    |
+| `metadata`       | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object.    |
 
 ### Branch Dataset Layout
 
@@ -118,4 +119,7 @@ Each tag file is a JSON file with the following fields:
 |-----------------|--------|----------|--------------------------------------------------------------------------|
 | `branch`        | string | Yes      | Branch name being tagged. `null` or absent indicates main branch.        |
 | `version`       | number |          | Version number being tagged within that branch.                          |
+| `createdAt`     | string | Yes      | RFC 3339 timestamp for when the tag was first created.                  |
+| `updatedAt`     | string | Yes      | RFC 3339 timestamp for the latest tag reference update.                 |
 | `manifest_size` | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |
+| `metadata`      | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object. |

@@ -617,7 +617,6 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
-
         Returns
         -------
         LanceDataset
@@ -4367,7 +4366,10 @@ class Transaction:
 class Tag(TypedDict):
     branch: Optional[str]
     version: int
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
     manifest_size: int
+    metadata: Dict[str, str]
 
 
 class Branch(TypedDict):
@@ -4376,6 +4378,7 @@ class Branch(TypedDict):
     parent_version: int
     create_at: int
     manifest_size: int
+    metadata: Dict[str, str]
 
 
 class Version(TypedDict):
@@ -5725,7 +5728,9 @@ class Tags:
         Returns
         -------
         dict[str, Tag]
-            A dictionary mapping tag names to version numbers.
+            A dictionary mapping tag names to tag metadata, including the
+            referenced branch, version, timestamps, manifest size, and any
+            attached metadata.
         """
         return self._ds.tags()
 
@@ -5745,7 +5750,7 @@ class Tags:
         """
         return self._ds.get_version(tag)
 
-    def list_ordered(self, order: Optional[str] = None) -> list[str, Tag]:
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Tag]]:
         """
         List all dataset tags.
 
@@ -5758,7 +5763,7 @@ class Tags:
 
         Returns
         -------
-        list[str, Tag]
+        List[Tuple[str, Tag]]
             An ordered list of tuples mapping tag names to its `Tag` metadata.
         """
         return self._ds.tags_ordered(order)
@@ -5816,6 +5821,12 @@ class Tags:
         """
         self._ds.update_tag(tag, reference)
 
+    def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
+        """
+        Replace metadata for an existing tag.
+        """
+        self._ds.replace_tag_metadata(tag, metadata)
+
 
 class Branches:
     """
@@ -5847,6 +5858,12 @@ class Branches:
         Delete a branch.
         """
         self._ds.delete_branch(branch)
+
+    def replace_metadata(self, branch: str, metadata: Dict[str, str]) -> None:
+        """
+        Replace metadata for a branch.
+        """
+        self._ds.replace_branch_metadata(branch, metadata)
 
 
 @dataclass
