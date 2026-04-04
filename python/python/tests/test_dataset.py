@@ -537,7 +537,7 @@ def test_tag(tmp_path: Path):
     assert updated_tag1_meta["updated_at"] >= tag1_updated_at
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
-    assert ds.tags.list()["tag1"]["metadata"] == {"description": "updated tag"}
+    assert ds.tags.list()["tag1"]["metadata"] == {"owner": "ml-team"}
 
     ds.tags.replace_metadata("tag1", {})
     ds = lance.dataset(base_dir, "tag1")
