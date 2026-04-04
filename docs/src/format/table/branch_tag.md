@@ -38,10 +38,10 @@ Each branch metadata file is a JSON file with the following fields:
 
 | JSON Key         | Type   | Optional | Description                                                                    |
 |------------------|--------|----------|--------------------------------------------------------------------------------|
-| `parent_branch`  | string | Yes      | Name of the branch this was created from. `null` indicates branched from main. |
-| `parent_version` | number |          | Version number of the parent branch at the time this branch was created.       |
-| `create_at`      | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
-| `manifest_size`  | number |          | Size of the initial manifest file in bytes.                                    |
+| `parentBranch`   | string | Yes      | Name of the branch this was created from. `null` indicates branched from main. |
+| `parentVersion`  | number |          | Version number of the parent branch at the time this branch was created.       |
+| `createAt`       | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
+| `manifestSize`   | number |          | Size of the initial manifest file in bytes.                                    |
 | `metadata`       | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object.    |
 
 ### Branch Dataset Layout
@@ -121,5 +121,5 @@ Each tag file is a JSON file with the following fields:
 | `version`       | number |          | Version number being tagged within that branch.                          |
 | `createdAt`     | string | Yes      | RFC 3339 timestamp for when the tag was first created.                  |
 | `updatedAt`     | string | Yes      | RFC 3339 timestamp for the latest tag reference update.                 |
-| `manifest_size` | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |
+| `manifestSize`  | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |
 | `metadata`      | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object. |

@@ -521,7 +521,14 @@ def test_tag(tmp_path: Path):
     ds.tags.replace_metadata("tag1", {"description": "updated tag"})
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
-    assert ds.tags.list()["tag1"]["metadata"] == {"description": "updated tag"}
+    replaced_tag1_meta = ds.tags.list()["tag1"]
+    assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
+    assert replaced_tag1_meta["updated_at"] == tag1_updated_at
+
+    ds.tags.replace_metadata("tag1", {"owner": "ml-team"})
+    replaced_again_tag1_meta = ds.tags.list()["tag1"]
+    assert replaced_again_tag1_meta["metadata"] == {"owner": "ml-team"}
+    assert replaced_again_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.update("tag1", 2)
     updated_tag1_meta = ds.tags.list()["tag1"]
@@ -5266,10 +5273,13 @@ def test_branches(tmp_path: Path):
     branch1.tags.create("main_latest", (None, None))
     branch1.tags.create("main_latest2", ("main", None))
     branch1.create_branch("branch_from_main", ("main", None))
+    ordered_tags = dict(branch1.tags.list_ordered())
     branches_with_main = branch1.branches.list()
     assert branch1.tags.list()["branch1_latest"]["branch"] == "branch1"
     assert branch1.tags.list()["main_latest"]["branch"] is None
     assert branch1.tags.list()["main_latest2"]["branch"] is None
+    assert ordered_tags["branch1_latest"]["branch"] == "branch1"
+    assert ordered_tags["main_latest"]["branch"] is None
     assert branches_with_main["branch_from_main"]["parent_branch"] is None
     assert branches_with_main["branch_from_main"]["branch_identifier"][0][0] == 1
     assert isinstance(

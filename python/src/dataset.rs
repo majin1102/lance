@@ -1608,6 +1608,7 @@ impl Dataset {
 
         for (tag_name, tag_content) in tags {
             let dict = PyDict::new(py);
+            dict.set_item("branch", tag_content.branch.clone())?;
             dict.set_item("version", tag_content.version)?;
             dict.set_item("created_at", tag_content.created_at)?;
             dict.set_item("updated_at", tag_content.updated_at)?;

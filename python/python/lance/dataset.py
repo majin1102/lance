@@ -5824,6 +5824,11 @@ class Tags:
     def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
         """
         Replace metadata for an existing tag.
+
+        This replaces the entire metadata map instead of merging with existing
+        keys. It does not change the tag reference, and it does not update
+        `updated_at`. `updated_at` only changes when `update()` moves the tag
+        to a different reference.
         """
         self._ds.replace_tag_metadata(tag, metadata)
 
