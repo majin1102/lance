@@ -57,9 +57,8 @@ fn version_summary_schema() -> Arc<ArrowSchema> {
 /// Private helper to get the Lance schema for VersionSummary
 fn version_summary_lance_schema() -> Result<LanceSchema> {
     let arrow_schema = version_summary_schema();
-    LanceSchema::try_from(arrow_schema.as_ref()).map_err(|e| {
-        Error::invalid_input(format!("Failed to create Lance schema: {}", e))
-    })
+    LanceSchema::try_from(arrow_schema.as_ref())
+        .map_err(|e| Error::invalid_input(format!("Failed to create Lance schema: {}", e)))
 }
 
 /// Convert a slice of VersionSummary to an Arrow RecordBatch
@@ -185,9 +184,7 @@ macro_rules! get_column {
             .ok_or_else(|| Error::invalid_input(concat!($name, " column not found")))?
             .as_any()
             .downcast_ref::<$type>()
-            .ok_or_else(|| {
-                Error::invalid_input(concat!($name, " column is not ", $type_str))
-            })?
+            .ok_or_else(|| Error::invalid_input(concat!($name, " column is not ", $type_str)))?
     };
 }
 

@@ -1279,8 +1279,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::dataset::checkpoint::CHECKPOINT_DIR;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::dataset::checkpoint::CHECKPOINT_DIR;
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
