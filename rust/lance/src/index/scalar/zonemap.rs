@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::bitmap::BitmapIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::zonemap::ZoneMapIndex;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
-/// Merge one caller-defined group of source bitmap segments into a single segment.
+/// Merge one caller-defined group of source ZoneMap segments into a single segment.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
@@ -28,36 +29,45 @@ pub(in crate::index) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    let mut source_indices = Vec::with_capacity(segments.len());
+    let mut scalar_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
+    let dataset_fragments = dataset.fragment_bitmap.as_ref();
     for segment in &segments {
-        fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
-            Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            ))
-        })?;
+        let effective = segment
+            .effective_fragment_bitmap(dataset_fragments)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+        fragment_bitmap |= effective;
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
-        let bitmap_index = scalar_index
+        scalar_indices.push((segment.uuid, scalar_index));
+    }
+
+    let mut source_indices = Vec::with_capacity(scalar_indices.len());
+    for (segment_uuid, scalar_index) in &scalar_indices {
+        let zonemap_index = scalar_index
             .as_any()
-            .downcast_ref::<BitmapIndex>()
+            .downcast_ref::<ZoneMapIndex>()
             .ok_or_else(|| {
                 Error::index(format!(
-                    "merge_existing_index_segments: expected bitmap segment {}, got {:?}",
-                    segment.uuid,
+                    "merge_existing_index_segments: expected zonemap segment {}, got {:?}",
+                    segment_uuid,
                     scalar_index.index_type()
                 ))
             })?;
-        source_indices.push(Arc::new(bitmap_index.clone()));
+        source_indices.push(zonemap_index);
     }
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = lance_index::scalar::bitmap::merge_bitmap_indices(
+    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
         &source_indices,
         &new_store,
-        lance_index::progress::noop_progress(),
+        &fragment_bitmap,
     )
     .await?;
 
