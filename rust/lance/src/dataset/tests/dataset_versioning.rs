@@ -625,6 +625,42 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
 }
 
 #[tokio::test]
+async fn test_main_branch_management() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let checked_out = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(checked_out.version().version, dataset.version().version);
+    assert_eq!(checked_out.manifest.branch, None);
+
+    let checked_out = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(checked_out.version().version, dataset.version().version);
+    assert_eq!(checked_out.manifest.branch, None);
+
+    let err = match dataset.create_branch("main", ("main", None), None).await {
+        Ok(_) => panic!("creating a branch named main should fail"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, Error::InvalidRef { .. }));
+    assert!(err.to_string().contains("\"main\" is reserved"), "{err}");
+
+    assert!(!tempdir.std_path().join("tree").join("main").exists());
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+
+    let err = dataset.branches().get("main").await.unwrap_err();
+    assert!(matches!(err, Error::InvalidRef { .. }));
+    assert!(err.to_string().contains("\"main\" is reserved"), "{err}");
+
+    let err = dataset.delete_branch("main").await.unwrap_err();
+    assert!(matches!(err, Error::InvalidRef { .. }));
+    assert!(err.to_string().contains("\"main\" is reserved"), "{err}");
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();

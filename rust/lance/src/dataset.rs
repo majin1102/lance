@@ -499,6 +499,8 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        refs::check_valid_branch(branch)?;
+
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let source_location = self
@@ -560,16 +562,19 @@ impl Dataset {
         version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<Self> {
+        let standardized_branch = branch.and_then(refs::standardize_branch);
         // Reject malformed names at the boundary (mirroring the branch CRUD
         // paths) so they fail as InvalidRef instead of tripping the wrong-chain
         // check below
-        if let Some(branch_name) = branch
-            && !Branches::is_main_branch(branch)
+        if let Some(branch_name) = standardized_branch.as_deref()
+            && !Branches::is_main_branch(Some(branch_name))
         {
             refs::check_valid_branch(branch_name)?;
         }
 
-        let new_location = self.branch_location().find_branch(branch)?;
+        let new_location = self
+            .branch_location()
+            .find_branch(standardized_branch.as_deref())?;
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
@@ -585,7 +590,7 @@ impl Dataset {
                 .await?
         };
 
-        if self.already_checked_out(&manifest_location, branch) {
+        if self.already_checked_out(&manifest_location, standardized_branch.as_deref()) {
             return Ok(self.clone());
         }
 
@@ -601,8 +606,7 @@ impl Dataset {
         // means the commit handler resolved against a different chain (for
         // example an external manifest store that ignores branch-qualified
         // paths); error loudly rather than hand back another branch's data.
-        let requested_branch = branch.and_then(refs::standardize_branch);
-        if manifest.branch.as_deref() != requested_branch.as_deref() {
+        if manifest.branch.as_deref() != standardized_branch.as_deref() {
             return Err(Error::internal(format!(
                 "checkout of branch '{}' at version {} resolved a manifest belonging to branch '{}'",
                 refs::normalize_branch(branch),
