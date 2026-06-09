@@ -46,6 +46,12 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 
 See [python/AGENTS.md](python/AGENTS.md) and [java/AGENTS.md](java/AGENTS.md).
 
+## Language-Specific Environment Contract
+
+- For language-specific tasks, always follow the environment and command rules in the corresponding subdirectory guide before running build, test, lint, format, or tooling commands.
+- Do not substitute a different environment manager or toolchain just because a command appears missing, unavailable, or slow.
+- If a language-specific command fails outside the documented workflow, treat that as an environment usage mistake first. Fix the environment usage, rerun with the prescribed commands, and only then conclude that a dependency or tool is unavailable.
+
 ### Integration Testing
 
 ```bash
@@ -62,6 +68,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Comments should explain non-obvious "why" reasoning, not restate what the code does.
 - Remove debug prints (`println!`, `dbg!`, `print()`) before merging — use `tracing` or logging frameworks.
 - Extract logic repeated in 2+ places into a shared helper; inline single-use logic at its call site.
+- Think carefully before adding a helper: only introduce one when it materially reduces cognitive load or eliminates substantial duplication, and do not add thin wrappers that only rename or forward existing calls.
 - Keep PRs focused — no drive-by refactors, reformatting, or cosmetic changes.
 - Be mindful of memory use: avoid collecting streams of `RecordBatch` into memory; use `RoaringBitmap` instead of `HashSet<u32>`.
 
@@ -122,6 +129,11 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Keep doc examples in sync with actual API signatures — update when refactoring.
 - Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
 - Proofread comments and docs for typos before committing.
+
+## Pull Requests
+
+- PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
+- Before creating or updating a PR, run the lint checks for every touched language surface, even when they are expensive. For Rust changes, run `cargo fmt --all` and `cargo clippy --all --tests --benches -- -D warnings`. For Python changes, follow the environment workflow in `python/AGENTS.md` and run `uv run make lint` from `python/`. If a required lint check cannot be run, state the blocker explicitly in the PR summary.
 
 ## Review Guidelines
 

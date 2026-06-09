@@ -23,7 +23,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
-use super::super::builder::{DEFAULT_WAND_FACTOR, FtsQuery, FtsQueryType};
+use super::super::builder::{FtsQuery, FtsQueryType};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -46,7 +46,7 @@ pub struct FtsIndexExec {
     max_visible_batch_position: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Pre-computed batch ranges for O(log n) lookup.
     batch_ranges: Vec<BatchRange>,
@@ -106,18 +106,23 @@ impl FtsIndexExec {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.push(Field::new(SCORE_COLUMN, DataType::Float32, false));
+        // `_score` is nullable here to stay schema-compatible with
+        // `lance_index::scalar::inverted::FTS_SCHEMA` (the schema base/flushed
+        // FTS exec nodes emit). The LSM `full_text_search` planner unions the
+        // active arm with base/flushed arms; UnionExec requires schema equality
+        // including nullability. The actual emitted column is always populated.
+        fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
         }
         let output_schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         // Pre-compute batch ranges for O(log n) lookup and max visible row
         let mut batch_ranges = Vec::new();
@@ -204,14 +209,12 @@ impl FtsIndexExec {
             } => FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *max_expansions),
         };
 
-        // Search the index using the query expression
-        // Use search_with_options if wand_factor is set (< 1.0)
-        let entries = if self.query.wand_factor < DEFAULT_WAND_FACTOR {
-            let options = SearchOptions::new().with_wand_factor(self.query.wand_factor);
-            index.search_with_options(&query_expr, options)
-        } else {
-            index.search_query(&query_expr)
-        };
+        // Search the index using the query expression. `include_tail` selects
+        // read-your-writes vs immutable-only; `wand_factor` adds pruning.
+        let options = SearchOptions::new()
+            .with_wand_factor(self.query.wand_factor)
+            .with_include_tail(self.query.include_tail);
+        let entries = index.search_with_options(&query_expr, options);
 
         // Convert to (row_position, score) pairs
         entries
@@ -229,73 +232,6 @@ impl FtsIndexExec {
             .into_iter()
             .filter(|&(pos, _)| pos <= max_visible)
             .collect()
-    }
-
-    /// Materialize rows from batch store with score column (for unsorted results).
-    #[allow(dead_code)]
-    fn materialize_rows(&self, results: &[(u64, f32)]) -> DataFusionResult<Vec<RecordBatch>> {
-        if results.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Group rows by batch using binary search on pre-computed ranges
-        // Track (row_in_batch, score, original_row_position)
-        let mut batches_data: std::collections::HashMap<usize, Vec<(usize, f32, u64)>> =
-            std::collections::HashMap::new();
-
-        for &(pos, score) in results {
-            if let Some(batch) = self.find_batch(pos as usize) {
-                batches_data.entry(batch.batch_id).or_default().push((
-                    pos as usize - batch.start,
-                    score,
-                    pos,
-                ));
-            }
-        }
-
-        let mut all_batches = Vec::new();
-
-        for (batch_id, rows_with_score) in batches_data {
-            if let Some(stored) = self.batch_store.get(batch_id) {
-                let rows: Vec<u32> = rows_with_score.iter().map(|&(r, _, _)| r as u32).collect();
-                let scores: Vec<f32> = rows_with_score.iter().map(|&(_, s, _)| s).collect();
-                let row_positions: Vec<u64> =
-                    rows_with_score.iter().map(|&(_, _, pos)| pos).collect();
-
-                let indices = UInt32Array::from(rows);
-
-                let mut columns: Vec<Arc<dyn arrow_array::Array>> = stored
-                    .data
-                    .columns()
-                    .iter()
-                    .map(|col| arrow_select::take::take(col.as_ref(), &indices, None).unwrap())
-                    .collect();
-
-                // Add score column
-                columns.push(Arc::new(Float32Array::from(scores)));
-
-                // Apply projection if needed (excluding score column which is always included)
-                let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
-                    // Always include score as last column
-                    projected.push(columns.last().unwrap().clone());
-                    projected
-                } else {
-                    columns
-                };
-
-                // Add _rowid column if requested
-                if self.with_row_id {
-                    final_columns.push(Arc::new(UInt64Array::from(row_positions)));
-                }
-
-                let batch = RecordBatch::try_new(self.output_schema.clone(), final_columns)?;
-                all_batches.push(batch);
-            }
-        }
-
-        Ok(all_batches)
     }
 
     /// Materialize rows from batch store preserving input order (for sorted results).
@@ -475,7 +411,7 @@ impl ExecutionPlan for FtsIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

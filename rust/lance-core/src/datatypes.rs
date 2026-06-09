@@ -18,7 +18,8 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
+    BlobVersion, Encoding, Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+    LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
@@ -68,6 +69,26 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
+
+/// Blob v2 user-view struct fields used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+/// Blob v2 user-view struct type used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_USER_FIELDS.clone()));
 
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
@@ -123,6 +144,17 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
     }
 }
 
+fn is_supported_fixed_size_list_child(data_type: &DataType, nested: bool) -> bool {
+    match data_type {
+        DataType::Struct(_) => !nested,
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => false,
+        DataType::FixedSizeList(field, _) => {
+            is_supported_fixed_size_list_child(field.data_type(), true)
+        }
+        _ => true,
+    }
+}
+
 fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
     match unit {
         "s" => Ok(TimeUnit::Second),
@@ -153,8 +185,8 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float64 => "double".to_string(),
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
-            DataType::Utf8 => "string".to_string(),
-            DataType::Binary => "binary".to_string(),
+            DataType::Utf8 | DataType::Utf8View => "string".to_string(),
+            DataType::Binary | DataType::BinaryView => "binary".to_string(),
             DataType::LargeUtf8 => "large_string".to_string(),
             DataType::LargeBinary => "large_binary".to_string(),
             DataType::Date32 => "date32:day".to_string(),
@@ -192,6 +224,8 @@ impl TryFrom<&DataType> for LogicalType {
                     // Don't want to directly use `bfloat16`, in case a built-in type is added
                     // that isn't identical to our extension type.
                     format!("fixed_size_list:lance.bfloat16:{}", *len)
+                } else if !is_supported_fixed_size_list_child(field.data_type(), false) {
+                    return Err(Error::schema(format!("Unsupported data type: {:?}", dt)));
                 } else {
                     format!(
                         "fixed_size_list:{}:{}",

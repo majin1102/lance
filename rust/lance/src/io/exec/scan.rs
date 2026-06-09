@@ -27,6 +27,7 @@ use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
@@ -274,33 +275,42 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
+                let config = config_for_stream.clone();
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
                 > = tokio::spawn(
                     (async move {
+                        let mut frag_config = FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version);
+                        if let Some(file_reader_options) = config.file_reader_options {
+                            frag_config = frag_config.with_file_reader_options(file_reader_options);
+                        }
                         let reader = open_file(
                             file_fragment.fragment,
                             project_schema,
-                            FragReadConfig::default()
-                                .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address)
-                                .with_row_last_updated_at_version(
-                                    config.with_row_last_updated_at_version,
-                                )
-                                .with_row_created_at_version(config.with_row_created_at_version),
+                            frag_config,
                             config.with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
                         .await?;
                         let batch_stream = if let Some(range) = file_fragment.range {
-                            reader.read_range(range, config.batch_size as u32)?.boxed()
+                            reader
+                                .read_range(range, config.batch_size as u32)
+                                .await?
+                                .boxed()
                         } else {
-                            reader.read_all(config.batch_size as u32)?.boxed()
+                            reader.read_all(config.batch_size as u32).await?.boxed()
                         };
                         let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
                             batch_stream
@@ -332,7 +342,11 @@ impl LanceStream {
             // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
-            .try_buffered(get_num_compute_intensive_cpus())
+            .try_buffered(
+                get_num_compute_intensive_cpus()
+                    .min(config.parallelism_cap.unwrap_or(usize::MAX))
+                    .max(1),
+            )
             .stream_in_current_span()
             .boxed();
 
@@ -361,9 +375,13 @@ impl LanceStream {
         let fragment_readahead = config
             .fragment_readahead
             .unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD);
+        let batch_readahead = config
+            .batch_readahead
+            .min(config.parallelism_cap.unwrap_or(usize::MAX))
+            .max(1);
         debug!(
             "Scanning v1 dataset with frag_readahead={} and batch_readahead={}",
-            fragment_readahead, config.batch_readahead
+            fragment_readahead, batch_readahead
         );
 
         let file_fragments = fragments
@@ -389,19 +407,18 @@ impl LanceStream {
                     ))
                 })
                 .try_buffered(fragment_readahead);
-            let tasks = readers.and_then(move |reader| {
-                std::future::ready(
-                    reader
-                        .read_all(config.batch_size as u32)
-                        .map(|task_stream| task_stream.map(Ok))
-                        .map_err(DataFusionError::from),
-                )
+            let tasks = readers.and_then(move |reader| async move {
+                reader
+                    .read_all(config.batch_size as u32)
+                    .await
+                    .map(|task_stream| task_stream.map(Ok))
+                    .map_err(DataFusionError::from)
             });
             tasks
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
-                .try_buffered(config.batch_readahead)
+                .try_buffered(batch_readahead)
                 .stream_in_current_span()
                 .boxed()
         } else {
@@ -422,20 +439,19 @@ impl LanceStream {
                     ))
                 })
                 .try_buffered(fragment_readahead);
-            let tasks = readers.and_then(move |reader| {
-                std::future::ready(
-                    reader
-                        .read_all(config.batch_size as u32)
-                        .map(|task_stream| task_stream.map(Ok))
-                        .map_err(DataFusionError::from),
-                )
+            let tasks = readers.and_then(move |reader| async move {
+                reader
+                    .read_all(config.batch_size as u32)
+                    .await
+                    .map(|task_stream| task_stream.map(Ok))
+                    .map_err(DataFusionError::from)
             });
             // When we flatten the streams (one stream per fragment), we allow
             // `fragment_readahead` stream to be read concurrently.
             tasks
                 .try_flatten_unordered(config.fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
-                .try_buffer_unordered(config.batch_readahead)
+                .try_buffer_unordered(batch_readahead)
                 .stream_in_current_span()
                 .boxed()
         };
@@ -499,6 +515,10 @@ pub struct LanceScanConfig {
     pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
+    pub file_reader_options: Option<FileReaderOptions>,
+    /// Upper bound on frag_parallelism and CPU decode concurrency. Set from
+    /// DataFusion's `target_partitions` session config in `LanceScanExec::execute`.
+    pub parallelism_cap: Option<usize>,
 }
 
 // This is mostly for testing purposes, end users are unlikely to create this
@@ -516,6 +536,8 @@ impl Default for LanceScanConfig {
             with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
+            file_reader_options: None,
+            parallelism_cap: None,
         }
     }
 }
@@ -528,7 +550,7 @@ pub struct LanceScanExec {
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -602,12 +624,12 @@ impl LanceScanExec {
         }
         let output_schema = Arc::new(output_schema);
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             fragments,
@@ -680,13 +702,17 @@ impl ExecutionPlan for LanceScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
+        context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let dataset = self.dataset.clone();
         let fragments = self.fragments.clone();
         let range = self.range.clone();
         let projection = self.projection.clone();
-        let config = self.config.clone();
+        let target_partitions = context.session_config().target_partitions();
+        let config = LanceScanConfig {
+            parallelism_cap: Some(target_partitions),
+            ..self.config.clone()
+        };
         let metrics = self.metrics.clone();
 
         let lance_fut_stream = stream::once(async move {
@@ -701,11 +727,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -724,11 +746,15 @@ impl ExecutionPlan for LanceScanExec {
 
         Ok(Statistics {
             num_rows,
-            ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+            ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -740,6 +766,9 @@ impl ExecutionPlan for LanceScanExec {
 #[cfg(test)]
 mod tests {
     use datafusion::execution::TaskContext;
+    use datafusion::prelude::SessionConfig;
+    use futures::TryStreamExt;
+    use lance_datagen::gen_batch;
 
     use crate::utils::test::NoContextTestFixture;
 
@@ -761,5 +790,48 @@ mod tests {
         );
 
         scan.execute(0, Arc::new(TaskContext::default())).unwrap();
+    }
+
+    /// Verify that executing with target_partitions=1 produces the same row count as the
+    /// default context. Regression guard for the parallelism cap.
+    #[tokio::test]
+    async fn test_target_partitions_cap_produces_correct_results() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::{Dimension, array};
+
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "v",
+                array::rand_vec::<arrow_array::types::Float32Type>(Dimension::from(4)),
+            )
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let scan = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+
+        let low_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::default().with_target_partitions(1)),
+        );
+        let stream = scan.execute(0, low_ctx).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 400);
     }
 }

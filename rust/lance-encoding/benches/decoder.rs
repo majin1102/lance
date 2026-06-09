@@ -274,7 +274,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             RecordBatch::try_new(Arc::new(new_schema.clone()), data.columns().to_vec()).unwrap();
 
         let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -291,7 +291,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::default(),
+                    LanceFileVersion::V2_2,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -300,7 +300,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
+#[cfg(target_os = "linux")]
 fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
@@ -541,6 +541,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
                                 false,
                                 false,
                                 rx,
+                                None,
                             )
                             .unwrap();
 
@@ -566,7 +567,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+        .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding, bench_decode_compressed,
                 bench_decode_compressed_parallel);

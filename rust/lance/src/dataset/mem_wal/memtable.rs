@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use lance_core::datatypes::Schema;
+use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_core::{Error, Result};
-use lance_index::scalar::bloomfilter::sbbf::Sbbf;
 use tokio::sync::RwLock;
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::index::IndexStore;
@@ -222,7 +223,14 @@ impl MemTable {
             flushed_batch_positions: HashSet::new(),
             pk_bloom_filter,
             pk_field_ids,
-            indexes: None,
+            // Initialize with an empty IndexStore so the visibility cursor has
+            // a stable Arc shared between the scanner (via `indexes_arc()`)
+            // and the WAL flush handler. Replaced via `set_indexes_arc` if
+            // index configs are supplied. Without this, the no-index path
+            // would hand out fresh empty IndexStores to scanners and the WAL
+            // flush handler, breaking cursor advance — see the regression
+            // test `test_unindexed_memtable_visibility_after_flush`.
+            indexes: Some(Arc::new(IndexStore::new())),
             frozen_at_wal_entry_position: None,
             wal_flush_completion: std::sync::Mutex::new(None),
             memtable_flush_completion: std::sync::Mutex::new(Some(memtable_flush_cell)),
@@ -309,12 +317,15 @@ impl MemTable {
             .map(|cell| cell.reader())
     }
 
-    /// Signal that the memtable flush is complete.
+    /// Signal that the memtable flush has finished, with the outcome.
     ///
-    /// Called after the memtable has been flushed to Lance storage.
-    pub fn signal_memtable_flush_complete(&self) {
+    /// Must be called whether the flush succeeded or failed — otherwise the
+    /// watch channel is dropped without a value and any awaiting watcher
+    /// (e.g. `ShardWriter::wait_for_flush_drain`) sees the closed channel
+    /// and returns `Err` instead of receiving the actual outcome.
+    pub fn signal_memtable_flush_complete(&self, result: DurabilityResult) {
         if let Some(cell) = self.memtable_flush_completion.lock().unwrap().take() {
-            cell.write(DurabilityResult::ok());
+            cell.write(result);
         }
     }
 
@@ -341,6 +352,7 @@ impl MemTable {
     /// # Single Writer Requirement
     ///
     /// This method MUST only be called from the single writer task.
+    #[instrument(name = "mt_insert", level = "debug", skip_all, fields(num_rows = batch.num_rows(), generation = self.generation))]
     pub async fn insert(&mut self, batch: RecordBatch) -> Result<usize> {
         // Validate schema compatibility
         if batch.schema() != self.schema {
@@ -423,6 +435,7 @@ impl MemTable {
     /// # Single Writer Requirement
     ///
     /// This method MUST only be called from the single writer task.
+    #[instrument(name = "mt_insert_batches", level = "debug", skip_all, fields(batch_count = batches.len(), generation = self.generation))]
     pub async fn insert_batches_only(
         &mut self,
         batches: Vec<RecordBatch>,
@@ -781,7 +794,7 @@ impl MemTable {
     ///
     /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
     ///
-    /// The scanner captures the current `max_indexed_batch_position` from the
+    /// The scanner captures the current `max_visible_batch_position` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
     /// # Panics

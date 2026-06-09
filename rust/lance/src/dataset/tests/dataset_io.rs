@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -35,15 +36,26 @@ use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
+use lance_table::format::BasePath;
+use object_store::ObjectStoreExt;
 
+use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
+use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+};
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
+
+fn file_object_store_uri(path: &std::path::Path) -> String {
+    let path = path.to_str().unwrap().replace('\\', "/");
+    let path_prefix = if path.starts_with('/') { "" } else { "/" };
+    format!("file-object-store://{path_prefix}{path}")
+}
 
 #[tokio::test]
 async fn test_truncate_table() {
@@ -107,8 +119,8 @@ async fn test_with_object_store_clone_preserves_shared_state_and_overrides_store
     let wrapped_dataset = dataset.with_object_store(wrapped_store, Some(store_params));
     assert!(Arc::ptr_eq(&dataset.session(), &wrapped_dataset.session()));
     assert!(!Arc::ptr_eq(
-        &dataset.object_store().inner,
-        &wrapped_dataset.object_store().inner
+        &dataset.object_store.as_ref().inner,
+        &wrapped_dataset.object_store.as_ref().inner
     ));
 }
 
@@ -164,6 +176,298 @@ async fn test_with_object_store_enables_isolated_per_request_io_tracking() {
     drain_scan(&dataset).await;
     assert_eq!(tracker_a.incremental_stats().read_iops, 0);
     assert_eq!(tracker_b.incremental_stats().read_iops, 0);
+}
+
+#[tokio::test]
+async fn test_with_object_store_wrappers_wraps_primary_store() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Dataset::open(uri).await.unwrap();
+
+    let tracker = Arc::new(IOTracker::default());
+    let wrapped =
+        dataset.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+
+    let _ = tracker.incremental_stats();
+    drain_scan(&wrapped).await;
+    assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_with_object_store_wrappers_wraps_base_store_params() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+
+    let base_dir = tempfile::tempdir().unwrap();
+    let base_uri = file_object_store_uri(base_dir.path());
+    let base = BasePath::new(1, base_uri, Some("base".to_string()), true);
+    dataset.add_bases(vec![base.clone()], None).await.unwrap();
+
+    let existing_tracker = Arc::new(IOTracker::default());
+    let base_store_params = ObjectStoreParams {
+        object_store_wrapper: Some(existing_tracker.clone()),
+        ..Default::default()
+    };
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_base_store_params(&base.path, base_store_params)
+        .load()
+        .await
+        .unwrap();
+
+    let request_tracker = Arc::new(IOTracker::default());
+    let wrapped = dataset
+        .with_object_store_wrappers(vec![request_tracker.clone() as Arc<dyn WrappingObjectStore>]);
+    let base_store = wrapped.object_store(Some(1)).await.unwrap();
+    let base_location = base
+        .extract_path(wrapped.session().store_registry())
+        .unwrap()
+        .join("data")
+        .join("probe.lance");
+
+    base_store.put(&base_location, b"hello").await.unwrap();
+    let _ = existing_tracker.incremental_stats();
+    let _ = request_tracker.incremental_stats();
+
+    base_store
+        .inner
+        .get_range(&base_location, 0..1)
+        .await
+        .unwrap();
+
+    assert!(existing_tracker.incremental_stats().read_iops > 0);
+    assert!(request_tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_with_object_store_wrappers_wraps_refs_store() {
+    let test_dir = tempfile::tempdir().unwrap();
+    let uri = file_object_store_uri(test_dir.path());
+    let batch = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(2))
+        .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        &uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .tags()
+        .create("v1", dataset.manifest().version)
+        .await
+        .unwrap();
+
+    let tracker = Arc::new(IOTracker::default());
+    let wrapped =
+        dataset.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+
+    let _ = tracker.incremental_stats();
+    wrapped.tags().get("v1").await.unwrap();
+    assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_create_data_file_uses_base_object_store() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let primary_uri = file_object_store_uri(primary_dir.path());
+    let source_uri = file_object_store_uri(source_dir.path());
+
+    let source_batch = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(8))
+        .unwrap();
+    let source = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(source_batch.clone())], source_batch.schema()),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let primary = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch.clone())], source_batch.schema()),
+            &primary_uri,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let base = BasePath::new(1, source_uri.clone(), Some("source".to_string()), true);
+    primary.add_bases(vec![base.clone()], None).await.unwrap();
+
+    let tracker = Arc::new(IOTracker::default());
+    let dataset = DatasetBuilder::from_uri(&primary_uri)
+        .with_base_store_params(
+            &base.path,
+            ObjectStoreParams {
+                object_store_wrapper: Some(tracker.clone()),
+                ..Default::default()
+            },
+        )
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let source_file = &source.manifest().fragments[0].files[0];
+
+    let _ = tracker.incremental_stats();
+    let data_file = dataset
+        .create_data_file(&source_file.path, Some(base.id))
+        .await
+        .unwrap();
+
+    assert_eq!(data_file.base_id, Some(base.id));
+    assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_shallow_clone_base_artifacts_use_base_object_store() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let batch = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    let mut source = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    source.delete("id < 4").await.unwrap();
+    source
+        .tags()
+        .create("with_artifacts", source.version().version)
+        .await
+        .unwrap();
+
+    let cloned = source
+        .shallow_clone(&clone_uri, "with_artifacts", None)
+        .await
+        .unwrap();
+    let base = cloned
+        .manifest()
+        .base_paths
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let tracker = Arc::new(IOTracker::default());
+    let cloned = DatasetBuilder::from_uri(&clone_uri)
+        .with_base_store_params(
+            &base.path,
+            ObjectStoreParams {
+                object_store_wrapper: Some(tracker.clone()),
+                ..Default::default()
+            },
+        )
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+
+    let fragment = cloned
+        .get_fragments()
+        .into_iter()
+        .find(|fragment| fragment.metadata.deletion_file.is_some())
+        .unwrap();
+    assert_eq!(
+        fragment.metadata.deletion_file.as_ref().unwrap().base_id,
+        Some(base.id)
+    );
+
+    let _ = tracker.incremental_stats();
+    fragment.get_deletion_vector().await.unwrap().unwrap();
+    assert!(tracker.incremental_stats().read_iops > 0);
+
+    let indices = cloned.load_indices().await.unwrap();
+    assert_eq!(indices[0].base_id, Some(base.id));
+
+    let _ = tracker.incremental_stats();
+    cloned.index_statistics("id_idx").await.unwrap();
+    assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn test_object_store_uses_runtime_base_store_params() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+
+    let base_a = BasePath::new(
+        1,
+        "az://container/path-a".to_string(),
+        Some("base-a".to_string()),
+        true,
+    );
+    let base_b = BasePath::new(
+        2,
+        "az://container/path-b".to_string(),
+        Some("base-b".to_string()),
+        true,
+    );
+    dataset
+        .add_bases(vec![base_a.clone(), base_b.clone()], None)
+        .await
+        .unwrap();
+
+    let base_a_store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("account_name".to_string(), "account-a".to_string()),
+                ("account_key".to_string(), "dGVzdA==".to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
+    let default_store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("account_name".to_string(), "account-b".to_string()),
+                ("account_key".to_string(), "dGVzdA==".to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
+
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_store_params(default_store_params)
+        .with_base_store_params(&base_a.path, base_a_store_params)
+        .load()
+        .await
+        .unwrap();
+
+    let store_a = dataset.object_store(Some(1)).await.unwrap();
+    let store_a_again = dataset.object_store(Some(1)).await.unwrap();
+    let store_b = dataset.object_store(Some(2)).await.unwrap();
+
+    assert!(Arc::ptr_eq(&store_a, &store_a_again));
+    assert!(!Arc::ptr_eq(&store_a, &store_b));
+    assert_eq!(store_a.store_prefix, "az$container@account-a");
+    assert_eq!(store_b.store_prefix, "az$container@account-b");
 }
 
 #[rstest]
@@ -380,7 +684,7 @@ async fn test_load_manifest_iops() {
     .await
     .unwrap();
 
-    let _ = _original_ds.object_store().io_stats_incremental(); //reset
+    let _ = _original_ds.object_store.as_ref().io_stats_incremental(); //reset
 
     let _dataset = DatasetBuilder::from_uri("memory://test")
         .with_session(session)
@@ -392,7 +696,7 @@ async fn test_load_manifest_iops() {
     // 1. List _versions directory to get the latest manifest location
     // 2. Read the manifest file. (The manifest is small enough to be read in one go.
     //    Larger manifests would result in more IOPS.)
-    let io_stats = _dataset.object_store().io_stats_incremental();
+    let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 2);
 }
 
@@ -491,10 +795,10 @@ async fn test_write_manifest(
 
     // Check it has no flags
     let manifest = read_manifest(
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         &dataset
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store())
+            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
             .await
             .unwrap()
             .path,
@@ -515,10 +819,10 @@ async fn test_write_manifest(
 
     // Check it set the flag
     let mut manifest = read_manifest(
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         &dataset
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store())
+            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
             .await
             .unwrap()
             .path,
@@ -540,7 +844,7 @@ async fn test_write_manifest(
     manifest.reader_feature_flags |= FLAG_UNKNOWN;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         dataset.commit_handler.as_ref(),
         &dataset.base,
         &mut manifest,
@@ -749,7 +1053,7 @@ async fn test_deep_clone(
     assert!(cloned_dataset.manifest().base_paths.is_empty());
 
     // Validate internal file counts are equal between source and cloned datasets
-    let store = branch.object_store();
+    let store = branch.object_store.as_ref();
     let src_root = dataset.base.clone();
     let branch_root = branch.base.clone();
     let dst_root = cloned_dataset.base.clone();
@@ -801,7 +1105,7 @@ async fn test_deep_clone(
         .deep_clone(cloned_ds, ("branch", original_version - 1), None)
         .await
         .unwrap();
-    let store = branch.object_store();
+    let store = branch.object_store.as_ref();
     let dst_root = cloned_dataset.base.clone();
 
     // Validate target dataset rows
@@ -823,7 +1127,7 @@ async fn test_deep_clone(
 // Helper: count files under a dataset directory (data/_indices/_deletions)
 async fn count_files(store: &ObjectStore, root: &Path, prefix: &str) -> usize {
     use futures::StreamExt;
-    let dir = root.child(prefix);
+    let dir = root.clone().join(prefix);
     let mut stream = store.read_dir_all(&dir, None);
     let mut count: usize = 0;
     while stream.next().await.transpose().unwrap().is_some() {
@@ -1439,6 +1743,118 @@ async fn test_fast_count_rows(
 
 #[rstest]
 #[tokio::test]
+async fn test_sample_with_fragment_ids(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    dataset.delete("i IN (1, 9)").await.unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let sampled = dataset
+        .sample(8, &projection, Some(&[0, 0, 2]))
+        .await
+        .unwrap();
+    let sampled_values = sampled
+        .column_by_name("i")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+
+    assert_eq!(sampled_values, vec![0, 2, 3, 8, 10, 11]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_with_empty_fragment_ids_rejected(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let err = dataset.sample(1, &projection, Some(&[])).await.unwrap_err();
+
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("does not accept an empty fragment_ids list")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_with_unknown_fragment_ids_rejected(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let err = dataset
+        .sample(1, &projection, Some(&[0, 999]))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("not part of the current dataset version")
+    );
+    assert!(err.to_string().contains("999"));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_bfloat16_roundtrip(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
@@ -1614,5 +2030,59 @@ async fn test_dataset_uri_roundtrips() {
     assert_eq!(
         ds2.latest_version_id().await.unwrap(),
         dataset.latest_version_id().await.unwrap()
+    );
+}
+
+/// A commit handler whose resolve_latest_location always returns an IO error.
+/// Used to verify that non-NotFound errors from resolve_latest_location are
+/// propagated as-is rather than being wrapped as DatasetNotFound.
+#[derive(Debug)]
+struct ErroringCommitHandler;
+
+#[async_trait::async_trait]
+impl lance_table::io::commit::CommitHandler for ErroringCommitHandler {
+    async fn resolve_latest_location(
+        &self,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> Result<lance_table::io::commit::ManifestLocation> {
+        Err(Error::io("simulated I/O error".to_string()))
+    }
+
+    async fn commit(
+        &self,
+        _manifest: &mut lance_table::format::Manifest,
+        _indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: lance_table::io::commit::ManifestWriter,
+        _naming_scheme: lance_table::io::commit::ManifestNamingScheme,
+        _transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<
+        lance_table::io::commit::ManifestLocation,
+        lance_table::io::commit::CommitError,
+    > {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn test_open_dataset_non_not_found_error_is_not_masked() {
+    // When resolve_latest_location returns an IO error, it should propagate
+    // as an IO error, not be wrapped as DatasetNotFound.
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let location = url::Url::parse("memory://test").unwrap();
+
+    #[allow(deprecated)]
+    let result = DatasetBuilder::from_uri("memory://test")
+        .with_object_store(store, location, Arc::new(ErroringCommitHandler))
+        .load()
+        .await;
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, Error::IO { .. }),
+        "Expected IO error but got: {:?}",
+        err,
     );
 }

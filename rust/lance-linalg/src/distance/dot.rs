@@ -63,6 +63,44 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
     T::dot(from, to)
 }
 
+/// Dot product between two f32 slices, dispatched to the widest SIMD backend
+/// available at runtime. See [`crate::distance::l2::l2_f32`] for why this is
+/// needed on top of the generic [`dot`].
+#[inline]
+pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use lance_core::utils::cpu::SimdSupport;
+        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
+            // SAFETY: guarded by the runtime AVX-512 detection above.
+            return unsafe { dot_f32_avx512(x, y) };
+        }
+    }
+    dot(x, y)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let a = _mm512_loadu_ps(x.as_ptr().add(i));
+        let b = _mm512_loadu_ps(y.as_ptr().add(i));
+        acc = _mm512_fmadd_ps(a, b, acc);
+        i += 16;
+    }
+    let mut sum = _mm512_reduce_add_ps(acc);
+    while i < n {
+        sum += x[i] * y[i];
+        i += 1;
+    }
+    sum
+}
+
 /// Negative [Dot] distance.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
@@ -75,10 +113,56 @@ pub trait Dot: Num {
     fn dot(x: &[Self], y: &[Self]) -> f32;
 }
 
+#[cfg(feature = "fp16kernels")]
+mod bf16_kernel {
+    use half::bf16;
+
+    // These are the `dot_bf16` function in bf16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
+    unsafe extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn dot_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        pub fn dot_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn dot_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+    }
+}
+
 impl Dot for bf16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        dot_scalar::<Self, f32, 32>(x, y)
+        match *SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                bf16_kernel::dot_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_support = "avx512_bf16",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512FP16 => unsafe {
+                bf16_kernel::dot_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+                bf16_kernel::dot_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                bf16_kernel::dot_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                bf16_kernel::dot_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => dot_scalar::<Self, f32, 32>(x, y),
+        }
     }
 }
 
@@ -91,7 +175,7 @@ mod kernel {
     unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
@@ -112,7 +196,7 @@ impl Dot for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
@@ -145,18 +229,51 @@ impl Dot for f32 {
 impl Dot for f64 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        dot_scalar::<Self, Self, 8>(x, y) as f32
+        dot_f64_simd(x, y)
     }
+}
+
+/// Explicit SIMD dot product for f64.
+#[inline]
+fn dot_f64_simd(x: &[f64], y: &[f64]) -> f32 {
+    use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::{FloatSimd, SIMD};
+
+    let dim = x.len();
+    let unrolled_len = dim / 8 * 8;
+
+    let mut acc8 = f64x8::zeros();
+    for i in (0..unrolled_len).step_by(8) {
+        unsafe {
+            let a = f64x8::load_unaligned(x.as_ptr().add(i));
+            let b = f64x8::load_unaligned(y.as_ptr().add(i));
+            acc8.multiply_add(a, b);
+        }
+    }
+
+    let aligned_len = dim / 4 * 4;
+    let mut acc4 = f64x4::zeros();
+    for i in (unrolled_len..aligned_len).step_by(4) {
+        unsafe {
+            let a = f64x4::load_unaligned(x.as_ptr().add(i));
+            let b = f64x4::load_unaligned(y.as_ptr().add(i));
+            acc4.multiply_add(a, b);
+        }
+    }
+
+    let tail: f64 = x[aligned_len..]
+        .iter()
+        .zip(y[aligned_len..].iter())
+        .map(|(&a, &b)| a * b)
+        .sum();
+
+    (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
 }
 
 impl Dot for u8 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        // TODO: this is not optimized for auto vectorization yet.
-        x.iter()
-            .zip(y.iter())
-            .map(|(&x_i, &y_i)| x_i as u32 * y_i as u32)
-            .sum::<u32>() as f32
+        super::dot_u8::dot_u8(x, y) as f32
     }
 }
 
@@ -251,6 +368,17 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn test_dot_f32_dispatch_matches_scalar() {
+        use approx::assert_relative_eq;
+        // Covers tail handling for lengths around the 16-lane AVX-512 stride.
+        for dim in [1usize, 7, 15, 16, 17, 31, 33, 64, 100, 1024] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 1.5).collect();
+            assert_relative_eq!(dot_f32(&x, &y), dot(&x, &y), max_relative = 1e-5);
+        }
+    }
+
+    #[test]
     fn test_dot() {
         let x: Vec<f32> = (0..20).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
@@ -304,11 +432,16 @@ mod tests {
         let k = ((2 * x.len()) - 1) as f64;
         let k_epsilon = k * T::epsilon().as_();
 
-        if k_epsilon < 1.0 {
-            (k_epsilon * dot) as f32
+        let error = if k_epsilon < 1.0 {
+            k_epsilon * dot
         } else {
-            (2.0 * T::epsilon().as_() * dot) as f32
-        }
+            2.0 * T::epsilon().as_() * dot
+        };
+
+        // Near the subnormal range the analytical error can underflow to zero,
+        // but f32 accumulation can still differ by a few subnormal ULPs.
+        let subnormal_rounding_floor = x.len() as f64 * f64::from(f32::from_bits(1));
+        error.max(subnormal_rounding_floor) as f32
     }
 
     fn do_dot_test<T: Dot + AsPrimitive<f64> + Float>(

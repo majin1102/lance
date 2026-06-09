@@ -5,7 +5,8 @@
 //!
 //! Maintains in-memory indexes that are updated synchronously with writes:
 //! - BTree: Primary key and scalar field lookups
-//! - IVF-PQ: Vector similarity search (reuses centroids and codebook from base table)
+//! - HNSW: Vector similarity search (built incrementally, queryable while
+//!   building, flushed as Lance HNSW + FLAT)
 //! - FTS: Full-text search
 //!
 //! Other index types log a warning and are skipped.
@@ -13,9 +14,10 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::type_complexity)]
 
+mod arena_skiplist;
 mod btree;
 mod fts;
-mod ivf_pq;
+mod hnsw;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,11 +28,11 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use prost::Message as _;
+use tracing::instrument;
 
 /// Row position in MemTable.
 ///
@@ -41,7 +43,7 @@ pub type RowPosition = u64;
 // Re-export public types used externally
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
-pub use ivf_pq::{IvfPqIndexConfig, IvfPqMemIndex};
+pub use hnsw::{HnswIndexConfig, HnswMemIndex};
 
 // ============================================================================
 // Index Store
@@ -50,14 +52,14 @@ pub use ivf_pq::{IvfPqIndexConfig, IvfPqMemIndex};
 /// Configuration for an index in MemWAL.
 ///
 /// Each variant contains all the configuration needed for that index type.
-/// IvfPq is boxed because it contains large IVF model and PQ codebook.
+/// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
+/// grow with future config (e.g. shard-specific tuning).
 #[derive(Debug, Clone)]
 pub enum MemIndexConfig {
     /// BTree index for scalar fields (point lookups, range queries).
     BTree(BTreeIndexConfig),
-    /// IVF-PQ index for vector similarity search.
-    /// Boxed due to large size (contains IVF centroids and PQ codebook).
-    IvfPq(Box<IvfPqIndexConfig>),
+    /// HNSW vector index built incrementally, queryable while building.
+    Hnsw(Box<HnswIndexConfig>),
     /// Full-text search index.
     Fts(FtsIndexConfig),
 }
@@ -67,7 +69,7 @@ impl MemIndexConfig {
     pub fn name(&self) -> &str {
         match self {
             Self::BTree(c) => &c.name,
-            Self::IvfPq(c) => &c.name,
+            Self::Hnsw(c) => &c.name,
             Self::Fts(c) => &c.name,
         }
     }
@@ -76,7 +78,7 @@ impl MemIndexConfig {
     pub fn field_id(&self) -> i32 {
         match self {
             Self::BTree(c) => c.field_id,
-            Self::IvfPq(c) => c.field_id,
+            Self::Hnsw(c) => c.field_id,
             Self::Fts(c) => c.field_id,
         }
     }
@@ -85,7 +87,7 @@ impl MemIndexConfig {
     pub fn column(&self) -> &str {
         match self {
             Self::BTree(c) => &c.column,
-            Self::IvfPq(c) => &c.column,
+            Self::Hnsw(c) => &c.column,
             Self::Fts(c) => &c.column,
         }
     }
@@ -123,23 +125,28 @@ impl MemIndexConfig {
         )))
     }
 
-    /// Create an IVF-PQ index config with centroids and codebook from base table.
-    pub fn ivf_pq(
-        name: String,
-        field_id: i32,
-        column: String,
-        ivf_model: IvfModel,
-        pq: ProductQuantizer,
-        distance_type: DistanceType,
-    ) -> Self {
-        Self::IvfPq(Box::new(IvfPqIndexConfig {
+    /// Create an HNSW vector index config.
+    pub fn hnsw(name: String, field_id: i32, column: String, distance_type: DistanceType) -> Self {
+        Self::Hnsw(Box::new(HnswIndexConfig::new(
             name,
             field_id,
             column,
-            ivf_model,
-            pq,
             distance_type,
-        }))
+        )))
+    }
+
+    /// Create an HNSW vector index config with explicit build parameters.
+    pub fn hnsw_with_params(
+        name: String,
+        field_id: i32,
+        column: String,
+        distance_type: DistanceType,
+        build_params: HnswBuildParams,
+    ) -> Self {
+        Self::Hnsw(Box::new(
+            HnswIndexConfig::new(name, field_id, column, distance_type)
+                .with_build_params(build_params),
+        ))
     }
 
     /// Detect index type from protobuf type_url.
@@ -183,28 +190,30 @@ impl MemIndexConfig {
 /// Indexes are keyed by index name. Each index stores its field_id for
 /// stable column-to-index resolution (column name → field_id → index).
 ///
-/// The store maintains a global `max_indexed_batch_position` watermark that
-/// tracks which batches have been indexed. All indexes are updated atomically,
-/// so queries should only see data up to this watermark for consistent results.
+/// The store also carries the MemTable's `max_visible_batch_position`
+/// watermark — the highest batch position that is durable in the WAL and
+/// therefore safe for scanners to read. Scanners snapshot this at plan
+/// construction time so every plan keys on a stable MVCC cursor.
 pub struct IndexStore {
     /// BTree indexes keyed by index name.
     btree_indexes: HashMap<String, BTreeMemIndex>,
-    /// IVF-PQ indexes keyed by index name.
-    ivf_pq_indexes: HashMap<String, IvfPqMemIndex>,
+    /// HNSW vector indexes keyed by index name.
+    hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
-    /// Maximum batch position that has been indexed across all indexes.
-    /// Updated atomically after all indexes have processed a batch.
-    max_indexed_batch_position: AtomicUsize,
+    /// Maximum batch position that is durable in the WAL and therefore
+    /// visible to scanners. Advanced unconditionally after a WAL append
+    /// succeeds; not gated on whether any indexes are configured.
+    max_visible_batch_position: AtomicUsize,
 }
 
 impl Default for IndexStore {
     fn default() -> Self {
         Self {
             btree_indexes: HashMap::new(),
-            ivf_pq_indexes: HashMap::new(),
+            hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
-            max_indexed_batch_position: AtomicUsize::new(0),
+            max_visible_batch_position: AtomicUsize::new(0),
         }
     }
 }
@@ -217,13 +226,13 @@ impl std::fmt::Debug for IndexStore {
                 &self.btree_indexes.keys().collect::<Vec<_>>(),
             )
             .field(
-                "ivf_pq_indexes",
-                &self.ivf_pq_indexes.keys().collect::<Vec<_>>(),
+                "hnsw_indexes",
+                &self.hnsw_indexes.keys().collect::<Vec<_>>(),
             )
             .field("fts_indexes", &self.fts_indexes.keys().collect::<Vec<_>>())
             .field(
-                "max_indexed_batch_position",
-                &self.max_indexed_batch_position.load(Ordering::Acquire),
+                "max_visible_batch_position",
+                &self.max_visible_batch_position.load(Ordering::Acquire),
             )
             .finish()
     }
@@ -240,12 +249,15 @@ impl IndexStore {
     /// # Arguments
     ///
     /// * `configs` - Index configurations
-    /// * `max_rows` - Maximum rows in memtable, used to calculate IVF-PQ partition capacity
-    /// * `ivf_index_partition_capacity_safety_factor` - Safety factor for partition capacity (accounts for non-uniform distribution)
+    /// * `max_rows` - Maximum vectors / rows in memtable. Used to size the
+    ///   pre-allocated HNSW graph and storage capacity.
+    /// * `max_batches` - Maximum number of write batches the HNSW storage
+    ///   can hold by reference (matches the writer's
+    ///   `ShardWriterConfig::max_memtable_batches`).
     pub fn from_configs(
         configs: &[MemIndexConfig],
         max_rows: usize,
-        ivf_index_partition_capacity_safety_factor: usize,
+        max_batches: usize,
     ) -> Result<Self> {
         let mut registry = Self::new();
 
@@ -255,24 +267,16 @@ impl IndexStore {
                     let index = BTreeMemIndex::new(c.field_id, c.column.clone());
                     registry.btree_indexes.insert(c.name.clone(), index);
                 }
-                MemIndexConfig::IvfPq(c) => {
-                    let num_partitions = c.ivf_model.num_partitions();
-                    // Calculate capacity with safety factor for non-uniform distribution.
-                    // Cap at max_rows to avoid over-allocation when num_partitions < safety_factor.
-                    let avg_per_partition = max_rows / num_partitions;
-                    let partition_capacity = (avg_per_partition
-                        * ivf_index_partition_capacity_safety_factor)
-                        .min(max_rows);
-
-                    let index = IvfPqMemIndex::with_capacity(
+                MemIndexConfig::Hnsw(c) => {
+                    let index = HnswMemIndex::with_capacity(
                         c.field_id,
                         c.column.clone(),
-                        c.ivf_model.clone(),
-                        c.pq.clone(),
                         c.distance_type,
-                        partition_capacity,
+                        c.build_params.clone(),
+                        max_rows,
+                        max_batches,
                     );
-                    registry.ivf_pq_indexes.insert(c.name.clone(), index);
+                    registry.hnsw_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Fts(c) => {
                     let index =
@@ -285,25 +289,58 @@ impl IndexStore {
         Ok(registry)
     }
 
-    /// Add a BTree/scalar index (implemented using skip-list for better concurrency).
+    /// Add a BTree/scalar index (skip-list backed). Low-level / test helper;
+    /// the production memtable path goes through [`Self::from_configs`].
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.btree_indexes
             .insert(name, BTreeMemIndex::new(field_id, column));
     }
 
-    /// Add an IVF-PQ index with centroids and codebook from base table.
-    pub fn add_ivf_pq(
+    /// Add an HNSW vector index with default build parameters.
+    pub fn add_hnsw(
         &mut self,
         name: String,
         field_id: i32,
         column: String,
-        ivf_model: IvfModel,
-        pq: ProductQuantizer,
         distance_type: DistanceType,
+        capacity: usize,
+        max_batches: usize,
     ) {
-        self.ivf_pq_indexes.insert(
+        self.hnsw_indexes.insert(
             name,
-            IvfPqMemIndex::new(field_id, column, ivf_model, pq, distance_type),
+            HnswMemIndex::with_capacity(
+                field_id,
+                column,
+                distance_type,
+                HnswBuildParams::default(),
+                capacity,
+                max_batches,
+            ),
+        );
+    }
+
+    /// Add an HNSW vector index with explicit build parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_hnsw_with_params(
+        &mut self,
+        name: String,
+        field_id: i32,
+        column: String,
+        distance_type: DistanceType,
+        build_params: HnswBuildParams,
+        capacity: usize,
+        max_batches: usize,
+    ) {
+        self.hnsw_indexes.insert(
+            name,
+            HnswMemIndex::with_capacity(
+                field_id,
+                column,
+                distance_type,
+                build_params,
+                capacity,
+                max_batches,
+            ),
         );
     }
 
@@ -331,6 +368,7 @@ impl IndexStore {
     }
 
     /// Insert a batch into all indexes with batch position tracking.
+    #[instrument(name = "idx_insert_batch", level = "debug", skip_all, fields(num_rows = batch.num_rows(), row_offset, batch_position))]
     pub fn insert_with_batch_position(
         &self,
         batch: &RecordBatch,
@@ -340,7 +378,7 @@ impl IndexStore {
         for index in self.btree_indexes.values() {
             index.insert(batch, row_offset)?;
         }
-        for index in self.ivf_pq_indexes.values() {
+        for index in self.hnsw_indexes.values() {
             index.insert(batch, row_offset)?;
         }
         for index in self.fts_indexes.values() {
@@ -349,19 +387,22 @@ impl IndexStore {
 
         // Update global watermark after all indexes have been updated
         if let Some(bp) = batch_position {
-            self.update_max_indexed_batch_position(bp);
+            self.advance_max_visible_batch_position(bp);
         }
 
         Ok(())
     }
 
-    /// Update the maximum indexed batch position.
+    /// Advance the visibility watermark to at least `batch_pos`.
     ///
-    /// Only updates if the new value is greater than the current value.
-    fn update_max_indexed_batch_position(&self, batch_pos: usize) {
-        let mut current = self.max_indexed_batch_position.load(Ordering::Acquire);
+    /// The watermark only ever moves forward (idempotent max). Public so the
+    /// WAL flush handler can advance it after a successful WAL append, which
+    /// is the authoritative durability signal regardless of whether any
+    /// indexes are configured.
+    pub fn advance_max_visible_batch_position(&self, batch_pos: usize) {
+        let mut current = self.max_visible_batch_position.load(Ordering::Acquire);
         while batch_pos > current {
-            match self.max_indexed_batch_position.compare_exchange_weak(
+            match self.max_visible_batch_position.compare_exchange_weak(
                 current,
                 batch_pos,
                 Ordering::Release,
@@ -374,10 +415,7 @@ impl IndexStore {
     }
 
     /// Insert multiple batches into all indexes with cross-batch optimization.
-    ///
-    /// For IVF-PQ indexes, this enables vectorized partition assignment and
-    /// PQ encoding across all batches, improving performance through better
-    /// SIMD utilization.
+    #[instrument(name = "idx_insert_batches", level = "debug", skip_all, fields(batch_count = batches.len()))]
     pub fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
         if batches.is_empty() {
             return Ok(());
@@ -390,8 +428,8 @@ impl IndexStore {
             }
         }
 
-        // IVF-PQ indexes: use batched insert for vectorization
-        for index in self.ivf_pq_indexes.values() {
+        // HNSW indexes: use batched insert
+        for index in self.hnsw_indexes.values() {
             index.insert_batches(batches)?;
         }
 
@@ -404,7 +442,7 @@ impl IndexStore {
 
         // Update global watermark to the max batch position
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-        self.update_max_indexed_batch_position(max_bp);
+        self.advance_max_visible_batch_position(max_bp);
 
         Ok(())
     }
@@ -419,6 +457,7 @@ impl IndexStore {
     ///
     /// Returns a map of index names to their update durations for performance tracking.
     #[allow(clippy::print_stderr)]
+    #[instrument(name = "idx_insert_batches_parallel", level = "debug", skip_all, fields(batch_count = batches.len()))]
     pub fn insert_batches_parallel(
         &self,
         batches: &[StoredBatch],
@@ -453,14 +492,14 @@ impl IndexStore {
                 handles.push((name.as_str(), "btree", handle));
             }
 
-            // Spawn a thread for each IVF-PQ index
-            for (name, index) in &self.ivf_pq_indexes {
+            // Spawn a thread for each HNSW index
+            for (name, index) in &self.hnsw_indexes {
                 let handle = scope.spawn(move || -> (std::time::Duration, Result<()>) {
                     let start = Instant::now();
                     let result = index.insert_batches(batches);
                     (start.elapsed(), result)
                 });
-                handles.push((name.as_str(), "ivfpq", handle));
+                handles.push((name.as_str(), "hnsw", handle));
             }
 
             // Spawn a thread for each FTS index
@@ -478,17 +517,19 @@ impl IndexStore {
                 handles.push((name.as_str(), "fts", handle));
             }
 
-            // Collect results, log timing, and check for errors
+            // Collect results, log timing, and check for errors. Keep the raw
+            // `Duration` so sub-millisecond timings (the steady-state case for
+            // BTree updates) are preserved instead of getting truncated to 0.
             let mut first_error: Option<Error> = None;
-            let mut timings: Vec<(&str, &str, u128)> = Vec::new();
+            let mut timings: Vec<(&str, &str, std::time::Duration)> = Vec::new();
 
             for (name, idx_type, handle) in handles {
                 match handle.join() {
                     Ok((duration, Ok(()))) => {
-                        timings.push((name, idx_type, duration.as_millis()));
+                        timings.push((name, idx_type, duration));
                     }
                     Ok((duration, Err(e))) => {
-                        timings.push((name, idx_type, duration.as_millis()));
+                        timings.push((name, idx_type, duration));
                         if first_error.is_none() {
                             first_error = Some(e);
                         }
@@ -506,20 +547,14 @@ impl IndexStore {
                 return Err(e);
             }
 
-            // Convert timings to HashMap<String, Duration>
             let duration_map: std::collections::HashMap<String, std::time::Duration> = timings
                 .into_iter()
-                .map(|(name, _idx_type, ms)| {
-                    (
-                        name.to_string(),
-                        std::time::Duration::from_millis(ms as u64),
-                    )
-                })
+                .map(|(name, _idx_type, duration)| (name.to_string(), duration))
                 .collect();
 
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-            self.update_max_indexed_batch_position(max_bp);
+            self.advance_max_visible_batch_position(max_bp);
 
             Ok(duration_map)
         })
@@ -530,9 +565,9 @@ impl IndexStore {
         self.btree_indexes.get(name)
     }
 
-    /// Get an IVF-PQ index by name.
-    pub fn get_ivf_pq(&self, name: &str) -> Option<&IvfPqMemIndex> {
-        self.ivf_pq_indexes.get(name)
+    /// Get an HNSW vector index by name.
+    pub fn get_hnsw(&self, name: &str) -> Option<&HnswMemIndex> {
+        self.hnsw_indexes.get(name)
     }
 
     /// Get an FTS index by name.
@@ -550,12 +585,9 @@ impl IndexStore {
             .find(|idx| idx.field_id() == field_id)
     }
 
-    /// Get an IVF-PQ index by field ID.
-    ///
-    /// Searches through all IVF-PQ indexes to find one matching the field_id.
-    /// Use this for column-to-index resolution (column → field_id → index).
-    pub fn get_ivf_pq_by_field_id(&self, field_id: i32) -> Option<&IvfPqMemIndex> {
-        self.ivf_pq_indexes
+    /// Get an HNSW vector index by field ID.
+    pub fn get_hnsw_by_field_id(&self, field_id: i32) -> Option<&HnswMemIndex> {
+        self.hnsw_indexes
             .values()
             .find(|idx| idx.field_id() == field_id)
     }
@@ -577,9 +609,9 @@ impl IndexStore {
             .find(|idx| idx.column_name() == column)
     }
 
-    /// Get an IVF-PQ index by column name.
-    pub fn get_ivf_pq_by_column(&self, column: &str) -> Option<&IvfPqMemIndex> {
-        self.ivf_pq_indexes
+    /// Get an HNSW vector index by column name.
+    pub fn get_hnsw_by_column(&self, column: &str) -> Option<&HnswMemIndex> {
+        self.hnsw_indexes
             .values()
             .find(|idx| idx.column_name() == column)
     }
@@ -593,25 +625,23 @@ impl IndexStore {
 
     /// Check if the registry has any indexes.
     pub fn is_empty(&self) -> bool {
-        self.btree_indexes.is_empty()
-            && self.ivf_pq_indexes.is_empty()
-            && self.fts_indexes.is_empty()
+        self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
     }
 
     /// Get the total number of indexes.
     pub fn len(&self) -> usize {
-        self.btree_indexes.len() + self.ivf_pq_indexes.len() + self.fts_indexes.len()
+        self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
     }
 
-    /// Get the global maximum indexed batch position.
+    /// Get the visibility watermark (max batch position safe to read).
     ///
-    /// Returns the batch position up to which all data has been indexed.
-    /// Queries should use `min(max_visible_batch_position, max_indexed_batch_position)`
-    /// as their effective visibility to ensure consistent results.
+    /// Returns the highest batch position whose data is durable in the WAL
+    /// and therefore visible to scanners. Scanners snapshot this at plan
+    /// construction time so every plan runs against a stable cursor.
     ///
-    /// Returns 0 if no data has been indexed yet.
-    pub fn max_indexed_batch_position(&self) -> usize {
-        self.max_indexed_batch_position.load(Ordering::Acquire)
+    /// Returns 0 before any WAL flush has advanced the watermark.
+    pub fn max_visible_batch_position(&self) -> usize {
+        self.max_visible_batch_position.load(Ordering::Acquire)
     }
 }
 
@@ -627,12 +657,12 @@ mod tests {
     fn check_index_type_supported(index_type: &str) -> bool {
         match index_type.to_lowercase().as_str() {
             "btree" | "scalar" => true,
-            "ivf_pq" | "ivf-pq" | "ivfpq" | "vector" => true,
+            "hnsw" | "vector" => true,
             "fts" | "inverted" | "fulltext" => true,
             _ => {
                 warn!(
                     "Index type '{}' is not supported for MemWAL. \
-                     Supported types: btree, ivf_pq, fts. Skipping.",
+                     Supported types: btree, hnsw, fts. Skipping.",
                     index_type
                 );
                 false
@@ -689,7 +719,8 @@ mod tests {
     fn test_check_index_type_supported() {
         assert!(check_index_type_supported("btree"));
         assert!(check_index_type_supported("BTree"));
-        assert!(check_index_type_supported("ivf_pq"));
+        assert!(check_index_type_supported("hnsw"));
+        assert!(check_index_type_supported("vector"));
         assert!(check_index_type_supported("fts"));
         assert!(check_index_type_supported("inverted"));
 
@@ -711,7 +742,7 @@ mod tests {
             )),
         ];
 
-        let registry = IndexStore::from_configs(&configs, 100_000, 8).unwrap();
+        let registry = IndexStore::from_configs(&configs, 100_000, 1_000).unwrap();
         assert_eq!(registry.len(), 2);
         assert!(registry.get_btree("pk_idx").is_some());
         assert!(registry.get_fts("search_idx").is_some());
@@ -721,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_store_max_indexed_batch_position() {
+    fn test_index_store_max_visible_batch_position() {
         let schema = create_test_schema();
         let mut registry = IndexStore::new();
 
@@ -730,7 +761,7 @@ mod tests {
         registry.add_fts("desc_idx".to_string(), 2, "description".to_string());
 
         // Initial watermark should be 0 (no data indexed yet)
-        assert_eq!(registry.max_indexed_batch_position(), 0);
+        assert_eq!(registry.max_visible_batch_position(), 0);
 
         // Insert with batch position tracking
         let batch = create_test_batch(&schema, 0);
@@ -739,7 +770,7 @@ mod tests {
             .unwrap();
 
         // Now watermark should be 5
-        assert_eq!(registry.max_indexed_batch_position(), 5);
+        assert_eq!(registry.max_visible_batch_position(), 5);
 
         // Insert with higher batch position
         registry
@@ -747,11 +778,11 @@ mod tests {
             .unwrap();
 
         // Watermark should advance to 10
-        assert_eq!(registry.max_indexed_batch_position(), 10);
+        assert_eq!(registry.max_visible_batch_position(), 10);
 
         // Insert without batch position shouldn't change watermark
         registry.insert(&batch, 6).unwrap();
-        assert_eq!(registry.max_indexed_batch_position(), 10);
+        assert_eq!(registry.max_visible_batch_position(), 10);
     }
 
     #[test]

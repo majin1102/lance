@@ -33,7 +33,7 @@ use crate::schema::logical_arrow_schema;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
-#[pyclass(name = "_Scanner", module = "_lib")]
+#[pyclass(name = "_Scanner", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct Scanner {
     scanner: Arc<LanceScanner>,
@@ -49,7 +49,7 @@ impl Scanner {
     }
 }
 
-#[pyclass(name = "ScanStatistics", module = "_lib", get_all)]
+#[pyclass(name = "ScanStatistics", module = "_lib", get_all, skip_from_py_object)]
 #[derive(Clone)]
 /// Statistics about the scan.
 pub struct ScanStatistics {
@@ -125,14 +125,17 @@ impl Scanner {
         Ok(res)
     }
 
-    #[pyo3(signature = (*))]
-    fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
+    #[pyo3(signature = (*, count_rows = false))]
+    fn analyze_plan(self_: PyRef<'_, Self>, count_rows: bool) -> PyResult<String> {
         let scanner = self_.scanner.clone();
         let res = rt()
-            .spawn(
-                Some(self_.py()),
-                async move { scanner.analyze_plan().await },
-            )?
+            .spawn(Some(self_.py()), async move {
+                if count_rows {
+                    scanner.analyze_count_plan().await
+                } else {
+                    scanner.analyze_plan().await
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(res)

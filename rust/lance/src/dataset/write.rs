@@ -52,8 +52,9 @@ pub mod merge_insert;
 mod retry;
 pub mod update;
 
-pub use commit::CommitBuilder;
-pub use delete::{DeleteBuilder, DeleteResult};
+pub use super::progress::{WriteProgressFn, WriteStats};
+pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
+pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
@@ -132,6 +133,43 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
+/// The strategy for handling external blob URIs on write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExternalBlobMode {
+    /// Store the URI as an external blob reference.
+    #[default]
+    Reference,
+    /// Read the external bytes during write and store them in Lance-managed storage.
+    Ingest,
+}
+
+impl TryFrom<&str> for ExternalBlobMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            "reference" => Ok(Self::Reference),
+            "ingest" => Ok(Self::Ingest),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid external blob mode: {}",
+                value
+            ))),
+        }
+    }
+}
+
+fn validate_external_blob_write_params(params: &WriteParams) -> Result<()> {
+    if params.external_blob_mode == ExternalBlobMode::Ingest
+        && params.allow_external_blob_outside_bases
+    {
+        return Err(Error::invalid_input(
+            "allow_external_blob_outside_bases only applies when external_blob_mode=\"reference\"",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Auto cleanup parameters
 #[derive(Debug, Clone)]
 pub struct AutoCleanupParams {
@@ -175,7 +213,16 @@ pub struct WriteParams {
 
     pub store_params: Option<ObjectStoreParams>,
 
+    pub base_store_params: Option<HashMap<String, ObjectStoreParams>>,
+
     pub progress: Arc<dyn WriteFragmentProgress>,
+
+    /// Optional callback invoked after each batch is written.
+    ///
+    /// Receives cumulative [`WriteStats`] so callers can render a progress bar
+    /// or compute throughput. The callback must be cheap and non-blocking;
+    /// spawn a task if you need async work.
+    pub write_progress: Option<WriteProgressFn>,
 
     /// If present, dataset will use this to update the latest version
     ///
@@ -210,11 +257,19 @@ pub struct WriteParams {
     pub session: Option<Arc<Session>>,
 
     /// If Some and this is a new dataset, old dataset versions will be
-    /// automatically cleaned up according to the parameters set out in
-    /// [`AutoCleanupParams`]. This parameter has no effect on existing datasets.
-    /// To add auto-cleanup to an existing dataset, use [`Dataset::update_config`]
-    /// to set `lance.auto_cleanup.interval` and `lance.auto_cleanup.older_than`.
-    /// Both parameters must be set to invoke auto-cleanup.
+    /// automatically cleaned up after commits according to the parameters set
+    /// out in [`AutoCleanupParams`]. This parameter has no effect on existing
+    /// datasets. To add auto-cleanup to an existing dataset, use
+    /// [`Dataset::update_config`] to set `lance.auto_cleanup.interval` and
+    /// `lance.auto_cleanup.older_than`. Both parameters must be set to invoke
+    /// auto-cleanup.
+    ///
+    /// Defaults to `None` (auto-cleanup disabled). Enabling it makes every
+    /// `interval`-th commit run a full cleanup pass, which lists and reads every
+    /// manifest in the dataset even when nothing is old enough to delete; on
+    /// object stores this adds noticeable per-commit latency that grows with the
+    /// version count. Prefer calling [`Dataset::cleanup_old_versions`] explicitly
+    /// when you actually need to reclaim space.
     pub auto_cleanup: Option<AutoCleanupParams>,
 
     /// If true, skip auto cleanup during commits. This should be set to true
@@ -250,6 +305,14 @@ pub struct WriteParams {
     /// Allow writing external blob URIs that cannot be mapped to any registered
     /// non-dataset-root base path. When disabled, such rows are rejected.
     pub allow_external_blob_outside_bases: bool,
+
+    /// The strategy used when writing external blob URIs.
+    pub external_blob_mode: ExternalBlobMode,
+
+    /// Maximum size in bytes for blob v2 pack (.blob) sidecar files.
+    /// When a pack file reaches this size, a new one is started.
+    /// If not set, defaults to 1 GiB.
+    pub blob_pack_file_size_threshold: Option<usize>,
 }
 
 impl Default for WriteParams {
@@ -262,19 +325,23 @@ impl Default for WriteParams {
             max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
             mode: WriteMode::Create,
             store_params: None,
+            base_store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            write_progress: None,
             commit_handler: None,
             data_storage_version: None,
             enable_stable_row_ids: false,
             enable_v2_manifest_paths: true,
             session: None,
-            auto_cleanup: Some(AutoCleanupParams::default()),
+            auto_cleanup: None,
             skip_auto_cleanup: false,
             transaction_properties: None,
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
             allow_external_blob_outside_bases: false,
+            external_blob_mode: ExternalBlobMode::Reference,
+            blob_pack_file_size_threshold: None,
         }
     }
 }
@@ -298,6 +365,21 @@ impl WriteParams {
             .as_ref()
             .map(|s| s.store_registry())
             .unwrap_or_default()
+    }
+
+    /// Set exact runtime object store params for a registered base path.
+    ///
+    /// These params are used as-is for that base. The write-level default
+    /// `store_params` remain the fallback for bases without an explicit binding.
+    pub fn with_base_store_params(
+        mut self,
+        base_path: impl AsRef<str>,
+        store_params: ObjectStoreParams,
+    ) -> Self {
+        self.base_store_params
+            .get_or_insert_with(HashMap::new)
+            .insert(base_path.as_ref().to_string(), store_params);
+        self
     }
 
     /// Set the properties for this WriteParams.
@@ -361,6 +443,22 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Configure how external blob URIs are handled during writes.
+    pub fn with_external_blob_mode(self, mode: ExternalBlobMode) -> Self {
+        Self {
+            external_blob_mode: mode,
+            ..self
+        }
+    }
+
+    /// Set the maximum size in bytes for blob v2 pack (.blob) sidecar files.
+    pub fn with_blob_pack_file_size_threshold(self, max_bytes: usize) -> Self {
+        Self {
+            blob_pack_file_size_threshold: Some(max_bytes),
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -370,7 +468,7 @@ impl WriteParams {
 /// IDs can be assigned after writing is complete.
 #[deprecated(
     since = "0.20.0",
-    note = "Use [`InsertBuilder::write_uncommitted_stream`] instead"
+    note = "Use [`InsertBuilder::execute_uncommitted_stream`] instead"
 )]
 pub async fn write_fragments(
     dest: impl Into<WriteDestination<'_>>,
@@ -417,58 +515,180 @@ pub async fn do_write_fragments(
     } else {
         None
     };
+    let source_store_registry = dataset
+        .map(|ds| ds.session.store_registry())
+        .unwrap_or_else(|| params.store_registry());
+    let source_store_params = params.store_params.clone().unwrap_or_default();
 
     let writer_generator = WriterGenerator::new(
-        object_store,
+        object_store.clone(),
         base_dir,
         schema,
         storage_version,
         target_bases_info,
         external_base_resolver,
         params.allow_external_blob_outside_bases,
+        params.external_blob_mode,
+        source_store_registry,
+        source_store_params,
+        params.blob_pack_file_size_threshold,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
-    let mut fragments = Vec::new();
-    while let Some(batch_chunk) = buffered_reader.next().await {
-        let batch_chunk = batch_chunk?;
+    let mut fragments: Vec<Fragment> = Vec::new();
+    let mut bytes_completed: u64 = 0;
+    let mut rows_completed: u64 = 0;
+    let mut files_written: u32 = 0;
 
-        if writer.is_none() {
-            let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-            params.progress.begin(&new_fragment).await?;
-            writer = Some(new_writer);
-            fragments.push(new_fragment);
-        }
+    // Wrap the loop in an async block so `?` returns into `loop_result` and we
+    // can run cleanup before propagating the error.
+    let loop_result: Result<()> = async {
+        while let Some(batch_chunk) = buffered_reader.next().await {
+            let batch_chunk = batch_chunk?;
 
-        writer.as_mut().unwrap().write(&batch_chunk).await?;
-        for batch in batch_chunk {
-            num_rows_in_current_file += batch.num_rows() as u32;
-        }
+            if writer.is_none() {
+                let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+                params.progress.begin(&new_fragment).await?;
+                writer = Some(new_writer);
+                fragments.push(new_fragment);
+            }
 
-        if num_rows_in_current_file >= params.max_rows_per_file as u32
-            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
-        {
-            let (num_rows, data_file) = writer.take().unwrap().finish().await?;
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-            debug_assert_eq!(num_rows, num_rows_in_current_file);
-            params.progress.complete(fragments.last().unwrap()).await?;
-            let last_fragment = fragments.last_mut().unwrap();
-            last_fragment.physical_rows = Some(num_rows as usize);
-            last_fragment.files.push(data_file);
-            num_rows_in_current_file = 0;
+            writer.as_mut().unwrap().write(&batch_chunk).await?;
+            for batch in &batch_chunk {
+                num_rows_in_current_file += batch.num_rows() as u32;
+            }
+
+            if let Some(cb) = &params.write_progress {
+                let current_bytes = writer.as_mut().unwrap().tell().await?;
+                cb.call(WriteStats {
+                    bytes_written: bytes_completed + current_bytes,
+                    rows_written: rows_completed + num_rows_in_current_file as u64,
+                    files_written,
+                });
+            }
+
+            if num_rows_in_current_file >= params.max_rows_per_file as u32
+                || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
+            {
+                let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+                debug_assert_eq!(num_rows, num_rows_in_current_file);
+                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+                rows_completed += num_rows as u64;
+                files_written += 1;
+                let last_fragment = fragments.last_mut().unwrap();
+                last_fragment.physical_rows = Some(num_rows as usize);
+                last_fragment.files.push(data_file);
+                // Notify after pushing the data file so it's tracked for cleanup
+                // if the callback fails.
+                params.progress.complete(fragments.last().unwrap()).await?;
+                if let Some(cb) = &params.write_progress {
+                    cb.call(WriteStats {
+                        bytes_written: bytes_completed,
+                        rows_written: rows_completed,
+                        files_written,
+                    });
+                }
+                num_rows_in_current_file = 0;
+            }
         }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = loop_result {
+        // Drop the writer so its in-progress file is cleaned up (LocalWriter
+        // removes its temp file; ObjectWriter aborts the multipart upload).
+        drop(writer.take());
+        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+        return Err(e);
     }
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        let (num_rows, data_file) = writer.finish().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-        let last_fragment = fragments.last_mut().unwrap();
-        last_fragment.physical_rows = Some(num_rows as usize);
-        last_fragment.files.push(data_file);
+        match writer.finish().await {
+            Ok((num_rows, data_file)) => {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+                rows_completed += num_rows as u64;
+                files_written += 1;
+                let last_fragment = fragments.last_mut().unwrap();
+                last_fragment.physical_rows = Some(num_rows as usize);
+                last_fragment.files.push(data_file);
+                if let Some(cb) = &params.write_progress {
+                    cb.call(WriteStats {
+                        bytes_written: bytes_completed,
+                        rows_written: rows_completed,
+                        files_written,
+                    });
+                }
+            }
+            Err(e) => {
+                drop(writer);
+                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+                return Err(e);
+            }
+        }
     }
 
     Ok(fragments)
+}
+
+/// Best-effort cleanup of data files for fragments that were written but not committed.
+///
+/// Contract:
+/// - Errors from individual `delete` calls are logged and swallowed, never returned —
+///   callers should propagate the original write error.
+/// - Only files in the dataset's default storage (`base_id == None`) are deleted;
+///   files in external bases are skipped because we don't have their object stores here.
+/// - Safe to call with an empty slice.
+/// - Must be called before the fragments are committed, otherwise live data may be deleted.
+pub(crate) async fn cleanup_data_fragments(
+    object_store: &ObjectStore,
+    base_dir: &Path,
+    fragments: &[Fragment],
+) {
+    let data_dir = base_dir.clone().join(DATA_DIR);
+    let mut skipped_external = 0usize;
+    for fragment in fragments {
+        for file in &fragment.files {
+            if file.base_id.is_none() {
+                let path = data_dir.clone().join(file.path.as_str());
+                if let Err(e) = object_store.delete(&path).await {
+                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+                }
+
+                // Clean up any blob v2 sidecars that might exist for this data file.
+                // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
+                // The `data_file_key` is the file stem of the .lance file.
+                if let Some(stem) = std::path::Path::new(file.path.as_str())
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                {
+                    let blob_dir = data_dir.clone().join(stem);
+                    match object_store.remove_dir_all(blob_dir.clone()).await {
+                        Err(e) if !matches!(e, Error::NotFound { .. }) => {
+                            log::warn!(
+                                "Failed to clean up orphaned blob dir '{}': {}",
+                                blob_dir,
+                                e
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                skipped_external += 1;
+            }
+        }
+    }
+    if skipped_external > 0 {
+        log::warn!(
+            "Skipped cleanup of {} orphaned data file(s) in external bases: \
+             cleanup not supported for external bases",
+            skipped_external
+        );
+    }
 }
 
 pub async fn validate_and_resolve_target_bases(
@@ -537,7 +757,6 @@ pub async fn validate_and_resolve_target_bases(
         .unwrap_or_default();
 
     if let Some(target_bases) = &target_base_ids {
-        let store_params = params.store_params.clone().unwrap_or_default();
         let mut bases_info = Vec::new();
 
         for &target_base_id in target_bases {
@@ -548,6 +767,7 @@ pub async fn validate_and_resolve_target_bases(
                 ))
             })?;
 
+            let store_params = write_store_params_for_base(params, &base_path.path);
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -573,6 +793,7 @@ fn append_external_base_candidate(
     base_path: &BasePath,
     store_prefix: String,
     extracted_path: Path,
+    store_params: ObjectStoreParams,
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
 ) {
@@ -584,29 +805,50 @@ fn append_external_base_candidate(
             base_id: base_path.id,
             store_prefix,
             base_path: extracted_path,
+            store_params,
         });
     }
+}
+
+fn write_store_params_for_base(params: &WriteParams, base_path: &str) -> ObjectStoreParams {
+    params
+        .base_store_params
+        .as_ref()
+        .and_then(|base_store_params| base_store_params.get(base_path))
+        .cloned()
+        .unwrap_or_else(|| params.store_params.clone().unwrap_or_default())
+}
+
+fn dataset_store_params_for_base(dataset: &Dataset, base_path: &str) -> ObjectStoreParams {
+    dataset
+        .base_store_params
+        .as_ref()
+        .and_then(|base_store_params| base_store_params.get(base_path))
+        .cloned()
+        .unwrap_or_else(|| dataset.store_params.as_deref().cloned().unwrap_or_default())
 }
 
 async fn append_external_initial_bases(
     initial_bases: Option<&Vec<BasePath>>,
     store_registry: Arc<ObjectStoreRegistry>,
-    store_params: &ObjectStoreParams,
+    params: &WriteParams,
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
 ) -> Result<()> {
     if let Some(initial_bases) = initial_bases {
         for base_path in initial_bases {
+            let store_params = write_store_params_for_base(params, &base_path.path);
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
-                store_params,
+                &store_params,
             )
             .await?;
             append_external_base_candidate(
                 base_path,
                 store.store_prefix.clone(),
                 extracted_path,
+                store_params,
                 candidates,
                 seen_base_ids,
             );
@@ -622,13 +864,13 @@ async fn build_external_base_resolver(
     let store_registry = dataset
         .map(|ds| ds.session.store_registry())
         .unwrap_or_else(|| params.store_registry());
-    let store_params = params.store_params.clone().unwrap_or_default();
 
     let mut seen_base_ids = HashSet::new();
     let mut candidates = vec![];
 
     if let Some(dataset) = dataset {
         for base_path in dataset.manifest.base_paths.values() {
+            let store_params = dataset_store_params_for_base(dataset, &base_path.path);
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -639,6 +881,7 @@ async fn build_external_base_resolver(
                 base_path,
                 store.store_prefix.clone(),
                 extracted_path,
+                store_params,
                 &mut candidates,
                 &mut seen_base_ids,
             );
@@ -648,17 +891,13 @@ async fn build_external_base_resolver(
     append_external_initial_bases(
         params.initial_bases.as_ref(),
         store_registry.clone(),
-        &store_params,
+        params,
         &mut candidates,
         &mut seen_base_ids,
     )
     .await?;
 
-    Ok(ExternalBaseResolver::new(
-        candidates,
-        store_registry,
-        store_params,
-    ))
+    Ok(ExternalBaseResolver::new(candidates, store_registry))
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -696,6 +935,7 @@ pub async fn write_fragments_internal(
 
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+    validate_external_blob_write_params(&params)?;
 
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
@@ -811,9 +1051,10 @@ where
         Ok(self.writer.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let num_rows = self.writer.finish().await? as u32;
         let size_bytes = self.writer.tell().await?;
         Ok((
-            self.writer.finish().await? as u32,
+            num_rows,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
@@ -866,17 +1107,17 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
-        let num_rows = self.writer.finish().await? as u32;
+        let write_summary = self.writer.finish().await?;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
-            NonZero::new(self.writer.tell().await?),
+            NonZero::new(write_summary.size_bytes),
             self.base_id,
         );
-        Ok((num_rows, data_file))
+        Ok((write_summary.num_rows as u32, data_file))
     }
 }
 
@@ -905,6 +1146,10 @@ struct WriterOptions {
     base_id: Option<u32>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
+    blob_pack_file_size_threshold: Option<usize>,
 }
 
 async fn open_writer_with_options(
@@ -919,18 +1164,22 @@ async fn open_writer_with_options(
         base_id,
         external_base_resolver,
         allow_external_blob_outside_bases,
+        external_blob_mode,
+        source_store_registry,
+        source_store_params,
+        blob_pack_file_size_threshold,
     } = options;
 
     let data_file_key = generate_random_filename();
     let filename = format!("{}.lance", data_file_key);
 
     let data_dir = if add_data_dir {
-        base_dir.child(DATA_DIR)
+        base_dir.clone().join(DATA_DIR)
     } else {
         base_dir.clone()
     };
 
-    let full_path = data_dir.child(filename.as_str());
+    let full_path = data_dir.clone().join(filename.as_str());
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
@@ -963,6 +1212,10 @@ async fn open_writer_with_options(
                 schema,
                 external_base_resolver,
                 allow_external_blob_outside_bases,
+                external_blob_mode,
+                source_store_registry,
+                source_store_params,
+                blob_pack_file_size_threshold,
             ))
         } else {
             None
@@ -1002,11 +1255,16 @@ struct WriterGenerator {
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
+    blob_pack_file_size_threshold: Option<usize>,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
 
 impl WriterGenerator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
@@ -1015,6 +1273,10 @@ impl WriterGenerator {
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
+        external_blob_mode: ExternalBlobMode,
+        source_store_registry: Arc<ObjectStoreRegistry>,
+        source_store_params: ObjectStoreParams,
+        blob_pack_file_size_threshold: Option<usize>,
     ) -> Self {
         Self {
             object_store,
@@ -1024,6 +1286,10 @@ impl WriterGenerator {
             target_bases_info,
             external_base_resolver,
             allow_external_blob_outside_bases,
+            external_blob_mode,
+            source_store_registry,
+            source_store_params,
+            blob_pack_file_size_threshold,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1054,6 +1320,10 @@ impl WriterGenerator {
                     base_id: Some(base_info.base_id),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                    external_blob_mode: self.external_blob_mode,
+                    source_store_registry: self.source_store_registry.clone(),
+                    source_store_params: self.source_store_params.clone(),
+                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                 },
             )
             .await?
@@ -1068,6 +1338,10 @@ impl WriterGenerator {
                     base_id: None,
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                    external_blob_mode: self.external_blob_mode,
+                    source_store_registry: self.source_store_registry.clone(),
+                    source_store_params: self.source_store_params.clone(),
+                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                 },
             )
             .await?
@@ -1149,13 +1423,11 @@ async fn new_source_iter(
 
 struct SpillStreamIter {
     receiver: SpillReceiver,
-    #[allow(dead_code)] // Exists to keep the SpillSender alive
-    sender_handle: tokio::task::JoinHandle<SpillSender>,
+    _sender_handle: tokio::task::JoinHandle<SpillSender>,
     // This temp dir is used to store the spilled data. It is kept alive by
     // this struct. When this struct is dropped, the Drop implementation of
     // tempfile::TempDir will delete the temp dir.
-    #[allow(dead_code)] // Exists to keep the temp dir alive
-    tmp_dir: TempDir,
+    _tmp_dir: TempDir,
 }
 
 impl SpillStreamIter {
@@ -1199,8 +1471,8 @@ impl SpillStreamIter {
 
         Ok(Self {
             receiver,
-            tmp_dir,
-            sender_handle,
+            _tmp_dir: tmp_dir,
+            _sender_handle: sender_handle,
         })
     }
 }
@@ -1216,6 +1488,7 @@ impl Iterator for SpillStreamIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1224,7 +1497,19 @@ mod tests {
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::previous::reader::FileReader as PreviousFileReader;
+    use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
+    use lance_table::format::BasePath;
+
+    #[test]
+    fn test_auto_cleanup_disabled_by_default() {
+        // Auto-cleanup must be off by default: the cleanup hook is expensive on
+        // object stores and the 14-day default rarely deletes anything anyway.
+        // See https://github.com/lance-format/lance/issues/6728
+        let params = WriteParams::default();
+        assert!(params.auto_cleanup.is_none());
+        assert!(!params.skip_auto_cleanup);
+    }
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -1647,11 +1932,12 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![0, 1, 3]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
 
         let path = base_path
-            .child(DATA_DIR)
-            .child(fragment.files[0].path.as_str());
+            .clone()
+            .join(DATA_DIR)
+            .join(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
         let reader = PreviousFileReader::try_new_from_reader(
             &path,
@@ -1668,6 +1954,65 @@ mod tests {
         assert_eq!(reader.num_batches(), 1);
         let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
+    }
+
+    #[cfg(feature = "azure")]
+    fn azure_store_params(account_name: &str) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), account_name.to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_validate_and_resolve_target_bases_uses_base_store_params() {
+        let mut params = WriteParams::default()
+            .with_target_bases(vec![1, 2])
+            .with_base_store_params("az://container/path-a", azure_store_params("account-a"))
+            .with_base_store_params("az://container/path-b", azure_store_params("account-b"));
+
+        let existing_base_paths = HashMap::from([
+            (
+                1,
+                BasePath::new(
+                    1,
+                    "az://container/path-a".to_string(),
+                    Some("base-a".to_string()),
+                    false,
+                ),
+            ),
+            (
+                2,
+                BasePath::new(
+                    2,
+                    "az://container/path-b".to_string(),
+                    Some("base-b".to_string()),
+                    false,
+                ),
+            ),
+        ]);
+
+        let target_bases =
+            validate_and_resolve_target_bases(&mut params, Some(&existing_base_paths))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(target_bases.len(), 2);
+        assert_eq!(
+            target_bases[0].object_store.store_prefix,
+            "az$container@account-a"
+        );
+        assert_eq!(
+            target_bases[1].object_store.store_prefix,
+            "az$container@account-b"
+        );
     }
 
     #[tokio::test]
@@ -1703,6 +2048,10 @@ mod tests {
             Some(target_bases),
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
         );
 
         // Create a writer
@@ -1817,6 +2166,10 @@ mod tests {
             Some(target_bases),
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
         );
 
         // Create test batch
@@ -1845,6 +2198,11 @@ mod tests {
         let test_cases = vec![
             ("s3://multi-path-test/test1/subBucket2", "test1/subBucket2"),
             ("gs://my-bucket/path/to/data", "path/to/data"),
+            ("az://container/path/to/data", "path/to/data"),
+            (
+                "abfss://filesystem@account.dfs.core.windows.net/path/to/data",
+                "path/to/data",
+            ),
             ("file:///tmp/test/bucket", "tmp/test/bucket"),
         ];
 
@@ -1873,6 +2231,18 @@ mod tests {
                     path: "s3://bucket2/path2".to_string(),
                     is_dataset_root: true,
                 },
+                BasePath {
+                    id: 3,
+                    name: Some("azure-az-base".to_string()),
+                    path: "az://container/path1".to_string(),
+                    is_dataset_root: true,
+                },
+                BasePath {
+                    id: 4,
+                    name: Some("azure-abfss-base".to_string()),
+                    path: "abfss://filesystem@account.dfs.core.windows.net/path1".to_string(),
+                    is_dataset_root: true,
+                },
             ]),
             target_bases: Some(vec![1]), // Use ID 1 which corresponds to bucket1
             ..Default::default()
@@ -1895,6 +2265,8 @@ mod tests {
     }
 
     fn validate_write_params(params: &WriteParams) -> Result<()> {
+        validate_external_blob_write_params(params)?;
+
         // Replicate the validation logic from the main write function
         if matches!(params.mode, WriteMode::Create)
             && let Some(target_bases) = &params.target_bases
@@ -1920,6 +2292,21 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_external_blob_mode_validation() {
+        let params = WriteParams {
+            external_blob_mode: ExternalBlobMode::Ingest,
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+
+        let err = validate_write_params(&params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("allow_external_blob_outside_bases only applies")
+        );
     }
 
     #[tokio::test]
@@ -2625,9 +3012,10 @@ mod tests {
         use std::sync::Arc;
 
         use async_trait::async_trait;
+        use futures::stream::BoxStream;
         use object_store::{
-            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-            PutOptions, PutPayload, PutResult,
+            CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+            PutMultipartOptions, PutOptions, PutPayload, PutResult,
         };
 
         // Create a custom ObjectStore that simulates disk full error
@@ -2642,20 +3030,6 @@ mod tests {
 
         #[async_trait]
         impl object_store::ObjectStore for DiskFullObjectStore {
-            async fn put(
-                &self,
-                _location: &object_store::path::Path,
-                _bytes: PutPayload,
-            ) -> object_store::Result<PutResult> {
-                Err(object_store::Error::Generic {
-                    store: "DiskFullStore",
-                    source: Box::new(io::Error::new(
-                        ErrorKind::StorageFull,
-                        "No space left on device",
-                    )),
-                })
-            }
-
             async fn put_opts(
                 &self,
                 _location: &object_store::path::Path,
@@ -2671,15 +3045,6 @@ mod tests {
                 })
             }
 
-            async fn put_multipart(
-                &self,
-                _location: &object_store::path::Path,
-            ) -> object_store::Result<Box<dyn MultipartUpload>> {
-                Err(object_store::Error::NotSupported {
-                    source: "Multipart upload not supported".into(),
-                })
-            }
-
             async fn put_multipart_opts(
                 &self,
                 _location: &object_store::path::Path,
@@ -2687,16 +3052,6 @@ mod tests {
             ) -> object_store::Result<Box<dyn MultipartUpload>> {
                 Err(object_store::Error::NotSupported {
                     source: "Multipart upload not supported".into(),
-                })
-            }
-
-            async fn get(
-                &self,
-                _location: &object_store::path::Path,
-            ) -> object_store::Result<GetResult> {
-                Err(object_store::Error::NotFound {
-                    path: "".into(),
-                    source: "".into(),
                 })
             }
 
@@ -2711,11 +3066,11 @@ mod tests {
                 })
             }
 
-            async fn delete(
+            fn delete_stream(
                 &self,
-                _location: &object_store::path::Path,
-            ) -> object_store::Result<()> {
-                Ok(())
+                locations: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+            ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+                locations
             }
 
             fn list(
@@ -2735,18 +3090,11 @@ mod tests {
                 })
             }
 
-            async fn copy(
+            async fn copy_opts(
                 &self,
                 _from: &object_store::path::Path,
                 _to: &object_store::path::Path,
-            ) -> object_store::Result<()> {
-                Ok(())
-            }
-
-            async fn copy_if_not_exists(
-                &self,
-                _from: &object_store::path::Path,
-                _to: &object_store::path::Path,
+                _options: CopyOptions,
             ) -> object_store::Result<()> {
                 Ok(())
             }
@@ -2928,6 +3276,180 @@ mod tests {
             all_ids,
             vec![1, 2, 3, 4, 5, 6],
             "All data should be correctly written"
+        );
+    }
+
+    /// Returns the number of files in `<base_dir>/data/`.
+    fn count_data_files(base_dir: &str) -> usize {
+        let data_dir = std::path::Path::new(base_dir).join("data");
+        if !data_dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().is_file())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_data_files_on_failed_write() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        let good_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Build a stream: one good batch, then an error.
+        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+            Ok(good_batch.clone()),
+            Err(DataFusionError::External("injected failure".into())),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(items),
+        ));
+
+        let result = do_write_fragments(
+            None,
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams::default(),
+            LanceFileVersion::V2_1,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Expected write to fail");
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "All partial data files should be cleaned up on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_data_files_on_failed_write_multi_file() {
+        // Verify cleanup when a failure occurs after one file has already been completed
+        // (i.e., max_rows_per_file causes a file boundary before the error).
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        // 3 rows per file; 2 good batches of 3 rows (fills one file), then error.
+        let good_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+            Ok(good_batch.clone()),
+            Ok(good_batch.clone()),
+            Err(DataFusionError::External("injected failure".into())),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(items),
+        ));
+
+        let result = do_write_fragments(
+            None,
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            },
+            LanceFileVersion::V2_1,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Expected write to fail");
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "All data files (including completed ones) should be cleaned up on failure"
+        );
+    }
+
+    /// Verifies the external-base branch in `cleanup_data_fragments`: files with
+    /// `base_id == Some(_)` are skipped (logged but not deleted via the dataset's
+    /// object store), while same-fragment files with `base_id == None` are deleted.
+    #[tokio::test]
+    async fn test_cleanup_data_fragments_skips_external_base() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        // Create a real local data file we expect to be cleaned up.
+        let data_dir = base_dir.clone().join(DATA_DIR);
+        let local_filename = "local.lance";
+        let local_path = data_dir.clone().join(local_filename);
+        object_store.put(&local_path, b"x").await.unwrap();
+        // Sanity check: file is on disk.
+        assert_eq!(count_data_files(test_uri), 1);
+
+        let mut external_file = DataFile::new_unstarted("external.lance", 2, 1);
+        external_file.base_id = Some(42);
+        let local_file = DataFile::new_unstarted(local_filename, 2, 1);
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![external_file, local_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        cleanup_data_fragments(&object_store, &base_dir, &fragments).await;
+
+        // The local file should be removed; the external file is skipped without
+        // erroring (its base store isn't known here).
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "Local data file should be deleted by cleanup"
         );
     }
 }

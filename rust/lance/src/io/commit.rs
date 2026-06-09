@@ -26,13 +26,13 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, is_detached_version, pb,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -48,7 +48,9 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::details::infer_missing_vector_details;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -56,9 +58,11 @@ use crate::session::index_caches::IndexMetadataKey;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::{DatasetIndexExt, is_system_index};
+use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
+#[cfg(test)]
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -72,17 +76,46 @@ pub mod namespace_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
     transaction.try_into()
+}
+
+/// Best-effort delete of a transaction file that is no longer needed.
+///
+/// Logs a warning on failure rather than propagating the error, since the
+/// primary operation has already failed and the orphaned file will eventually
+/// be removed by GC.
+async fn cleanup_transaction_file(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction_file: &str,
+) {
+    if transaction_file.is_empty() {
+        return;
+    }
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
+    if let Err(e) = object_store.delete(&path).await {
+        log::warn!(
+            "Failed to clean up orphaned transaction file '{}': {}",
+            transaction_file,
+            e
+        );
+    }
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -92,11 +125,14 @@ pub(crate) async fn write_transaction_file(
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
+    object_store.put(&path, &buf).await?;
 
     Ok(file_name)
 }
@@ -152,7 +188,7 @@ async fn do_commit_new_dataset(
                 ref_path.clone(),
                 new_base_id,
                 branch_name.clone(),
-                transaction_file,
+                transaction_file.clone(),
             );
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
@@ -251,9 +287,13 @@ async fn do_commit_new_dataset(
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
+            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
-        Err(CommitError::OtherError(err)) => Err(err),
+        Err(CommitError::OtherError(err)) => {
+            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            Err(err)
+        }
     }
 }
 
@@ -361,6 +401,67 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     Ok(())
 }
 
+fn check_column_indices(manifest: &Manifest) -> Result<()> {
+    let data_storage_version = manifest.data_storage_format.lance_file_version()?;
+    if data_storage_version < LanceFileVersion::V2_1 {
+        return Ok(());
+    }
+
+    for fragment in manifest.fragments.iter() {
+        for data_file in &fragment.files {
+            if data_file.is_legacy_file() || data_file.column_indices.is_empty() {
+                continue;
+            }
+            if data_file.fields.len() != data_file.column_indices.len() {
+                return Err(Error::invalid_input(format!(
+                    "Data file '{}' (fragment {}) has {} field ids but {} column indices. \
+                     These must be the same length.",
+                    data_file.path,
+                    fragment.id,
+                    data_file.fields.len(),
+                    data_file.column_indices.len()
+                )));
+            }
+            let file_version = LanceFileVersion::try_from_major_minor(
+                data_file.file_major_version,
+                data_file.file_minor_version,
+            )?;
+            if file_version < LanceFileVersion::V2_1 {
+                continue;
+            }
+            for (field_id, column_index) in
+                data_file.fields.iter().zip(data_file.column_indices.iter())
+            {
+                // Field ids may not exist in the current schema after schema
+                // evolution (e.g. cast/drop column). Skip those.
+                let Some(field) = manifest.schema.field_by_id(*field_id) else {
+                    continue;
+                };
+                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+                if needs_column && *column_index == -1 {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' (id={}) in data file '{}' (fragment {}) \
+                         has column_index=-1, but leaf fields, packed structs, \
+                         and blob fields must have a valid column index in \
+                         file format 2.1+.",
+                        field.name, field_id, data_file.path, fragment.id
+                    )));
+                }
+                if !needs_column && *column_index != -1 {
+                    return Err(Error::invalid_input(format!(
+                        "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) \
+                         has column_index={}, but non-leaf fields should have \
+                         column_index=-1 in file format 2.1+. Only leaf fields, \
+                         packed structs, and blob fields should have column indices.",
+                        field.name, field_id, data_file.path, fragment.id, column_index
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fix schema in case of duplicate field ids.
 ///
 /// See test dataset v0.10.5/corrupt_schema
@@ -403,17 +504,22 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We iterate over files in reverse order so that we only map the last field id
     seen_fields.clear();
     for fragment in fragments.iter_mut() {
-        for field_id in fragment
-            .files
-            .iter_mut()
-            .rev()
-            .flat_map(|file| file.fields.iter_mut())
-        {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
-                && seen_fields.insert(*field_id)
-            {
-                *field_id = *new_field_id;
-            }
+        for file in fragment.files.iter_mut().rev() {
+            let new_fields: Arc<[i32]> = file
+                .fields
+                .iter()
+                .map(|field_id| {
+                    if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                        && seen_fields.insert(*field_id)
+                    {
+                        *new_field_id
+                    } else {
+                        *field_id
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
+            file.fields = new_fields;
         }
         seen_fields.clear();
     }
@@ -487,7 +593,7 @@ pub(crate) async fn migrate_fragments(
             let mut data_files = fragment.files.clone();
 
             // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store();
+            let object_store = dataset.object_store.as_ref();
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
@@ -496,7 +602,7 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         Either::Right(async {
                             object_store
-                                .size(&dataset.base.child("data").child(file.path.clone()))
+                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))
@@ -564,14 +670,16 @@ fn must_recalculate_fragment_bitmap(
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
+/// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
+    infer_missing_vector_details(dataset, indices).await;
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {
             bad_indices.into_iter().map(|(name, _)| name).collect()
         }
     };
-    for index in indices {
+    for index in indices.iter_mut() {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
@@ -595,6 +703,39 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 "the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.",
                 index.uuid
             );
+        }
+
+        // Migrate file sizes for indices that don't have them.
+        // Use indice_files_dir to handle shallow-cloned indices with base_id.
+        if index.files.is_none() && !is_system_index(index) {
+            let result = async {
+                let index_dir = dataset
+                    .indice_files_dir(index)?
+                    .join(index.uuid.to_string());
+                let object_store = dataset.object_store_for_index(index).await?;
+                list_index_files_with_sizes(&object_store, &index_dir).await
+            }
+            .await;
+            match result {
+                Ok(files) => {
+                    log::debug!(
+                        "Migrated file sizes for index {} (uuid: {}): {} files",
+                        index.name,
+                        index.uuid,
+                        files.len()
+                    );
+                    index.files = Some(files);
+                }
+                Err(e) => {
+                    // Log but don't fail - file sizes are optional
+                    log::debug!(
+                        "Could not collect file sizes for index {} (uuid: {}): {}",
+                        index.name,
+                        index.uuid,
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -686,6 +827,7 @@ pub(crate) async fn do_commit_detached_transaction(
         // fix_schema and check_storage_version are just for sanity-checking and consistency
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
+        check_column_indices(&manifest)?;
         migrate_indices(dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -716,6 +858,7 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
+                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
                 return Err(err);
             }
         }
@@ -723,6 +866,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
+    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -778,7 +922,7 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store()
+    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
@@ -808,6 +952,9 @@ pub(crate) async fn commit_transaction(
     // Other transactions that may have been committed since the read_version.
     // We keep pair of (version, transaction). No other transactions to check initially
     let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
+    // Track the transaction file written in the current loop iteration so we can
+    // delete it if the commit ultimately fails.
+    let mut current_transaction_file = String::new();
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -835,11 +982,12 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
-        let transaction_file = if !write_config.disable_transaction_file() {
+        current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &transaction).await?
         } else {
             String::new()
         };
+        let transaction_file = current_transaction_file.as_str();
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
@@ -856,7 +1004,7 @@ pub(crate) async fn commit_transaction(
                     &dataset.base,
                     version,
                     write_config,
-                    &transaction_file,
+                    transaction_file,
                     &dataset.manifest,
                 )
                 .await?
@@ -864,7 +1012,7 @@ pub(crate) async fn commit_transaction(
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
-                &transaction_file,
+                transaction_file,
                 write_config,
             )?,
         };
@@ -883,6 +1031,7 @@ pub(crate) async fn commit_transaction(
         fix_schema(&mut manifest)?;
 
         check_storage_version(&mut manifest)?;
+        check_column_indices(&manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
@@ -956,6 +1105,14 @@ pub(crate) async fn commit_transaction(
                 }
 
                 if next_attempt_i < num_attempts {
+                    // The transaction file from this attempt is now stale; clean it up
+                    // before the next attempt writes a new one (possibly rebased).
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.base,
+                        &current_transaction_file,
+                    )
+                    .await;
                     tokio::time::sleep(backoff.next_backoff()).await;
                     continue;
                 } else {
@@ -963,12 +1120,14 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
-                // If other error, return
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
                 return Err(err);
             }
         }
     }
 
+    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(
@@ -995,7 +1154,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
-        CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
+        CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
     };
     use lance_testing::datagen::generate_random_array;
 
@@ -1216,9 +1375,16 @@ mod tests {
             .collect();
 
         let results = join_all(futures).await;
-        for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-        }
+        let success_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Ok(_))))
+            .count();
+        let retryable_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Err(Error::RetryableCommitConflict { .. }))))
+            .count();
+        assert_eq!(success_count, 2, "{results:?}");
+        assert_eq!(retryable_count, 1, "{results:?}");
 
         // Validate that each version has the anticipated number of indexes
         let dataset = dataset.checkout_version(1).await.unwrap();
@@ -1241,12 +1407,7 @@ mod tests {
             assert_eq!(indices[0].fields, vec![0]);
         }
 
-        let dataset = dataset.checkout_version(4).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 2);
-        let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
-        fields.sort();
-        assert_eq!(fields, vec![0, 1]);
+        assert!(dataset.checkout_version(4).await.is_err());
     }
 
     #[tokio::test]
@@ -1599,5 +1760,288 @@ mod tests {
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
+    }
+
+    /// A CommitHandler that always fails with OtherError, used to simulate
+    /// a manifest write failure so we can verify orphaned transaction files
+    /// are cleaned up.
+    #[derive(Debug)]
+    struct FailingCommitHandler;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for FailingCommitHandler {
+        async fn commit(
+            &self,
+            _manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            _base_path: &Path,
+            _object_store: &ObjectStore,
+            _manifest_writer: ManifestWriter,
+            _naming_scheme: ManifestNamingScheme,
+            _transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            Err(CommitError::OtherError(lance_core::Error::io(
+                "simulated commit failure",
+            )))
+        }
+    }
+
+    fn count_txn_files(uri: &str) -> usize {
+        let tx_dir = std::path::Path::new(uri).join("_transactions");
+        std::fs::read_dir(&tx_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_transaction_file_cleanup_on_commit_failure() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+
+        // Create initial dataset with a normal commit handler.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        Dataset::write(reader, uri, None).await.unwrap();
+
+        let txn_files_before = count_txn_files(uri);
+
+        // Attempt to append with a commit handler that always fails.
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(Arc::new(FailingCommitHandler)),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let result = Dataset::write(reader, uri, Some(params)).await;
+        assert!(result.is_err(), "expected commit to fail");
+
+        // The failed commit must not leave any extra transaction files behind.
+        let txn_files_after = count_txn_files(uri);
+        assert_eq!(
+            txn_files_after,
+            txn_files_before,
+            "failed commit left {extra} orphaned transaction file(s)",
+            extra = txn_files_after.saturating_sub(txn_files_before),
+        );
+    }
+    /// Helper to build a simple manifest for check_column_indices tests.
+    fn make_manifest_with_file(
+        schema: Schema,
+        data_file: DataFile,
+        data_storage_version: LanceFileVersion,
+    ) -> Manifest {
+        let fragment = Fragment {
+            id: 0,
+            files: vec![data_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(100),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(data_storage_version),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_struct_with_column() {
+        // Struct (non-leaf) field with column_index=0 in v2.1 should be rejected.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // field ids: struct=0, leaf=1; give struct a real column_index (wrong)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected error for struct with column_index=0"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_list_with_column() {
+        // List (non-leaf) field with column_index=0 in v2.1 should be rejected.
+        let mut list_field = Field::try_from(ArrowField::new(
+            "l",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        ))
+        .unwrap();
+        list_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![list_field],
+            metadata: Default::default(),
+        };
+
+        // field ids: list=0, item=1; give list a real column_index (wrong)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected error for list with column_index=0"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_allows_correct_v21() {
+        // Non-leaf with column_index=-1 and leaf with column_index>=0 should pass.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1 (correct), leaf=0 (correct)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![-1, 0], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_allows_packed_struct() {
+        // Packed struct with a real column_index in v2.1 should be allowed.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+        struct_field
+            .metadata
+            .insert("lance-encoding:packed".to_string(), "true".to_string());
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // packed struct=0 (allowed), leaf=1
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_skips_v20() {
+        // Non-leaf with column_index>=0 in v2.0 should be allowed (no validation).
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_0);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_mismatched_lengths() {
+        // fields and column_indices must have the same length.
+        let mut leaf_field = Field::try_from(ArrowField::new("x", DataType::Int32, false)).unwrap();
+        leaf_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![leaf_field],
+            metadata: Default::default(),
+        };
+
+        // 1 field id but 2 column indices
+        let data_file = DataFile::new("data.lance", vec![0], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(result.is_err(), "Expected error for mismatched lengths");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("1 field ids but 2 column indices"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_skips_unknown_field_id() {
+        // A field id not present in the schema is skipped (schema evolution).
+        let mut leaf_field = Field::try_from(ArrowField::new("x", DataType::Int32, false)).unwrap();
+        leaf_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![leaf_field],
+            metadata: Default::default(),
+        };
+
+        // field id 99 does not exist in the schema — should be skipped
+        let data_file = DataFile::new("data.lance", vec![0, 99], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_leaf_with_negative_one() {
+        // A leaf field with column_index=-1 in v2.1 should be rejected.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1 (correct), but leaf=-1 (wrong — leaf must have a real column)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![-1, -1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected error for leaf with column_index=-1"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("must have a valid column index"), "{msg}");
     }
 }

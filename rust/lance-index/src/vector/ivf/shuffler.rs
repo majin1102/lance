@@ -28,9 +28,11 @@ use futures::stream::repeat_with;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
+use lance_core::utils::futures::StreamOnDropExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
@@ -52,12 +54,12 @@ use crate::vector::transform::Transformer;
 const UNSORTED_BUFFER: &str = "unsorted.lance";
 const SHUFFLE_BATCH_SIZE: usize = 1024;
 
-fn get_temp_dir() -> Result<Path> {
-    // Note: using keep here means we will not delete this TempDir automatically
-    let dir = tempfile::TempDir::new()?.keep();
+/// Returns the temp dir path plus a guard whose `Drop` removes the directory.
+fn get_temp_dir() -> Result<(Path, tempfile::TempDir)> {
+    let dir = tempfile::TempDir::new()?;
     let tmp_dir_path =
-        Path::from_filesystem_path(dir).map_err(|e| Error::io_source(Box::new(e)))?;
-    Ok(tmp_dir_path)
+        Path::from_filesystem_path(dir.path()).map_err(|e| Error::io_source(Box::new(e)))?;
+    Ok((tmp_dir_path, dir))
 }
 
 /// A builder for a partition of data
@@ -342,11 +344,22 @@ pub async fn shuffle_dataset(
 
     // step 3: load the sorted chunks, consumers are expect to be responsible for merging the streams
     let start = std::time::Instant::now();
-    let stream =
+    let streams =
         IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files).await?;
     info!("merged partitioned shuffles in {:?}", start.elapsed());
 
-    Ok(stream)
+    // Clone the temp-dir guard into each returned stream so the shuffle
+    // files are removed only after the consumer drops every stream.
+    let temp_dir_guard = shuffler.owned_temp_dir.clone();
+    let guarded_streams = streams
+        .into_iter()
+        .map(|stream| {
+            let guard = temp_dir_guard.clone();
+            stream.on_drop(move || drop(guard))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(guarded_streams)
 }
 
 pub async fn shuffle_vectors(
@@ -384,10 +397,16 @@ pub struct IvfShuffler {
 
     output_dir: Path,
 
+    // `Some` for an auto-created `output_dir`; cleanup runs when the last
+    // clone of this `Arc` is dropped. `None` when the caller owns cleanup.
+    owned_temp_dir: Option<Arc<tempfile::TempDir>>,
+
     // whether the lance file is v1 (legacy) or v2
     is_legacy: bool,
 
     shuffle_output_root_filename: String,
+
+    format_version: LanceFileVersion,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -407,9 +426,12 @@ impl IvfShuffler {
         is_legacy: bool,
         shuffle_output_root_filename: Option<String>,
     ) -> Result<Self> {
-        let output_dir = match output_dir {
-            Some(output_dir) => output_dir,
-            None => get_temp_dir()?,
+        let (output_dir, owned_temp_dir) = match output_dir {
+            Some(output_dir) => (output_dir, None),
+            None => {
+                let (path, dir) = get_temp_dir()?;
+                (path, Some(Arc::new(dir)))
+            }
         };
 
         let shuffle_output_root_filename = match shuffle_output_root_filename {
@@ -420,10 +442,17 @@ impl IvfShuffler {
         Ok(Self {
             num_partitions,
             output_dir,
+            owned_temp_dir,
             unsorted_buffers: vec![],
             is_legacy,
             shuffle_output_root_filename,
+            format_version: LanceFileVersion::V2_0,
         })
+    }
+
+    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+        self.format_version = format_version;
+        self
     }
 
     /// Set the unsorted buffers to be shuffled.
@@ -440,7 +469,7 @@ impl IvfShuffler {
         data: impl Stream<Item = Result<RecordBatch>>,
     ) -> Result<()> {
         let object_store = ObjectStore::local();
-        let path = self.output_dir.child(UNSORTED_BUFFER);
+        let path = self.output_dir.clone().join(UNSORTED_BUFFER);
         let writer = object_store.create(&path).await?;
 
         let mut data = Box::pin(data.peekable());
@@ -495,7 +524,7 @@ impl IvfShuffler {
         let mut total_batches = vec![];
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
-            let path = self.output_dir.child(buffer.as_str());
+            let path = self.output_dir.clone().join(buffer.as_str());
 
             if self.is_legacy {
                 let reader =
@@ -539,7 +568,7 @@ impl IvfShuffler {
         } in inputs
         {
             let file_name = &self.unsorted_buffers[file_idx];
-            let path = self.output_dir.child(file_name.as_str());
+            let path = self.output_dir.clone().join(file_name.as_str());
 
             if self.is_legacy {
                 let reader =
@@ -584,6 +613,7 @@ impl IvfShuffler {
                         16,
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 while let Some(batch) = stream.next().await {
@@ -621,7 +651,7 @@ impl IvfShuffler {
         {
             let object_store = ObjectStore::local();
             let file_name = &self.unsorted_buffers[file_idx];
-            let path = self.output_dir.child(file_name.as_str());
+            let path = self.output_dir.clone().join(file_name.as_str());
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
@@ -658,7 +688,8 @@ impl IvfShuffler {
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
-                    )?
+                    )
+                    .await?
                     .boxed()
             };
 
@@ -761,7 +792,7 @@ impl IvfShuffler {
                     // finally, write the shuffled data to disk
                     let object_store = ObjectStore::local();
                     let output_file = format!("{}_{}.lance", this.shuffle_output_root_filename, i);
-                    let path = this.output_dir.child(output_file.clone());
+                    let path = this.output_dir.clone().join(output_file.clone());
                     let writer = object_store.create(&path).await?;
 
                     info!(
@@ -778,7 +809,10 @@ impl IvfShuffler {
                     let mut file_writer = lance_file::writer::FileWriter::try_new(
                         writer,
                         lance_schema,
-                        FileWriterOptions::default(),
+                        FileWriterOptions {
+                            format_version: Some(this.format_version),
+                            ..Default::default()
+                        },
                     )?;
 
                     for partition_and_idx in shuffled.into_iter().enumerate() {
@@ -813,7 +847,7 @@ impl IvfShuffler {
 
         for file in files {
             let object_store = Arc::new(ObjectStore::local());
-            let path = basedir.child(file);
+            let path = basedir.clone().join(file);
             let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
             let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
             let file_scheduler = scan_scheduler
@@ -833,7 +867,8 @@ impl IvfShuffler {
                     /*batch_size=*/ 1,
                     /*batch_readahead=*/ 32,
                     FilterExpression::no_filter(),
-                )?
+                )
+                .await?
                 .and_then(|batch| {
                     let list_array = batch
                         .column(0)
@@ -1182,5 +1217,64 @@ mod test {
         }
 
         assert_eq!(num_batches, NUM_PARTITIONS * expected_num_part_files);
+    }
+
+    // Auto-created shuffler temp dir must be removed once the shuffler and
+    // its returned streams are dropped.
+    #[tokio::test]
+    async fn test_shuffler_cleans_up_auto_temp_dir() {
+        let (stream, mut shuffler) = make_stream_and_shuffler(false);
+
+        // Snapshot the path without cloning the `Arc` — a clone here would
+        // block cleanup on drop.
+        let temp_dir_path = shuffler
+            .owned_temp_dir
+            .as_ref()
+            .expect("shuffler built with output_dir = None should own a TempDir guard")
+            .path()
+            .to_path_buf();
+
+        assert!(
+            temp_dir_path.is_dir(),
+            "auto-created shuffler temp dir should exist while shuffler is alive: {:?}",
+            temp_dir_path,
+        );
+
+        shuffler.write_unsorted_stream(stream).await.unwrap();
+        let partition_files = shuffler.write_partitioned_shuffles(100, 1).await.unwrap();
+        assert_eq!(partition_files.len(), 1);
+
+        assert!(
+            temp_dir_path.join("unsorted.lance").is_file(),
+            "shuffler should have written unsorted.lance into its working dir: {:?}",
+            temp_dir_path,
+        );
+        assert!(
+            temp_dir_path.join("sorted_0.lance").is_file(),
+            "shuffler should have written sorted_0.lance into its working dir: {:?}",
+            temp_dir_path,
+        );
+
+        let mut result_streams =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
+
+        while let Some(mut s) = result_streams.pop() {
+            while let Some(item) = s.next().await {
+                let _ = item.unwrap();
+            }
+        }
+        drop(result_streams);
+        // Dropping the shuffler releases the last `Arc<TempDir>`, which
+        // removes the on-disk directory.
+        drop(shuffler);
+
+        assert!(
+            !temp_dir_path.exists(),
+            "auto-created shuffler temp dir should be removed once the IvfShuffler and \
+             its returned streams are dropped, but it still exists: {:?}",
+            temp_dir_path,
+        );
     }
 }

@@ -2,15 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod address;
+pub mod aimd;
 pub mod assume;
 pub mod backoff;
 pub mod bit;
 pub mod blob;
+pub mod bloomfilter;
 pub mod cpu;
 pub mod deletion;
 pub mod futures;
 pub mod hash;
-pub mod mask;
 pub mod parse;
 pub mod path;
 pub mod tempfile;

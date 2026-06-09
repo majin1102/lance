@@ -7,10 +7,9 @@ use arrow_array::FixedSizeListArray;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use lance_arrow::FixedSizeListArrayExt;
-use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::utils::SimpleIndex;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_index::vector::kmeans::{
     KMeans, KMeansAlgo, KMeansAlgoFloat, KMeansParams, compute_partitions_arrow_array,
@@ -66,9 +65,13 @@ fn bench_train(c: &mut Criterion) {
         });
 
         if k * dimension as usize >= 1_000_000 {
-            let index =
-                SimpleIndex::try_new(FlatFloatStorage::new(centroids.clone(), DistanceType::L2))
-                    .unwrap();
+            let index = SimpleIndex::may_train_index(
+                centroids.values().clone(),
+                dimension as usize,
+                DistanceType::L2,
+            )
+            .unwrap()
+            .unwrap();
             group.bench_function("with_index", |b| {
                 b.iter(|| {
                     KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(

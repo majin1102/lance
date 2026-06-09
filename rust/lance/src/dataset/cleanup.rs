@@ -33,13 +33,14 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
+use super::archive::{VersionArchive, VersionArchiveConfig, VersionArchiveEntry};
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
 use futures::future::try_join_all;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
@@ -64,7 +65,10 @@ use std::{
     collections::{HashMap, HashSet},
     future,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
+use tokio::time::{MissedTickBehavior, interval};
+use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument};
 
 #[derive(Clone, Debug, Default)]
@@ -121,29 +125,26 @@ struct CleanupInspection {
     tagged_old_versions: HashSet<u64>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
-    /// Pre-generated VersionSummary for checkpoint (populated during process_manifests)
-    version_summaries: Vec<VersionSummary>,
-    /// Latest version checkpoint file
-    version_checkpoint: VersionCheckpoint,
+    /// Pre-generated VersionArchiveEntry for archive (populated during process_manifests)
+    version_archive_entries: Vec<VersionArchiveEntry>,
+    /// Latest version archive file
+    version_archive: VersionArchive,
 }
 
 impl CleanupInspection {
     async fn try_new(dataset: &Dataset) -> Result<Self> {
-        let config = CheckpointConfig::from_config(&dataset.manifest.config);
-        let version_checkpoint = VersionCheckpoint::load_or_new(
-            dataset.base.clone(),
-            dataset.object_store.clone(),
-            config,
-        )
-        .await?;
+        let config = VersionArchiveConfig::from_config(&dataset.manifest.config);
+        let version_archive =
+            VersionArchive::load_or_new(dataset.base.clone(), dataset.object_store.clone(), config)
+                .await?;
         Ok(Self {
             old_manifests: HashMap::new(),
             referenced_files: ReferencedFiles::default(),
             verified_files: ReferencedFiles::default(),
             tagged_old_versions: HashSet::new(),
             earliest_retained_manifest_time: None,
-            version_summaries: Vec::new(),
-            version_checkpoint,
+            version_archive_entries: Vec::new(),
+            version_archive,
         })
     }
 }
@@ -151,6 +152,8 @@ impl CleanupInspection {
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
+const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
+const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
@@ -204,25 +207,27 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
-        // Populate is_tagged and is_cleaned_up for version summaries
-        let old_versions: HashSet<u64> = inspection.old_manifests.values().copied().collect();
-        for summary in &mut inspection.version_summaries {
+        // Populate tag state for version archive entries. Cleanup state is derived
+        // by comparing archive entries with live manifests when scanning.
+        for summary in &mut inspection.version_archive_entries {
             summary.is_tagged = tagged_versions.contains(&summary.version);
-            summary.is_cleaned_up = old_versions.contains(&summary.version);
         }
 
-        // Add collected summaries to checkpoint (sorts internally)
+        // Add collected entries to archive (sorts internally)
         inspection
-            .version_checkpoint
-            .add_summaries(&inspection.version_summaries);
+            .version_archive
+            .add_entries(&inspection.version_archive_entries);
 
-        let stats = self.delete_unreferenced_files(inspection.clone()).await?;
+        self.archive_versions(&mut inspection).await?;
+
+        let stats = self.delete_unreferenced_files(inspection).await?;
+        final_stats.bytes_removed += stats.bytes_removed;
+        final_stats.old_versions += stats.old_versions;
         final_stats.data_files_removed += stats.data_files_removed;
         final_stats.transaction_files_removed += stats.transaction_files_removed;
         final_stats.index_files_removed += stats.index_files_removed;
         final_stats.deletion_files_removed += stats.deletion_files_removed;
 
-        self.checkpoint_versions(&mut inspection).await?;
         Ok(final_stats)
     }
 
@@ -276,7 +281,7 @@ impl<'a> CleanupTask<'a> {
 
         let mut inspection = inspection.lock().unwrap();
 
-        if manifest.version > inspection.version_checkpoint.latest_version_number {
+        if manifest.version > inspection.version_archive.latest_version_number {
             let manifest_summary = manifest.summary();
             let (transaction_uuid, read_version, operation_type, transaction_properties) =
                 match &transaction {
@@ -292,18 +297,19 @@ impl<'a> CleanupTask<'a> {
                     None => (None, None, None, HashMap::new()),
                 };
 
-            let version_summary = VersionSummary {
+            let version_archive_entry = VersionArchiveEntry {
                 version: manifest.version,
                 timestamp_millis: manifest.timestamp().timestamp_millis(),
                 manifest_summary,
                 is_tagged: false,
-                is_cleaned_up: false,
                 transaction_uuid,
                 read_version,
                 operation_type,
                 transaction_properties,
             };
-            inspection.version_summaries.push(version_summary);
+            inspection
+                .version_archive_entries
+                .push(version_archive_entry);
         }
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -347,7 +353,7 @@ impl<'a> CleanupTask<'a> {
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
-                let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
             }
@@ -363,7 +369,7 @@ impl<'a> CleanupTask<'a> {
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
                 .tx_paths
-                .insert(Path::parse(TRANSACTIONS_DIR)?.child(relative_tx_path.as_str()));
+                .insert(Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str()));
         }
 
         for index in indexes {
@@ -488,10 +494,24 @@ impl<'a> CleanupTask<'a> {
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
+        let paths_to_delete: BoxStream<Result<Path>> = if let Some(rate) =
+            self.policy.delete_rate_limit
+        {
+            let duration = calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
+            let mut ticker = interval(duration);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            IntervalStream::new(ticker)
+                .zip(all_paths_to_remove)
+                .map(|(_, path)| path)
+                .boxed()
+        } else {
+            all_paths_to_remove.boxed()
+        };
+
         let delete_fut = self
             .dataset
             .object_store
-            .remove_stream(all_paths_to_remove.boxed())
+            .remove_stream(paths_to_delete)
             .try_for_each(|_| future::ready(Ok(())));
 
         delete_fut.await?;
@@ -859,7 +879,8 @@ impl<'a> CleanupTask<'a> {
                     if let Some(base_path) = base_path
                         && base_path.path == self.dataset.uri
                     {
-                        let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                        let full_data_path =
+                            self.dataset.data_dir().clone().join(file.path.as_str());
                         let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                         inspection
                             .verified_files
@@ -921,26 +942,38 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    /// Checkpoint version metadata after deleting files.
+    /// Archive version metadata before deleting files.
     ///
     /// This preserves manifest data for historical versions that have been cleaned up.
-    /// Also cleans up old checkpoint files.
-    async fn checkpoint_versions(&self, inspection: &mut CleanupInspection) -> Result<()> {
-        if !inspection.version_checkpoint.is_enabled()
-            || inspection.version_checkpoint.versions.is_empty()
+    /// Also cleans up old archive files.
+    async fn archive_versions(&self, inspection: &mut CleanupInspection) -> Result<()> {
+        if !inspection.version_archive.is_enabled()
+            || inspection.version_archive.versions.is_empty()
         {
             return Ok(());
         }
 
-        let old_versions: HashSet<u64> = inspection.old_manifests.values().copied().collect();
-        for summary in &mut inspection.version_checkpoint.versions {
-            if old_versions.contains(&summary.version) {
-                summary.is_cleaned_up = true;
-            }
-        }
-
-        inspection.version_checkpoint.flush().await
+        inspection.version_archive.flush().await
     }
+}
+
+fn calculate_duration(scheme: String, rate: u64) -> Duration {
+    let batch_size = if scheme.to_lowercase().contains("s3") {
+        S3_DELETE_STREAM_BATCH_SIZE
+    } else if scheme.to_lowercase().contains("az") {
+        AZURE_DELETE_STREAM_BATCH_SIZE
+    } else {
+        1
+    };
+    let effective_rate = rate.max(1);
+    let path_rate = effective_rate * batch_size;
+    info!(
+        "delete_rate_limit enabled: limit {} delete requests/sec",
+        effective_rate
+    );
+    // convert user given op/s to the rate of issuing paths
+    let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
+    Duration::from_nanos(duration_ns)
 }
 
 #[derive(Clone, Debug)]
@@ -955,6 +988,12 @@ pub struct CleanupPolicy {
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,
+    /// Maximum number of delete requests per second. If None, no rate limiting is applied.
+    ///
+    /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
+    /// On stores with bulk delete, each request can include multiple paths.
+    /// For example, `Some(100)` limits deletions to 100 delete requests per second.
+    pub delete_rate_limit: Option<u64>,
 }
 
 impl CleanupPolicy {
@@ -978,6 +1017,7 @@ impl Default for CleanupPolicy {
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
+            delete_rate_limit: None,
         }
     }
 }
@@ -1029,6 +1069,25 @@ impl CleanupPolicyBuilder {
     pub fn error_if_tagged_old_versions(mut self, error: bool) -> Self {
         self.policy.error_if_tagged_old_versions = error;
         self
+    }
+
+    /// Limit the number of delete requests per second during cleanup.
+    ///
+    /// By default (None), deletions run at full speed. Set this to a positive value to
+    /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
+    /// On backends with bulk delete APIs, effective path throughput scales with batch size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rate` is zero.
+    pub fn delete_rate_limit(mut self, rate: u64) -> Result<Self> {
+        if rate == 0 {
+            return Err(Error::Cleanup {
+                message: format!("delete_rate_limit must be greater than 0, got {}", rate),
+            });
+        }
+        self.policy.delete_rate_limit = Some(rate);
+        Ok(self)
     }
 
     pub fn build(self) -> CleanupPolicy {
@@ -1157,6 +1216,23 @@ pub async fn build_cleanup_policy(
         // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
     }
+    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+        let rate: u64 = match delete_rate_limit.parse() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
+                        e
+                    ),
+                });
+            }
+        };
+        builder = match builder.delete_rate_limit(rate) {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+    }
 
     Ok(Some(builder.build()))
 }
@@ -1193,10 +1269,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::dataset::checkpoint::CHECKPOINT_DIR;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::dataset::archive::ARCHIVE_DIR;
+    use crate::index::DatasetIndexExt;
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::transaction::{Operation, Transaction},
+        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1209,7 +1287,7 @@ mod tests {
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
@@ -1217,6 +1295,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use uuid::Uuid;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -1276,7 +1355,7 @@ mod tests {
         num_index_files: usize,
         num_delete_files: usize,
         num_tx_files: usize,
-        num_checkpoint_files: usize,
+        num_archive_files: usize,
         num_bytes: u64,
     }
 
@@ -1344,6 +1423,24 @@ mod tests {
             self.write_some_data_impl(WriteMode::Create).await
         }
 
+        // Auto-cleanup is disabled by default; this helper creates a dataset
+        // with auto-cleanup enabled using the default interval/older_than.
+        async fn create_some_data_with_auto_cleanup(&self) -> Result<()> {
+            Dataset::write(
+                some_batch(),
+                &self.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(self.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    auto_cleanup: Some(AutoCleanupParams::default()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+            Ok(())
+        }
+
         async fn overwrite_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Overwrite).await
         }
@@ -1395,8 +1492,8 @@ mod tests {
             policy.set_before_policy(
                 "block_commit",
                 Arc::new(|op, _| -> Result<()> {
-                    if op.contains("copy") {
-                        return Err(Error::internal("Copy blocked".to_string()));
+                    if op.contains("copy") || op.contains("rename") {
+                        return Err(Error::internal("Commit blocked".to_string()));
                     }
                     Ok(())
                 }),
@@ -1508,21 +1605,21 @@ mod tests {
                 num_index_files: 0,
                 num_manifest_files: 0,
                 num_tx_files: 0,
-                num_checkpoint_files: 0,
+                num_archive_files: 0,
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
-                let is_checkpoint = path.location.parts().any(|p| p.as_ref() == CHECKPOINT_DIR);
+                let is_archive = path.location.parts().any(|p| p.as_ref() == ARCHIVE_DIR);
 
-                // Checkpoint files are managed separately, don't count their bytes
-                if !is_checkpoint {
+                // Archive files are managed separately, don't count their bytes
+                if !is_archive {
                     file_count.num_bytes += path.size;
                 }
 
                 match path.location.extension() {
                     Some("lance") => {
-                        if is_checkpoint {
-                            file_count.num_checkpoint_files += 1;
+                        if is_archive {
+                            file_count.num_archive_files += 1;
                         } else {
                             file_count.num_data_files += 1;
                         }
@@ -1556,6 +1653,63 @@ mod tests {
             let db = self.open().await?;
             let count = db.count_rows(None).await?;
             Ok(count)
+        }
+    }
+
+    async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
+        dataset
+            .object_store
+            .as_ref()
+            .put(&index_dir.clone().join("index.idx"), b"idx")
+            .await?;
+        dataset
+            .object_store
+            .as_ref()
+            .put(&index_dir.clone().join("auxiliary.idx"), b"aux")
+            .await?;
+        Ok(())
+    }
+
+    async fn write_dummy_staging_partial(
+        dataset: &Dataset,
+        staging_uuid: Uuid,
+        shard_uuid: Uuid,
+    ) -> Result<()> {
+        let shard_dir = dataset
+            .indices_dir()
+            .join(staging_uuid.to_string())
+            .join(format!("partial_{}", shard_uuid));
+        dataset
+            .object_store
+            .as_ref()
+            .put(&shard_dir.clone().join("index.idx"), b"idx")
+            .await?;
+        dataset
+            .object_store
+            .as_ref()
+            .put(&shard_dir.clone().join("auxiliary.idx"), b"aux")
+            .await?;
+        Ok(())
+    }
+
+    fn dummy_index_metadata(
+        dataset: &Dataset,
+        field_id: i32,
+        uuid: Uuid,
+        fragment_bitmap: impl IntoIterator<Item = u32>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            name: "some_index".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.version().version,
+            fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
+            index_details: None,
+            index_version: IndexType::Vector.version(),
+            created_at: None,
+            base_id: None,
+            files: None,
         }
     }
 
@@ -1876,7 +2030,7 @@ mod tests {
         // commit.
         let fixture = MockDatasetFixture::try_new().unwrap();
 
-        fixture.create_some_data().await.unwrap();
+        fixture.create_some_data_with_auto_cleanup().await.unwrap();
 
         let dataset_config = &fixture.open().await.unwrap().manifest.config;
         let cleanup_interval: usize = dataset_config
@@ -2208,7 +2362,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
 
-        // Cleanup creates a checkpoint file, so we only compare relevant fields
+        // Cleanup creates an archive file, so we only compare relevant fields
         assert_eq!(before_count.num_data_files, after_count.num_data_files);
         assert_eq!(
             before_count.num_manifest_files,
@@ -2218,6 +2372,159 @@ mod tests {
         assert_eq!(before_count.num_delete_files, after_count.num_delete_files);
         assert_eq!(before_count.num_tx_files, after_count.num_tx_files);
         assert_eq!(before_count.num_bytes, after_count.num_bytes);
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_replaced_segment_keeps_still_referenced_segments() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+
+        let seg_a = Uuid::new_v4();
+        let seg_b = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, seg_a).await.unwrap();
+        write_dummy_index_artifact(&dataset, seg_b).await.unwrap();
+
+        let index_a = dummy_index_metadata(&dataset, field_id, seg_a, [0_u32]);
+        let index_b = dummy_index_metadata(&dataset, field_id, seg_b, [1_u32]);
+        let initial_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_a.clone(), index_b.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(initial_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let seg_c = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, seg_c).await.unwrap();
+        let index_c = dummy_index_metadata(&dataset, field_id, seg_c, [2_u32]);
+        let replace_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_c.clone()],
+                removed_indices: vec![index_a.clone()],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(replace_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.index_files_removed, 2);
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(seg_a.to_string())
+                        .join("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(seg_b.to_string())
+                        .join("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(seg_c.to_string())
+                        .join("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_uncommitted_index_artifacts() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let dataset = fixture.open().await.unwrap();
+        let staging_uuid = Uuid::new_v4();
+        let shard_uuid = Uuid::new_v4();
+        let built_segment_uuid = Uuid::new_v4();
+
+        write_dummy_staging_partial(&dataset, staging_uuid, shard_uuid)
+            .await
+            .unwrap();
+        write_dummy_index_artifact(&dataset, built_segment_uuid)
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.index_files_removed, 4);
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(staging_uuid.to_string())
+                        .join(format!("partial_{}", shard_uuid))
+                        .join("index.idx"),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(built_segment_uuid.to_string())
+                        .join("index.idx"),
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2236,7 +2543,8 @@ mod tests {
         // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 1);
-        assert_eq!(before_count.num_tx_files, 2);
+        // Only 1 txn file: the failed commit's txn file was already cleaned up.
+        assert_eq!(before_count.num_tx_files, 1);
 
         // All of our manifests are newer than the threshold but temp files
         // should still be deleted.
@@ -2284,7 +2592,7 @@ mod tests {
         assert_eq!(removed.data_files_removed, 0);
 
         let after_count = fixture.count_files().await.unwrap();
-        // Cleanup creates a checkpoint file, so we only compare relevant fields
+        // Cleanup creates an archive file, so we only compare relevant fields
         assert_eq!(before_count.num_data_files, after_count.num_data_files);
         assert_eq!(
             before_count.num_manifest_files,
@@ -2450,18 +2758,18 @@ mod tests {
                 .unwrap();
 
         // Create unmanaged directories/files under dataset root
-        let img = base.child("images").child("clip.mp4");
-        let misc = base.child("misc").child("notes.txt");
-        let branch_file = base.child("tree").child("branchA").child("data.bin");
+        let img = base.clone().join("images").join("clip.mp4");
+        let misc = base.clone().join("misc").join("notes.txt");
+        let branch_file = base.clone().join("tree").join("branchA").join("data.bin");
         os.put(&img, b"video").await.unwrap();
         os.put(&misc, b"notes").await.unwrap();
         os.put(&branch_file, b"branch").await.unwrap();
 
         // Create a temporary manifest file that should be cleaned
-        let tmp_manifest = base.child("_versions").child(".tmp").child("orphan");
+        let tmp_manifest = base.clone().join("_versions").join(".tmp").join("orphan");
         os.put(&tmp_manifest, b"tmp").await.unwrap();
         // Delete the _transactions directory so that we can test that if not_found err will be swallowed
-        os.remove_dir_all(base.child(TRANSACTIONS_DIR))
+        os.remove_dir_all(base.clone().join(TRANSACTIONS_DIR))
             .await
             .unwrap();
 
@@ -2682,7 +2990,7 @@ mod tests {
                     num_tx_files: 0,
                     num_delete_files: 0,
                     num_index_files: 0,
-                    num_checkpoint_files: 0,
+                    num_archive_files: 0,
                     num_bytes: 0,
                 },
             }
@@ -2691,8 +2999,9 @@ mod tests {
         // Create a full-text index (Inverted) on the "text" column once.
         // We only create this on main during dataset creation. Branches inherit the index configuration.
         async fn create_text_index(&mut self) -> Result<()> {
+            use crate::index::DatasetIndexExt;
+            use lance_index::IndexType;
             use lance_index::scalar::InvertedIndexParams;
-            use lance_index::{DatasetIndexExt, IndexType};
             let params = InvertedIndexParams::default();
             self.dataset
                 .create_index(&["text"], IndexType::Inverted, None, &params, true)
@@ -2709,7 +3018,7 @@ mod tests {
             // Optimize indices after write and delete
             use lance_index::optimize::OptimizeOptions;
             self.dataset
-                .optimize_indices(&OptimizeOptions::append())
+                .optimize_indices(&OptimizeOptions::merge(1))
                 .await?;
             Ok(())
         }
@@ -2786,7 +3095,7 @@ mod tests {
                 Ok(count)
             }
 
-            let manifest_dir = branch_path.child("_versions");
+            let manifest_dir = branch_path.clone().join("_versions");
             self.counts.num_manifest_files = count_dir(
                 &self.dataset.object_store,
                 &manifest_dir,
@@ -2796,20 +3105,20 @@ mod tests {
             .unwrap_or(0);
 
             // Transactions: count files under _transactions (extension .txn)
-            let txn_dir = branch_path.child("_transactions");
+            let txn_dir = branch_path.clone().join("_transactions");
             self.counts.num_tx_files =
                 count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
                     .await
                     .unwrap_or(0);
 
             // Indices: count files under _indices
-            let idx_dir = branch_path.child(crate::dataset::INDICES_DIR);
+            let idx_dir = branch_path.clone().join(crate::dataset::INDICES_DIR);
             self.counts.num_index_files = count_dir(&self.dataset.object_store, &idx_dir, None)
                 .await
                 .unwrap_or(0);
 
             // Deletions: count files under _deletions (extensions .arrow / .bin)
-            let del_dir = branch_path.child("_deletions");
+            let del_dir = branch_path.clone().join("_deletions");
             self.counts.num_delete_files = count_dir(
                 &self.dataset.object_store,
                 &del_dir,
@@ -2819,7 +3128,7 @@ mod tests {
             .unwrap_or(0);
 
             // Data files: count .lance files under data/
-            let data_dir = branch_path.child(crate::dataset::DATA_DIR);
+            let data_dir = branch_path.clone().join(crate::dataset::DATA_DIR);
             self.counts.num_data_files =
                 count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
                     .await
@@ -2916,7 +3225,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 2);
-        assert_eq!(setup.branch1.counts.num_index_files, 8);
+        assert_eq!(setup.branch1.counts.num_index_files, 14);
         setup.assert_all_unchanged().await;
 
         setup.branch1.compact().await.unwrap();
@@ -2931,7 +3240,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 8);
+        assert_eq!(setup.branch1.counts.num_index_files, 14);
         setup.assert_all_unchanged().await;
 
         // Now we clean the referenced files of branch1 by branch2 and branch3
@@ -2945,14 +3254,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup.branch1.run_cleanup().await.unwrap();
 
         // Only the latest manifest is retained.
@@ -2961,7 +3270,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
     }
 
@@ -2978,7 +3287,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -2994,7 +3303,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch3.compact().await.unwrap();
         setup.branch3.run_cleanup().await.unwrap();
@@ -3004,7 +3313,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -3017,7 +3326,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
     }
 
     #[tokio::test]
@@ -3034,7 +3343,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 2);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 2);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -3054,7 +3363,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch4.compact().await.unwrap();
         setup.branch4.run_cleanup().await.unwrap();
@@ -3064,7 +3373,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
 
         setup.main.run_cleanup().await.unwrap();
@@ -3078,7 +3387,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
     }
 
     #[tokio::test]
@@ -3103,7 +3412,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 12);
+        assert_eq!(setup.main.counts.num_index_files, 21);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -3114,7 +3423,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 12);
+        assert_eq!(setup.main.counts.num_index_files, 21);
         setup.assert_all_unchanged().await;
 
         setup.branch1.write_data().await.unwrap();
@@ -3135,14 +3444,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 8);
+        assert_eq!(setup.branch2.counts.num_index_files, 14);
         setup.branch1.run_cleanup().await.unwrap();
         // Cleanup 4 index files referenced from branch2
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch3 holds references from main:
@@ -3158,7 +3467,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3168,7 +3477,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Cleanup doesn't take effects if we don't clean branch2 and branch1 first
@@ -3176,7 +3485,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         // Cleanup doesn't take effect if we don't clean branch2 first
         setup.branch1.run_cleanup().await.unwrap();
@@ -3184,7 +3493,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3193,7 +3502,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch1.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3202,7 +3511,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch4 holds references from main:
@@ -3214,7 +3523,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch4.write_data().await.unwrap();
         setup.branch4.compact().await.unwrap();
@@ -3225,7 +3534,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3234,7 +3543,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
     }
 
     #[tokio::test]
@@ -3258,7 +3567,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // After auto-clean: branch3
         // 2 appends produced 2 data files
         // 2 deletes produced 2 deletion files
@@ -3266,7 +3575,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3288,14 +3597,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3325,7 +3634,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
 
         setup.main.compact().await.unwrap();
         setup
@@ -3345,7 +3654,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
 
         setup.branch4.compact().await.unwrap();
         setup
@@ -3362,13 +3671,13 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.branch1.write_data().await.unwrap();
         setup.branch1.compact().await.unwrap();
@@ -3386,7 +3695,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // Branch3 and branch2 still hold references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3395,7 +3704,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.branch2.write_data().await.unwrap();
         setup.branch2.compact().await.unwrap();
@@ -3413,7 +3722,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // Branch3 still holds references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3422,7 +3731,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         // Branch3 still holds references from branch2:
         // - 1 manifest file
         // - 1 data files
@@ -3431,7 +3740,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3449,22 +3758,22 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup.assert_unchanged(&["branch4"]).await;
     }
 
@@ -3508,24 +3817,24 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
         // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup
             .branch3
@@ -3548,27 +3857,27 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 14);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.main.dataset.tags().delete("main-tag").await.unwrap();
         setup
@@ -3584,30 +3893,91 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
+    }
+
+    #[test]
+    fn test_calculate_duration_s3() {
+        // Normal case: duration is computed from S3 batch size and configured rate.
+        let normal_rate = 100;
+        let expected_duration_ns =
+            1_000_000_000u64.div_ceil(normal_rate * S3_DELETE_STREAM_BATCH_SIZE);
+        assert_eq!(
+            calculate_duration("s3".to_string(), normal_rate),
+            Duration::from_nanos(expected_duration_ns)
+        );
+
+        // Edge case: rate too small should be clamped to 1.
+        let min_rate_duration = calculate_duration("s3".to_string(), 1);
+        assert_eq!(calculate_duration("s3".to_string(), 0), min_rate_duration);
+
+        // Edge case: computed duration_ns too small should be clamped to at least 1ns.
+        let very_large_rate = 2_000_000;
+        assert_eq!(
+            calculate_duration("s3".to_string(), very_large_rate),
+            Duration::from_nanos(1)
+        );
     }
 
     #[tokio::test]
-    async fn test_version_checkpoint_comprehensive() {
+    async fn test_cleanup_with_rate_limit() {
+        // Create multiple versions with data files that will be deleted.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        // Create several old versions
+        for _ in 0..4 {
+            fixture.overwrite_some_data().await.unwrap();
+        }
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        // Set rate limit to 1 ops/second so cleanup of several files must take at least ~1s
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+            .delete_rate_limit(1)
+            .unwrap()
+            .build();
+
+        let start = std::time::Instant::now();
+        let db = fixture.open().await.unwrap();
+        let stats = cleanup_old_versions(&db, policy).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // We deleted old versions, so there should be removed files
+        assert!(
+            stats.old_versions > 0,
+            "expected some old versions to be removed"
+        );
+        // With rate=1 and multiple files, it must take at least 2s
+        // (even just 2 deletions at 1/s means ≥2s)
+        assert!(
+            elapsed.as_millis() >= 2000,
+            "expected cleanup to be rate-limited (elapsed: {:?})",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_archive_comprehensive() {
         use lance_table::format::ManifestSummary;
 
-        fn create_version_summary(version: u64) -> VersionSummary {
-            VersionSummary {
+        fn create_version_archive_entry(version: u64) -> VersionArchiveEntry {
+            VersionArchiveEntry {
                 version,
                 timestamp_millis: version as i64 * 1000,
                 manifest_summary: ManifestSummary {
@@ -3620,7 +3990,6 @@ mod tests {
                     total_rows: version * 100,
                 },
                 is_tagged: false,
-                is_cleaned_up: false,
                 transaction_uuid: None,
                 read_version: None,
                 operation_type: None,
@@ -3651,48 +4020,47 @@ mod tests {
         .await
         .unwrap();
 
-        let config = CheckpointConfig::default();
+        let config = VersionArchiveConfig::default();
 
-        let mut checkpoint =
-            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+        let mut archive =
+            VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
                 .await
                 .unwrap();
 
-        assert!(checkpoint.versions.is_empty());
-        assert_eq!(checkpoint.latest_version(), 0);
+        assert!(archive.versions.is_empty());
+        assert_eq!(archive.latest_version(), 0);
 
-        let summaries = vec![
-            create_version_summary(1),
-            create_version_summary(2),
-            create_version_summary(3),
+        let entries = vec![
+            create_version_archive_entry(1),
+            create_version_archive_entry(2),
+            create_version_archive_entry(3),
         ];
-        checkpoint.add_summaries(&summaries);
-        checkpoint.flush().await.unwrap();
+        archive.add_entries(&entries);
+        archive.flush().await.unwrap();
 
-        assert_eq!(checkpoint.versions.len(), 3);
-        assert_eq!(checkpoint.versions[0].version, 1);
-        assert_eq!(checkpoint.versions[1].version, 2);
-        assert_eq!(checkpoint.versions[2].version, 3);
+        assert_eq!(archive.versions.len(), 3);
+        assert_eq!(archive.versions[0].version, 1);
+        assert_eq!(archive.versions[1].version, 2);
+        assert_eq!(archive.versions[2].version, 3);
 
-        let loaded =
-            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
-                .await
-                .unwrap();
+        let loaded = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
 
         assert_eq!(loaded.versions.len(), 3);
         assert_eq!(loaded.latest_version(), 3);
 
-        let checkpoint_dir = checkpoint.checkpoint_dir();
+        let archive_dir = archive.archive_dir();
 
-        // Corrupt the checkpoint file to ensure graceful degradation
-        let lance_path = checkpoint_dir.child(format!("{:020}.lance", 3));
+        // Corrupt the archive file to ensure graceful degradation
+        let lance_path = archive_dir.join(format!("{:020}.lance", 3));
         db.object_store
             .put(&lance_path, b"corrupted data")
             .await
             .unwrap();
 
         let corrupted_loaded =
-            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
                 .await
                 .unwrap();
 
@@ -3700,7 +4068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_checkpoint_integration() {
+    async fn test_cleanup_archive_integration() {
         let fixture = MockDatasetFixture::try_new().unwrap();
 
         fixture.create_some_data().await.unwrap();
@@ -3717,38 +4085,33 @@ mod tests {
         fixture.run_cleanup_with_policy(policy).await.unwrap();
 
         let db = fixture.open().await.unwrap();
-        let config = CheckpointConfig::from_config(&db.manifest.config);
-        let checkpoint =
-            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
-                .await
-                .unwrap();
+        let config = VersionArchiveConfig::from_config(&db.manifest.config);
+        let archive = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            checkpoint.versions.len(),
-            3,
-            "Expected 3 versions in checkpoint"
-        );
+        assert_eq!(archive.versions.len(), 3, "Expected 3 versions in archive");
 
-        assert_eq!(checkpoint.versions[0].version, 1);
-        assert_eq!(checkpoint.versions[1].version, 2);
-        assert_eq!(checkpoint.versions[2].version, 3);
+        assert_eq!(archive.versions[0].version, 1);
+        assert_eq!(archive.versions[1].version, 2);
+        assert_eq!(archive.versions[2].version, 3);
 
-        assert!(
-            checkpoint.versions[0].is_cleaned_up,
-            "Version 1 should be cleaned up"
-        );
-        assert!(
-            checkpoint.versions[1].is_cleaned_up,
-            "Version 2 should be cleaned up"
-        );
-        assert!(
-            !checkpoint.versions[2].is_cleaned_up,
-            "Latest version should not be cleaned up"
-        );
+        let versions = db.versions().await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, 3);
+
+        let live_versions: HashSet<u64> = versions.iter().map(|version| version.version).collect();
+        let cleaned_versions: Vec<u64> = archive
+            .versions
+            .iter()
+            .filter(|entry| !live_versions.contains(&entry.version))
+            .map(|entry| entry.version)
+            .collect();
+        assert_eq!(cleaned_versions, vec![1, 2]);
     }
 
     #[tokio::test]
-    async fn test_cleanup_checkpoint_with_tagged_version() {
+    async fn test_cleanup_archive_with_tagged_version() {
         let fixture = MockDatasetFixture::try_new().unwrap();
 
         fixture.create_some_data().await.unwrap();
@@ -3766,14 +4129,13 @@ mod tests {
         fixture.run_cleanup_with_policy(policy).await.unwrap();
 
         let db = fixture.open().await.unwrap();
-        let config = CheckpointConfig::from_config(&db.manifest.config);
-        let checkpoint =
-            VersionCheckpoint::load_or_new(db.base.clone(), db.object_store.clone(), config)
-                .await
-                .unwrap();
+        let config = VersionArchiveConfig::from_config(&db.manifest.config);
+        let archive = VersionArchive::load_or_new(db.base.clone(), db.object_store.clone(), config)
+            .await
+            .unwrap();
 
-        let v1 = checkpoint.versions.iter().find(|v| v.version == 1);
-        assert!(v1.is_some(), "Version 1 should exist in checkpoint");
+        let v1 = archive.versions.iter().find(|v| v.version == 1);
+        assert!(v1.is_some(), "Version 1 should exist in archive");
         assert!(v1.unwrap().is_tagged, "Version 1 should be tagged");
     }
 }

@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use super::TakeExec;
 use arrow_schema::Schema as ArrowSchema;
+#[allow(deprecated)]
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result as DFResult,
     physical_optimizer::{PhysicalOptimizerRule, optimizer::PhysicalOptimizer},
-    physical_plan::{
-        ExecutionPlan, coalesce_batches::CoalesceBatchesExec, projection::ProjectionExec,
-    },
+    physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
 use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 
@@ -70,6 +70,7 @@ impl CoalesceTake {
 }
 
 impl PhysicalOptimizerRule for CoalesceTake {
+    #[allow(deprecated)]
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -170,9 +171,16 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
+        // Rewrite `COUNT(*)`-style aggregates into CountFromMaskExec so they
+        // can be answered without scanning column data. Runs before the
+        // generic rules so they don't see the rewritten subtree.
+        Arc::new(crate::io::exec::count_pushdown::CountPushdown),
         Arc::new(crate::io::exec::optimizer::CoalesceTake),
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
         // Push down limit into FilteredReadExec and other Execs via with_fetch()
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
+        // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
+        // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
+        Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
     ])
 }

@@ -15,8 +15,9 @@ use std::{borrow::Cow, ops::Deref};
 use deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, LanceCache},
-    utils::{deletion::DeletionVector, mask::RowAddrMask},
+    utils::deletion::DeletionVector,
 };
+use lance_select::RowAddrMask;
 use lance_table::{
     format::{DeletionFile, Manifest},
     rowids::{RowIdIndex, RowIdSequence},
@@ -33,12 +34,6 @@ impl GlobalMetadataCache {
         // Create a sub-cache for the dataset by adding the URI as a key prefix.
         // This prevents collisions between different datasets.
         DSMetadataCache(self.0.with_key_prefix(uri))
-    }
-
-    /// Create a file-specific metadata cache with the given prefix.
-    /// This is used by file readers and other components that need file-level caching.
-    pub(crate) fn file_metadata_cache(&self, path: &Path) -> LanceCache {
-        self.0.with_key_prefix(path.as_ref())
     }
 }
 
@@ -75,13 +70,15 @@ pub struct ManifestKey<'a> {
 
 impl CacheKey for ManifestKey<'_> {
     type ValueType = Manifest;
-
     fn key(&self) -> Cow<'_, str> {
         if let Some(e_tag) = self.e_tag {
             Cow::Owned(format!("manifest/{}/{}", self.version, e_tag))
         } else {
             Cow::Owned(format!("manifest/{}", self.version))
         }
+    }
+    fn type_name() -> &'static str {
+        "Manifest"
     }
 }
 
@@ -92,9 +89,11 @@ pub struct TransactionKey {
 
 impl CacheKey for TransactionKey {
     type ValueType = Transaction;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("txn/{}", self.version))
+    }
+    fn type_name() -> &'static str {
+        "Transaction"
     }
 }
 
@@ -106,7 +105,6 @@ pub struct DeletionFileKey<'a> {
 
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
             "deletion/{}/{}/{}/{}",
@@ -116,18 +114,30 @@ impl CacheKey for DeletionFileKey<'_> {
             self.deletion_file.file_type.suffix()
         ))
     }
+    fn type_name() -> &'static str {
+        "DeletionVector"
+    }
 }
 
 #[derive(Debug)]
 pub struct RowAddrMaskKey {
     pub version: u64,
+    /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
+    /// when it covers all fragments in the dataset. Two consumers that ask
+    /// for different subsets must not poison each other's cache entry.
+    pub restrict_hash: Option<u64>,
 }
 
 impl CacheKey for RowAddrMaskKey {
     type ValueType = RowAddrMask;
-
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_addr_mask/{}", self.version))
+        match self.restrict_hash {
+            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
+            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+        }
+    }
+    fn type_name() -> &'static str {
+        "RowAddrMask"
     }
 }
 
@@ -138,9 +148,11 @@ pub struct RowIdIndexKey {
 
 impl CacheKey for RowIdIndexKey {
     type ValueType = RowIdIndex;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_index/{}", self.version))
+    }
+    fn type_name() -> &'static str {
+        "RowIdIndex"
     }
 }
 
@@ -151,9 +163,11 @@ pub struct RowIdSequenceKey {
 
 impl CacheKey for RowIdSequenceKey {
     type ValueType = RowIdSequence;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
+    }
+    fn type_name() -> &'static str {
+        "RowIdSequence"
     }
 }
 

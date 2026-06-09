@@ -20,14 +20,16 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
+    compute_next_prefix,
 };
-use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion_expr::Accumulator;
+use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array};
+use arrow_array::{
+    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+};
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -130,9 +132,45 @@ impl DeepSizeOf for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
-    /// Evaluates whether a zone could potentially contain values matching the query
-    /// For NaN, total order is used here
-    /// reference: https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp
+    fn scalar_is_nan(value: &ScalarValue) -> bool {
+        match value {
+            ScalarValue::Float16(Some(value)) => value.is_nan(),
+            ScalarValue::Float32(Some(value)) => value.is_nan(),
+            ScalarValue::Float64(Some(value)) => value.is_nan(),
+            _ => false,
+        }
+    }
+
+    /// Returns true if the zone has a non-null, non-NaN min value.
+    fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
+        !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
+    }
+
+    /// Returns true if both min and max are non-null / non-NaN.
+    fn zone_has_finite_extrema(zone: &ZoneMapStatistics) -> bool {
+        Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
+    }
+
+    fn finite_value_may_be_in_zone(value: &ScalarValue, zone: &ZoneMapStatistics) -> bool {
+        if !Self::zone_has_finite_min(zone) || value < &zone.min {
+            return false;
+        }
+
+        if Self::scalar_is_nan(&zone.max) {
+            // A NaN max means this zone had both NaNs and finite values.  The
+            // finite max is not persisted, so keep the zone as a false positive
+            // instead of using total ordering to prune it.
+            return true;
+        }
+
+        !zone.max.is_null() && value <= &zone.max
+    }
+
+    /// Evaluates whether a zone could potentially contain values matching the query.
+    ///
+    /// NaN query values use the explicit `nan_count`.  When the stored max is
+    /// NaN we do not treat it as a finite upper bound; that representation means
+    /// the zone had finite values plus NaNs, and the finite max was not persisted.
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
@@ -164,20 +202,19 @@ impl ZoneMapIndex {
                     return Ok(zone.nan_count > 0);
                 }
 
-                // Check if target is within the zone's range
-                // Handle the case where zone.max is NaN (zone contains both finite values and NaN)
-                let min_check = target >= &zone.min;
-                let max_check = match &zone.max {
-                    ScalarValue::Float16(Some(f)) if f.is_nan() => true,
-                    ScalarValue::Float32(Some(f)) if f.is_nan() => true,
-                    ScalarValue::Float64(Some(f)) if f.is_nan() => true,
-                    _ => target <= &zone.max,
-                };
-                Ok(min_check && max_check)
+                if !Self::zone_has_finite_min(zone) {
+                    return Ok(false);
+                }
+
+                Ok(Self::finite_value_may_be_in_zone(target, zone))
             }
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
                 // the zone's [min, max] and the query's range
+                if !Self::zone_has_finite_min(zone) {
+                    return Ok(false);
+                }
+
                 let zone_min = &zone.min;
                 let zone_max = &zone.max;
 
@@ -300,24 +337,28 @@ impl ZoneMapIndex {
                                 if f.is_nan() {
                                     zone.nan_count > 0
                                 } else {
-                                    value >= &zone.min && value <= &zone.max
+                                    Self::finite_value_may_be_in_zone(value, zone)
                                 }
                             }
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
                                 } else {
-                                    value >= &zone.min && value <= &zone.max
+                                    Self::finite_value_may_be_in_zone(value, zone)
                                 }
                             }
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
                                 } else {
-                                    value >= &zone.min && value <= &zone.max
+                                    Self::finite_value_may_be_in_zone(value, zone)
                                 }
                             }
-                            _ => value >= &zone.min && value <= &zone.max,
+                            _ => {
+                                Self::zone_has_finite_extrema(zone)
+                                    && value >= &zone.min
+                                    && value <= &zone.max
+                            }
                         }
                     }
                 }))
@@ -325,6 +366,53 @@ impl ZoneMapIndex {
             SargableQuery::FullTextSearch(_) => Err(Error::not_supported_source(
                 "full text search is not supported for zonemap indexes".into(),
             )),
+            SargableQuery::LikePrefix(prefix) => {
+                // For prefix matching, a zone can match if:
+                // - zone.max >= prefix (there could be values >= prefix)
+                // - zone.min < next_prefix (there could be values < next_prefix)
+                //
+                // For example, prefix "foo":
+                // - Zone [aaa, azz]: max="azz" < "foo", so no match
+                // - Zone [fa, foz]: min="fa" < "fop", max="foz" >= "foo", so potential match
+                // - Zone [fop, fzz]: min="fop" >= "fop", so no match
+
+                let prefix_str = match prefix {
+                    ScalarValue::Utf8(Some(s)) => s.as_str(),
+                    ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+                    _ => return Ok(true), // Conservative: include zone if not a string prefix
+                };
+
+                // Empty prefix matches everything
+                if prefix_str.is_empty() {
+                    return Ok(true);
+                }
+
+                // Check zone.max >= prefix
+                let max_check = &zone.max >= prefix;
+                if !max_check {
+                    return Ok(false);
+                }
+
+                // Compute next_prefix by incrementing the last byte
+                // If the prefix ends with 0xFF bytes, we need to handle overflow
+                let next_prefix = compute_next_prefix(prefix_str);
+
+                match next_prefix {
+                    Some(next) => {
+                        // Check zone.min < next_prefix
+                        let next_scalar = match prefix {
+                            ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(next)),
+                            ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(next)),
+                            _ => return Ok(true),
+                        };
+                        Ok(zone.min < next_scalar)
+                    }
+                    None => {
+                        // No upper bound (prefix is all 0xFF), so any zone with max >= prefix matches
+                        Ok(true)
+                    }
+                }
+            }
         }
     }
 
@@ -536,7 +624,7 @@ impl ScalarIndex for ZoneMapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Train new zones for the incoming data stream
         let schema = new_data.schema();
@@ -557,6 +645,7 @@ impl ScalarIndex for ZoneMapIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -705,50 +794,59 @@ impl ZoneMapIndexBuilder {
 /// trainer takes care of chunking and fragment boundaries.
 struct ZoneMapProcessor {
     data_type: DataType,
-    min: MinAccumulator,
-    max: MaxAccumulator,
-    null_count: u32,
-    nan_count: u32,
+    statistics: StatisticsAccumulator,
 }
 
 impl ZoneMapProcessor {
     fn new(data_type: DataType) -> Result<Self> {
-        let min = MinAccumulator::try_new(&data_type)?;
-        let max = MaxAccumulator::try_new(&data_type)?;
         Ok(Self {
+            statistics: StatisticsAccumulator::new(&data_type),
             data_type,
-            min,
-            max,
-            null_count: 0,
-            nan_count: 0,
         })
     }
 
-    fn count_nans(array: &ArrayRef) -> u32 {
-        match array.data_type() {
-            DataType::Float16 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float16Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float32 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float32Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float64 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float64Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            _ => 0,
+    fn scalar_value_from_stat(
+        value: Option<&ArrayRef>,
+        data_type: &DataType,
+    ) -> Result<ScalarValue> {
+        let array = value
+            .cloned()
+            .unwrap_or_else(|| new_null_array(data_type, 1));
+        Ok(ScalarValue::try_from_array(&array, 0)?)
+    }
+
+    fn stat_count_to_u32(name: &str, value: u64) -> Result<u32> {
+        u32::try_from(value).map_err(|_| {
+            Error::invalid_input(format!(
+                "{} value {} exceeds the supported UInt32 range",
+                name, value
+            ))
+        })
+    }
+
+    fn nan_scalar(data_type: &DataType) -> Option<ScalarValue> {
+        match data_type {
+            DataType::Float16 => Some(ScalarValue::Float16(Some(half::f16::NAN))),
+            DataType::Float32 => Some(ScalarValue::Float32(Some(f32::NAN))),
+            DataType::Float64 => Some(ScalarValue::Float64(Some(f64::NAN))),
+            _ => None,
         }
+    }
+
+    fn max_value_from_stats(
+        value: Option<&ArrayRef>,
+        data_type: &DataType,
+        nan_count: u32,
+    ) -> Result<ScalarValue> {
+        if nan_count > 0
+            && let Some(nan) = Self::nan_scalar(data_type)
+        {
+            // DataFusion's max accumulator surfaced NaN as the zone max.  Keep
+            // that stored zonemap shape while using arrow_stats so existing
+            // range/equality pruning remains conservative around NaN.
+            return Ok(nan);
+        }
+        Self::scalar_value_from_stat(value, data_type)
     }
 }
 
@@ -756,28 +854,31 @@ impl ZoneProcessor for ZoneMapProcessor {
     type ZoneStatistics = ZoneMapStatistics;
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
-        self.null_count += array.null_count() as u32;
-        self.nan_count += Self::count_nans(array);
-        self.min.update_batch(std::slice::from_ref(array))?;
-        self.max.update_batch(std::slice::from_ref(array))?;
+        self.statistics.update(array)?;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+        let statistics = self.statistics.statistics();
+        let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
         Ok(ZoneMapStatistics {
-            min: self.min.evaluate()?,
-            max: self.max.evaluate()?,
-            null_count: self.null_count,
-            nan_count: self.nan_count,
+            min: Self::scalar_value_from_stat(
+                statistics.min.as_ref().map(|scalar| scalar.as_array()),
+                &self.data_type,
+            )?,
+            max: Self::max_value_from_stats(
+                statistics.max.as_ref().map(|scalar| scalar.as_array()),
+                &self.data_type,
+                nan_count,
+            )?,
+            null_count: Self::stat_count_to_u32("null_count", statistics.null_count)?,
+            nan_count,
             bound,
         })
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.min = MinAccumulator::try_new(&self.data_type)?;
-        self.max = MaxAccumulator::try_new(&self.data_type)?;
-        self.null_count = 0;
-        self.nan_count = 0;
+        self.statistics.reset();
         Ok(())
     }
 }
@@ -861,7 +962,11 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(index_name, true)))
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
     }
 
     async fn train_index(
@@ -869,15 +974,9 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "ZoneMap index does not support fragment training".into(),
-            ));
-        }
-
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
             .map_err(|_| {
@@ -890,6 +989,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -919,13 +1019,16 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{StreamExt, TryStreamExt, stream};
-    use lance_core::utils::mask::NullableRowAddrSet;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{ROW_ADDR, cache::LanceCache, utils::mask::RowAddrTreeMap};
+    use lance_core::{
+        ROW_ADDR,
+        cache::{LanceCache, WeakLanceCache},
+    };
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
+    use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 
     use crate::scalar::{
         SargableQuery, ScalarIndex, SearchResult,
@@ -2196,5 +2299,290 @@ mod tests {
             fragment1_rowaddrs.values(),
             &[4294967296, 4294967297, 4294967298, 4294967299, 4294967300]
         );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_query() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create zones with different string ranges
+        // Zone 0: ["aaa", "azz"] - should NOT match "foo%"
+        // Zone 1: ["bar", "baz"] - should NOT match "foo%"
+        // Zone 2: ["fa", "foz"]  - should match "foo%" (contains potential matches)
+        // Zone 3: ["fop", "fzz"] - should NOT match "foo%" (all values >= "fop")
+        // Zone 4: ["foo", "foobar"] - should match "foo%"
+        // Zone 5: ["gaa", "gzz"] - should NOT match "foo%"
+
+        let zones = vec![
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("aaa".to_string())),
+                max: ScalarValue::Utf8(Some("azz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("bar".to_string())),
+                max: ScalarValue::Utf8(Some("baz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("fa".to_string())),
+                max: ScalarValue::Utf8(Some("foz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 2,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("fop".to_string())),
+                max: ScalarValue::Utf8(Some("fzz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 3,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("foo".to_string())),
+                max: ScalarValue::Utf8(Some("foobar".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 4,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("gaa".to_string())),
+                max: ScalarValue::Utf8(Some("gzz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 5,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::Utf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix query for "foo"
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("foo".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match zones 2 and 4 only
+        let mut expected = RowAddrTreeMap::new();
+        // Zone 2: fragment 2
+        expected.insert_range((2u64 << 32)..((2u64 << 32) + 100));
+        // Zone 4: fragment 4
+        expected.insert_range((4u64 << 32)..((4u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_edge_cases() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test edge cases for LIKE prefix
+        let zones = vec![
+            // Zone with values that contain the prefix exactly
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("test".to_string())),
+                max: ScalarValue::Utf8(Some("test".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            // Zone with values that span across the prefix boundary
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("te".to_string())),
+                max: ScalarValue::Utf8(Some("tf".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            // Zone completely before prefix
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("abc".to_string())),
+                max: ScalarValue::Utf8(Some("def".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 2,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::Utf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix "test"
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("test".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match zones 0 and 1
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..100); // Zone 0: fragment 0
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+
+        // Test empty prefix - should match all zones
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..100); // Zone 0: fragment 0
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+        expected.insert_range((2u64 << 32)..((2u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_large_utf8() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test with LargeUtf8 type
+        let zones = vec![
+            ZoneMapStatistics {
+                min: ScalarValue::LargeUtf8(Some("aaa".to_string())),
+                max: ScalarValue::LargeUtf8(Some("azz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::LargeUtf8(Some("foo".to_string())),
+                max: ScalarValue::LargeUtf8(Some("foobar".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::LargeUtf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix with LargeUtf8
+        let query = SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("foo".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match only zone 1
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[test]
+    fn test_compute_next_prefix() {
+        use super::compute_next_prefix;
+
+        // Basic cases
+        assert_eq!(compute_next_prefix("foo"), Some("fop".to_string()));
+        assert_eq!(compute_next_prefix("abc"), Some("abd".to_string()));
+        assert_eq!(compute_next_prefix("a"), Some("b".to_string()));
+        assert_eq!(compute_next_prefix("z"), Some("{".to_string())); // 'z' + 1 = '{'
+
+        // Edge case: prefix with 'z' at the end
+        assert_eq!(compute_next_prefix("abz"), Some("ab{".to_string()));
+
+        // Edge case with tilde (~) which is 0x7E
+        assert_eq!(compute_next_prefix("ab~"), Some("ab\x7f".to_string()));
+
+        // Empty prefix
+        assert_eq!(compute_next_prefix(""), None);
+
+        // Non-ASCII: works correctly by incrementing Unicode code points
+        // é (U+00E9) -> ê (U+00EA)
+        assert_eq!(compute_next_prefix("café"), Some("cafê".to_string()));
+        // 中 (U+4E2D) -> 丮 (U+4E2E)
+        assert_eq!(compute_next_prefix("abc中"), Some("abc丮".to_string()));
+        // ÿ (U+00FF) -> Ā (U+0100) - crosses byte boundary but works
+        assert_eq!(compute_next_prefix("cafÿ"), Some("cafĀ".to_string()));
+
+        // Edge case: character just before surrogate range
+        // U+D7FF -> U+E000 (skips surrogate range U+D800-U+DFFF)
+        assert_eq!(
+            compute_next_prefix("a\u{D7FF}"),
+            Some("a\u{E000}".to_string())
+        );
+
+        // Edge case: max Unicode character U+10FFFF, falls back to previous char
+        assert_eq!(compute_next_prefix("ab\u{10FFFF}"), Some("ac".to_string()));
+        // All max characters
+        assert_eq!(compute_next_prefix("\u{10FFFF}\u{10FFFF}"), None);
     }
 }

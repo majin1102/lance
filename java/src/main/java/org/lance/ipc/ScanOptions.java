@@ -31,12 +31,60 @@ public class ScanOptions {
   private final Optional<Long> offset;
   private final Optional<Query> nearest;
   private final Optional<FullTextQuery> fullTextQuery;
+  private final boolean prefilter;
   private final boolean withRowId;
   private final boolean withRowAddress;
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
   private final Optional<ByteBuffer> substraitAggregate;
+  private final boolean collectStats;
+  private final boolean fastSearch;
+  private final boolean includeDeletedRows;
+  private final boolean strictBatchSize;
+  private final boolean disableScoringAutoprojection;
+
+  public ScanOptions(
+      Optional<List<Integer>> fragmentIds,
+      Optional<Long> batchSize,
+      Optional<List<String>> columns,
+      Optional<String> filter,
+      Optional<ByteBuffer> substraitFilter,
+      Optional<Long> limit,
+      Optional<Long> offset,
+      Optional<Query> nearest,
+      Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
+      boolean withRowId,
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats) {
+    this(
+        fragmentIds,
+        batchSize,
+        columns,
+        filter,
+        substraitFilter,
+        limit,
+        offset,
+        nearest,
+        fullTextQuery,
+        prefilter,
+        withRowId,
+        withRowAddress,
+        batchReadahead,
+        columnOrderings,
+        useScalarIndex,
+        substraitAggregate,
+        collectStats,
+        false,
+        false,
+        false,
+        false);
+  }
 
   /**
    * Constructor for LanceScanOptions.
@@ -48,6 +96,7 @@ public class ScanOptions {
    *     Otherwise, only columns present in the List will be scanned.
    * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param substraitFilter (Optional) Substrait filter expression.
+   * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param limit (Optional) Maximum number of rows to return.
    * @param offset (Optional) Number of rows to skip before returning results.
    * @param withRowId Whether to include the row ID in the results.
@@ -57,6 +106,8 @@ public class ScanOptions {
    * @param columnOrderings (Optional) Column orderings for result sorting.
    * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
    * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
+   * @param collectStats Whether to collect scan execution statistics. Default is false.
+   * @param fastSearch Whether to only search indexed fragments. Default is false.
    */
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -68,12 +119,18 @@ public class ScanOptions {
       Optional<Long> offset,
       Optional<Query> nearest,
       Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<ByteBuffer> substraitAggregate) {
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats,
+      boolean fastSearch,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -86,12 +143,18 @@ public class ScanOptions {
     this.offset = offset;
     this.nearest = nearest;
     this.fullTextQuery = fullTextQuery;
+    this.prefilter = prefilter;
     this.withRowId = withRowId;
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
     this.substraitAggregate = substraitAggregate;
+    this.collectStats = collectStats;
+    this.fastSearch = fastSearch;
+    this.includeDeletedRows = includeDeletedRows;
+    this.strictBatchSize = strictBatchSize;
+    this.disableScoringAutoprojection = disableScoringAutoprojection;
   }
 
   /**
@@ -176,6 +239,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to prefilter before nearest neighbor search.
+   *
+   * @return true if prefilter should be applied, false otherwise.
+   */
+  public boolean isPrefilter() {
+    return prefilter;
+  }
+
+  /**
    * Get whether to include the row ID.
    *
    * @return true if row ID should be included, false otherwise.
@@ -216,12 +288,52 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to only search indexed fragments.
+   *
+   * @return true if unindexed fragments should be skipped, false otherwise.
+   */
+  public boolean isFastSearch() {
+    return fastSearch;
+  }
+
+  /**
    * Get the substrait aggregate expression.
    *
    * @return Optional containing the substrait aggregate if specified, otherwise empty.
    */
   public Optional<ByteBuffer> getSubstraitAggregate() {
     return substraitAggregate;
+  }
+
+  public boolean isCollectStats() {
+    return collectStats;
+  }
+
+  /**
+   * Get whether to include deleted rows in scan results.
+   *
+   * @return true if deleted rows should be included, false otherwise.
+   */
+  public boolean isIncludeDeletedRows() {
+    return includeDeletedRows;
+  }
+
+  /**
+   * Get whether to enforce strict batch sizing.
+   *
+   * @return true if batch sizes must be strictly enforced, false otherwise.
+   */
+  public boolean isStrictBatchSize() {
+    return strictBatchSize;
+  }
+
+  /**
+   * Get whether to disable scoring autoprojection.
+   *
+   * @return true if scoring column autoprojection is disabled, false otherwise.
+   */
+  public boolean isDisableScoringAutoprojection() {
+    return disableScoringAutoprojection;
   }
 
   @Override
@@ -238,14 +350,20 @@ public class ScanOptions {
         .add("offset", offset.orElse(null))
         .add("nearest", nearest.orElse(null))
         .add("fullTextQuery", fullTextQuery.orElse(null))
+        .add("prefilter", prefilter)
         .add("withRowId", withRowId)
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
+        .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
             substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
+        .add("collectStats", collectStats)
+        .add("includeDeletedRows", includeDeletedRows)
+        .add("strictBatchSize", strictBatchSize)
+        .add("disableScoringAutoprojection", disableScoringAutoprojection)
         .toString();
   }
 
@@ -260,12 +378,18 @@ public class ScanOptions {
     private Optional<Long> offset = Optional.empty();
     private Optional<Query> nearest = Optional.empty();
     private Optional<FullTextQuery> fullTextQuery = Optional.empty();
+    private boolean prefilter = false;
     private boolean withRowId = false;
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
+    private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
+    private boolean collectStats = false;
+    private boolean includeDeletedRows = false;
+    private boolean strictBatchSize = false;
+    private boolean disableScoringAutoprojection = false;
 
     public Builder() {}
 
@@ -284,12 +408,18 @@ public class ScanOptions {
       this.offset = options.getOffset();
       this.nearest = options.getNearest();
       this.fullTextQuery = options.getFullTextQuery();
+      this.prefilter = options.isPrefilter();
       this.withRowId = options.isWithRowId();
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
+      this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
+      this.collectStats = options.isCollectStats();
+      this.includeDeletedRows = options.isIncludeDeletedRows();
+      this.strictBatchSize = options.isStrictBatchSize();
+      this.disableScoringAutoprojection = options.isDisableScoringAutoprojection();
     }
 
     /**
@@ -392,6 +522,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to prefilter during nearest neighbor search.
+     *
+     * @param prefilter true to apply prefilter, false otherwise.
+     * @return Builder instance for method chaining.
+     */
+    public Builder prefilter(boolean prefilter) {
+      this.prefilter = prefilter;
+      return this;
+    }
+
+    /**
      * Set whether to include the row ID.
      *
      * @param withRowId true to include row ID, false otherwise.
@@ -445,6 +586,21 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to only search indexed fragments.
+     *
+     * <p>This is a weak-consistency mode for vector search, full text search, and scalar-indexed
+     * filters. It can reduce latency by skipping recently appended fragments that are not covered
+     * by the relevant index.
+     *
+     * @param fastSearch true to skip unindexed fragments, false otherwise. Default is false.
+     * @return Builder instance for method chaining.
+     */
+    public Builder fastSearch(boolean fastSearch) {
+      this.fastSearch = fastSearch;
+      return this;
+    }
+
+    /**
      * Set the substrait aggregate expression.
      *
      * @param substraitAggregate Substrait aggregate expression.
@@ -452,6 +608,53 @@ public class ScanOptions {
      */
     public Builder substraitAggregate(ByteBuffer substraitAggregate) {
       this.substraitAggregate = Optional.of(substraitAggregate);
+      return this;
+    }
+
+    /**
+     * Enable or disable scan execution statistics collection.
+     *
+     * <p>When enabled, the native scanner will collect statistics (see {@link ScanStats}) for the
+     * scan and make them available via {@link LanceScanner#getStats()} after the scan stream is
+     * fully consumed and closed.
+     *
+     * <p>Default is false.
+     */
+    public Builder collectStats(boolean collectStats) {
+      this.collectStats = collectStats;
+      return this;
+    }
+
+    /**
+     * Set whether to include deleted rows in scan results. Default is false.
+     *
+     * @param includeDeletedRows whether to include deleted rows
+     * @return Builder instance for method chaining.
+     */
+    public Builder includeDeletedRows(boolean includeDeletedRows) {
+      this.includeDeletedRows = includeDeletedRows;
+      return this;
+    }
+
+    /**
+     * Set whether to enforce strict batch sizing. Default is false.
+     *
+     * @param strictBatchSize whether to enforce strict batch sizing
+     * @return Builder instance for method chaining.
+     */
+    public Builder strictBatchSize(boolean strictBatchSize) {
+      this.strictBatchSize = strictBatchSize;
+      return this;
+    }
+
+    /**
+     * Set whether to disable scoring column autoprojection. Default is false.
+     *
+     * @param disableScoringAutoprojection whether to disable autoprojection
+     * @return Builder instance for method chaining.
+     */
+    public Builder disableScoringAutoprojection(boolean disableScoringAutoprojection) {
+      this.disableScoringAutoprojection = disableScoringAutoprojection;
       return this;
     }
 
@@ -471,12 +674,18 @@ public class ScanOptions {
           offset,
           nearest,
           fullTextQuery,
+          prefilter,
           withRowId,
           withRowAddress,
           batchReadahead,
           columnOrderings,
           useScalarIndex,
-          substraitAggregate);
+          substraitAggregate,
+          collectStats,
+          fastSearch,
+          includeDeletedRows,
+          strictBatchSize,
+          disableScoringAutoprojection);
     }
   }
 }

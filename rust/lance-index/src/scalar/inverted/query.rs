@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::scalar::inverted::lance_tokenizer::DocType;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use crate::scalar::inverted::document_tokenizer::DocType;
+use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
     pub limit: Option<usize>,
     pub wand_factor: f32,
@@ -625,7 +625,7 @@ impl BooleanQuery {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct BooleanMatchPlan {
     pub column: String,
     pub should: Vec<MatchQuery>,
@@ -633,7 +633,7 @@ pub(crate) struct BooleanMatchPlan {
     pub must_not: Vec<MatchQuery>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl BooleanMatchPlan {
     pub(crate) fn try_build(query: &FtsQuery) -> Option<Self> {
         match query {
@@ -719,12 +719,19 @@ impl FtsQueryNode for BooleanQuery {
 #[derive(Clone)]
 pub struct Tokens {
     tokens: Vec<String>,
+    positions: Vec<u32>,
     tokens_map: HashMap<String, usize>,
     token_type: DocType,
 }
 
 impl Tokens {
     pub fn new(tokens: Vec<String>, token_type: DocType) -> Self {
+        let positions = (0..tokens.len() as u32).collect();
+        Self::with_positions(tokens, positions, token_type)
+    }
+
+    pub fn with_positions(tokens: Vec<String>, positions: Vec<u32>, token_type: DocType) -> Self {
+        debug_assert_eq!(tokens.len(), positions.len());
         let mut tokens_vec = vec![];
         let mut tokens_map = HashMap::new();
         for (idx, token) in tokens.into_iter().enumerate() {
@@ -734,6 +741,7 @@ impl Tokens {
 
         Self {
             tokens: tokens_vec,
+            positions,
             tokens_map,
             token_type,
         }
@@ -762,6 +770,10 @@ impl Tokens {
     pub fn get_token(&self, index: usize) -> &str {
         &self.tokens[index]
     }
+
+    pub fn position(&self, index: usize) -> u32 {
+        self.positions[index]
+    }
 }
 
 impl IntoIterator for Tokens {
@@ -786,10 +798,12 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
     let token_type = tokenizer.doc_type();
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
+    let mut positions = Vec::new();
     while let Some(token) = stream.next() {
         tokens.push(token.text.clone());
+        positions.push(token.position as u32);
     }
-    Tokens::new(tokens, token_type)
+    Tokens::with_positions(tokens, positions, token_type)
 }
 
 pub fn has_query_token(

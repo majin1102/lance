@@ -8,7 +8,7 @@ use std::{env, path::PathBuf};
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
 
-pub mod lance_tokenizer;
+pub mod document_tokenizer;
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;
 
@@ -19,8 +19,14 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::{
+use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
+};
+pub use lance_tokenizer::Language;
+use lance_tokenizer::{
+    AsciiFoldingFilter, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
+    SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
+    WhitespaceTokenizer,
 };
 
 /// Tokenizer configs
@@ -35,6 +41,7 @@ pub struct InvertedIndexParams {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -43,7 +50,7 @@ pub struct InvertedIndexParams {
 
     /// language for stemming and stop words
     /// this is only used when `stem` or `remove_stop_words` is true
-    pub(crate) language: tantivy::tokenizer::Language,
+    pub(crate) language: Language,
 
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
@@ -90,10 +97,28 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) prefix_only: bool,
 
-    /// If true, skip the partition merge stage after indexing.
-    /// This can be useful for distributed indexing where merge is handled separately.
-    #[serde(default)]
-    pub(crate) skip_merge: bool,
+    /// Total memory limit in MiB for the build stage.
+    ///
+    /// This is split evenly across FTS workers at build time. By default Lance
+    /// uses roughly `num_cpus / 2` workers, unless `LANCE_FTS_NUM_SHARDS` is set.
+    /// If unset, each worker defaults to a 2 GiB build-time memory limit.
+    ///
+    /// This is a build-time only parameter and is not persisted with the index.
+    #[serde(
+        rename = "memory_limit",
+        skip_serializing,
+        default,
+        alias = "worker_memory_limit_mb"
+    )]
+    pub(crate) memory_limit_mb: Option<u64>,
+
+    /// Number of workers to use for FTS build.
+    ///
+    /// This is a build-time only parameter and is not persisted with the index.
+    /// By default Lance uses roughly `num_cpus / 2` workers.
+    /// The effective worker count is clamped to `[1, num_cpus - 2]`.
+    #[serde(rename = "num_workers", skip_serializing, default)]
+    pub(crate) num_workers: Option<usize>,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -127,7 +152,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                 .base_tokenizer
                 .as_ref()
                 .cloned()
-                .unwrap_or(defaults.base_tokenizer),
+                .unwrap_or_else(|| "simple".to_string()),
             language: serde_json::from_str(details.language.as_str())?,
             with_position: details.with_position,
             max_token_length: details.max_token_length.map(|l| l as usize),
@@ -139,7 +164,8 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
-            skip_merge: defaults.skip_merge,
+            memory_limit_mb: defaults.memory_limit_mb,
+            num_workers: defaults.num_workers,
         })
     }
 }
@@ -158,7 +184,7 @@ fn default_max_ngram_length() -> u32 {
 
 impl Default for InvertedIndexParams {
     fn default() -> Self {
-        Self::new("simple".to_owned(), tantivy::tokenizer::Language::English)
+        Self::new("simple".to_owned(), Language::English)
     }
 }
 
@@ -170,13 +196,14 @@ impl InvertedIndexParams {
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `ngram`: N-Gram tokenizer
+    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
     /// The `language` is used for stemming and removing stop words,
     /// this is not used for `lindera/*` and `jieba/*` tokenizers.
     /// Default to `English`.
-    pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
+    pub fn new(base_tokenizer: String, language: Language) -> Self {
         Self {
             lance_tokenizer: None,
             base_tokenizer,
@@ -191,7 +218,8 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
-            skip_merge: false,
+            memory_limit_mb: None,
+            num_workers: None,
         }
     }
 
@@ -280,41 +308,66 @@ impl InvertedIndexParams {
         self
     }
 
-    /// Skip merging partitions after indexing.
-    pub fn skip_merge(mut self, skip_merge: bool) -> Self {
-        self.skip_merge = skip_merge;
+    pub fn memory_limit_mb(mut self, memory_limit_mb: u64) -> Self {
+        self.memory_limit_mb = Some(memory_limit_mb);
         self
+    }
+
+    /// Set the number of workers to use for this build.
+    ///
+    /// By default Lance uses roughly `num_cpus / 2` workers.
+    /// The effective worker count is clamped to `[1, num_cpus - 2]`.
+    pub fn num_workers(mut self, num_workers: usize) -> Self {
+        self.num_workers = Some(num_workers);
+        self
+    }
+
+    /// Serialize params for the build/training path, including build-only fields.
+    pub fn to_training_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        let object = value
+            .as_object_mut()
+            .expect("inverted index params should serialize to a JSON object");
+        if let Some(memory_limit_mb) = self.memory_limit_mb {
+            object.insert(
+                "memory_limit".to_string(),
+                serde_json::Value::from(memory_limit_mb),
+            );
+        }
+        if let Some(num_workers) = self.num_workers {
+            object.insert(
+                "num_workers".to_string(),
+                serde_json::Value::from(num_workers),
+            );
+        }
+        Ok(value)
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
-            builder = builder.filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(
-                max_token_length,
-            ));
+            builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
         }
         if self.lower_case {
-            builder = builder.filter_dynamic(tantivy::tokenizer::LowerCaser);
+            builder = builder.filter_dynamic(LowerCaser);
         }
         if self.stem {
-            builder = builder.filter_dynamic(tantivy::tokenizer::Stemmer::new(self.language));
+            builder = builder.filter_dynamic(Stemmer::new(self.language));
         }
         if self.remove_stop_words {
             let stop_word_filter = match &self.custom_stop_words {
-                Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
-                None => {
-                    tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "removing stop words for language {:?} is not supported yet",
-                            self.language
-                        ))
-                    })?
-                }
+                Some(words) => StopWordFilter::remove(words.iter().cloned()),
+                None => StopWordFilter::new(self.language).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "removing stop words for language {:?} is not supported yet",
+                        self.language
+                    ))
+                })?,
             };
             builder = builder.filter_dynamic(stop_word_filter);
         }
         if self.ascii_folding {
-            builder = builder.filter_dynamic(tantivy::tokenizer::AsciiFoldingFilter);
+            builder = builder.filter_dynamic(AsciiFoldingFilter);
         }
         let tokenizer = builder.build();
 
@@ -329,29 +382,21 @@ impl InvertedIndexParams {
         }
     }
 
-    fn build_base_tokenizer(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+    fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
-            "simple" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default(),
-            )
-            .dynamic()),
-            "whitespace" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::WhitespaceTokenizer::default(),
-            )
-            .dynamic()),
-            "raw" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::RawTokenizer::default(),
-            )
-            .dynamic()),
-            "ngram" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::NgramTokenizer::new(
+            "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
+            "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
+            "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
+            "ngram" => {
+                let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
                     self.max_ngram_length as usize,
                     self.prefix_only,
                 )
-                .map_err(|e| Error::invalid_input(e.to_string()))?,
-            )
-            .dynamic()),
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+                Ok(TextAnalyzer::builder(tokenizer).dynamic())
+            }
             #[cfg(feature = "tokenizer-lindera")]
             s if s.starts_with("lindera/") => {
                 let Some(home) = language_model_home() else {
@@ -389,5 +434,73 @@ pub fn language_model_home() -> Option<PathBuf> {
     match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
         Ok(p) => Some(PathBuf::from(p)),
         Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InvertedIndexParams;
+    use lance_tokenizer::TokenStream;
+
+    #[test]
+    fn test_build_only_fields_are_not_serialized() {
+        let params = InvertedIndexParams::default()
+            .memory_limit_mb(4096)
+            .num_workers(7);
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("memory_limit").is_none());
+        assert!(json.get("num_workers").is_none());
+    }
+
+    #[test]
+    fn test_memory_limit_serde_accepts_legacy_worker_field_name() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("memory_limit");
+        obj.insert(
+            "worker_memory_limit_mb".to_string(),
+            serde_json::Value::from(2048),
+        );
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.memory_limit_mb, Some(2048));
+    }
+
+    #[test]
+    fn test_build_only_fields_deserialize_from_public_names() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert("memory_limit".to_string(), serde_json::Value::from(4096));
+        obj.insert("num_workers".to_string(), serde_json::Value::from(3));
+
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.memory_limit_mb, Some(4096));
+        assert_eq!(params.num_workers, Some(3));
+    }
+
+    #[test]
+    fn test_training_json_serializes_build_only_fields() {
+        let params = InvertedIndexParams::default()
+            .memory_limit_mb(4096)
+            .num_workers(3);
+        let json = params.to_training_json().unwrap();
+        assert_eq!(
+            json.get("memory_limit"),
+            Some(&serde_json::Value::from(4096))
+        );
+        assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
+    }
+
+    #[test]
+    fn test_build_icu_tokenizer() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer("icu".to_string())
+            .stem(false)
+            .remove_stop_words(false)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_doc("Hello, こんにちは世界!");
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| tokens.push(token.text.clone()));
+        assert_eq!(tokens, vec!["hello", "こんにちは", "世界"]);
     }
 }

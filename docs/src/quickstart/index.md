@@ -19,13 +19,24 @@ pip install pylance
 
 For the latest features and bug fixes, you can install the preview version:
 
-```bash
-pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance
-```
+=== "pip"
 
-> Note: Preview releases receive the same level of testing as regular releases.
+    ```bash
+    pip install --pre --extra-index-url https://pypi.fury.io/lance-format pylance
+    ```
 
-> Note: For versions prior to 1.0.0-beta.4, you can find them at https://pypi.fury.io/lancedb/pylance
+=== "uv"
+
+    ```bash
+    uv venv
+    uv pip install --prerelease allow --index https://pypi.fury.io/lance-format pylance
+
+    # To add to pyproject.toml, just do:
+    uv add --prerelease allow --index https://pypi.fury.io/lance-format pylance
+    ```
+
+!!! note
+    Preview releases receive the same level of testing as regular releases.
 
 ## Set Up Your Environment
 

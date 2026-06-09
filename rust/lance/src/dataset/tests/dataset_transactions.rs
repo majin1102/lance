@@ -14,18 +14,19 @@ use crate::{Dataset, Result};
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use crate::index::DatasetIndexExt;
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array};
-use lance_index::DatasetIndexExt;
 
 use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance_datafusion::udf::register_functions;
+use object_store::ObjectStoreExt;
 
 #[tokio::test]
 async fn test_read_transaction_properties() {
@@ -175,8 +176,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
-        Arc::as_ptr(&dataset.object_store().inner),
-        Arc::as_ptr(&dataset2.object_store().inner)
+        Arc::as_ptr(&dataset.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset2.object_store.as_ref().inner)
     );
 
     // If we create another with **different parameters**, it should create a new store.
@@ -195,8 +196,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
-        Arc::as_ptr(&dataset.object_store().inner),
-        Arc::as_ptr(&dataset3.object_store().inner)
+        Arc::as_ptr(&dataset.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset3.object_store.as_ref().inner)
     );
 
     // Remove both datasets
@@ -306,7 +307,11 @@ async fn test_inline_transaction() {
 
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
-            let tx_path = ds.base.child(TRANSACTIONS_DIR).child(tx_file.as_str());
+            let tx_path = ds
+                .base
+                .clone()
+                .join(TRANSACTIONS_DIR)
+                .join(tx_file.as_str());
             let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }
@@ -331,12 +336,12 @@ async fn test_inline_transaction() {
         .load()
         .await
         .unwrap();
-    let stats = read_ds2.object_store().io_stats_incremental(); // Reset
+    let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
     // Because the manifest is so small, we should have opportunistically
     // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-    let stats = read_ds2.object_store().io_stats_incremental();
+    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
     assert_eq!(inline_tx, tx);
@@ -344,9 +349,10 @@ async fn test_inline_transaction() {
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
-    let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
-        .await
-        .unwrap();
+    let tx_file =
+        crate::io::commit::write_transaction_file(ds.object_store.as_ref(), &ds.base, &tx)
+            .await
+            .unwrap();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),
@@ -356,7 +362,7 @@ async fn test_inline_transaction() {
         )
         .unwrap();
     let location = write_manifest_file(
-        ds.object_store(),
+        ds.object_store.as_ref(),
         ds.commit_handler.as_ref(),
         &ds.base,
         &mut manifest,
@@ -376,4 +382,123 @@ async fn test_inline_transaction() {
     assert!(ds_new.manifest.transaction_file.is_some());
     let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx);
+}
+
+#[tokio::test]
+async fn test_list_detached_manifests() {
+    let test_uri = TempStrDir::default();
+
+    // Create initial dataset
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+            &test_uri,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+
+    // Initially there should be no detached manifests
+    let detached = dataset.list_detached_manifests().await.unwrap();
+    assert!(detached.is_empty());
+
+    // Create a detached transaction with properties
+    let mut properties = HashMap::new();
+    properties.insert("detached_key".to_string(), "detached_value".to_string());
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+    )
+    .unwrap();
+
+    // Use execute_uncommitted + CommitBuilder with_detached(true)
+    let transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            transaction_properties: Some(Arc::new(properties.clone())),
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch2])
+        .await
+        .unwrap();
+
+    CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(transaction)
+        .await
+        .unwrap();
+
+    // Now there should be one detached manifest
+    let detached = dataset.list_detached_manifests().await.unwrap();
+    assert_eq!(detached.len(), 1);
+
+    // The detached version should have the high bit set
+    let detached_version = detached[0].version;
+    assert!(lance_table::format::is_detached_version(detached_version));
+
+    // We should be able to checkout the detached version and read transaction properties
+    let checked_out = dataset.checkout_version(detached_version).await.unwrap();
+    let tx = checked_out.read_transaction().await.unwrap().unwrap();
+    let tx_props = tx.transaction_properties.unwrap();
+    assert_eq!(
+        tx_props.get("detached_key"),
+        Some(&"detached_value".to_string())
+    );
+
+    // The detached dataset should have more rows
+    assert_eq!(checked_out.count_rows(None).await.unwrap(), 6);
+
+    // Create another detached transaction
+    let batch3 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7, 8, 9]))],
+    )
+    .unwrap();
+
+    let mut properties2 = HashMap::new();
+    properties2.insert("second_key".to_string(), "second_value".to_string());
+
+    let transaction2 = InsertBuilder::new(dataset.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            transaction_properties: Some(Arc::new(properties2)),
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch3])
+        .await
+        .unwrap();
+
+    CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(transaction2)
+        .await
+        .unwrap();
+
+    // Now there should be two detached manifests
+    let detached = dataset.list_detached_manifests().await.unwrap();
+    assert_eq!(detached.len(), 2);
+
+    // Both should be detached versions
+    for loc in &detached {
+        assert!(lance_table::format::is_detached_version(loc.version));
+    }
+
+    // Regular versions() should not include detached manifests
+    let versions = dataset.versions().await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version, 1);
 }

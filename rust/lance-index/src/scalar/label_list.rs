@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, collections::HashMap, fmt::Debug, pin::Pin, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::Debug,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
-use lance_core::cache::LanceCache;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
-use lance_core::{Error, Result};
+use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
+use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
+use lance_core::error::LanceOptionExt;
+use lance_core::{Error, ROW_ID, Result};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -23,7 +32,7 @@ use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::bitmap::BitmapIndexPlugin;
+use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -33,7 +42,9 @@ use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
-const LABEL_LIST_INDEX_VERSION: u32 = 0;
+pub const LABEL_LIST_NULLS_METADATA_KEY: &str = "lance:label_list_nulls";
+pub const LABEL_LIST_NULLS_MIN_VERSION: i32 = 1;
+const LABEL_LIST_INDEX_VERSION: u32 = 1;
 
 #[async_trait]
 trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
@@ -64,12 +75,16 @@ impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 /// and `array_has` / `array_contains`, using an underlying bitmap index.
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct LabelListIndex {
-    values_index: Arc<dyn LabelListSubIndex>,
+    values_index: Arc<BitmapIndex>,
+    list_nulls: Arc<RowAddrTreeMap>,
 }
 
 impl LabelListIndex {
-    fn new(values_index: Arc<dyn LabelListSubIndex>) -> Self {
-        Self { values_index }
+    fn new(values_index: Arc<BitmapIndex>, list_nulls: Arc<RowAddrTreeMap>) -> Self {
+        Self {
+            values_index,
+            list_nulls,
+        }
     }
 
     async fn load(
@@ -77,9 +92,10 @@ impl LabelListIndex {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        BitmapIndex::load(store, frag_reuse_index, index_cache)
-            .await
-            .map(|index| Arc::new(Self::new(index)))
+        let values_index =
+            BitmapIndex::load(store.clone(), frag_reuse_index.clone(), index_cache).await?;
+        let list_nulls = read_list_nulls(store, frag_reuse_index).await?;
+        Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
 }
 
@@ -182,6 +198,13 @@ impl ScalarIndex for LabelListIndex {
                 self.set_union(values_results, labels.len() == 1).await
             }
         }?;
+        let row_ids = if self.list_nulls.as_ref().is_empty() {
+            row_ids
+        } else {
+            let mut nulls = row_ids.null_rows().clone();
+            nulls |= self.list_nulls.as_ref();
+            row_ids.with_nulls(nulls)
+        };
         Ok(SearchResult::Exact(row_ids))
     }
 
@@ -195,12 +218,29 @@ impl ScalarIndex for LabelListIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        self.values_index.remap(mapping, dest_store).await?;
+        let state = self.values_index.load_bitmap_index_state().await?;
+        let remapped_state = BitmapIndexPlugin::remap_bitmap_state(state, mapping);
+        let remapped_nulls =
+            RowAddrTreeMap::from_iter(self.list_nulls.row_addrs().unwrap().filter_map(|addr| {
+                let addr_as_u64 = u64::from(addr);
+                mapping
+                    .get(&addr_as_u64)
+                    .copied()
+                    .unwrap_or(Some(addr_as_u64))
+            }));
+        write_label_list_bitmap_index(
+            remapped_state,
+            dest_store,
+            self.values_index.value_type(),
+            &remapped_nulls,
+        )
+        .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -209,16 +249,26 @@ impl ScalarIndex for LabelListIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        self.values_index
-            .update(unnest_chunks(new_data)?, dest_store, valid_old_fragments)
-            .await?;
+        let state = self.values_index.load_bitmap_index_state().await?;
+        let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
+        let new_data = track_list_nulls(new_data, list_nulls.clone());
+        let (merged_state, value_type) =
+            BitmapIndexPlugin::build_bitmap_index_state(unnest_chunks(new_data)?, state).await?;
+        let _ = old_data_filter;
+        let mut merged_nulls = (*self.list_nulls).clone();
+        let new_nulls = list_nulls.lock().unwrap().clone();
+        if !new_nulls.is_empty() {
+            merged_nulls |= &new_nulls;
+        }
+        write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -254,6 +304,44 @@ fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
             list_arr.data_type()
         )
     }
+}
+
+/// Collect row_ids for list-level NULLs before unnest; unnest drops NULL lists entirely.
+fn track_list_nulls(
+    source: SendableRecordBatchStream,
+    list_nulls: Arc<Mutex<RowAddrTreeMap>>,
+) -> SendableRecordBatchStream {
+    let schema = source.schema();
+    let stream = source.try_filter_map(move |batch| {
+        let list_nulls = list_nulls.clone();
+        async move {
+            record_list_nulls(&batch, &list_nulls)?;
+            Ok(Some(batch))
+        }
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+}
+
+fn record_list_nulls(
+    batch: &RecordBatch,
+    list_nulls: &Arc<Mutex<RowAddrTreeMap>>,
+) -> datafusion_common::Result<()> {
+    let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
+    let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
+    let row_ids = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+
+    let mut local_nulls = RowAddrTreeMap::new();
+    for i in 0..values.len() {
+        if values.is_null(i) {
+            local_nulls.insert(row_ids.value(i));
+        }
+    }
+    if !local_nulls.is_empty() {
+        let mut guard = list_nulls.lock().unwrap();
+        *guard |= &local_nulls;
+    }
+    Ok(())
 }
 
 fn unnest_schema(schema: &Schema) -> SchemaRef {
@@ -353,6 +441,141 @@ fn unnest_chunks(
     )))
 }
 
+async fn read_list_nulls(
+    store: Arc<dyn IndexStore>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+) -> Result<RowAddrTreeMap> {
+    let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+    if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
+        let buffer_idx = buffer_idx_str.parse::<u32>().map_err(|err| {
+            Error::internal(format!(
+                "LabelList metadata key {} had invalid global buffer index {}: {}",
+                LABEL_LIST_NULLS_METADATA_KEY, buffer_idx_str, err
+            ))
+        })?;
+        let bytes = reader.read_global_buffer(buffer_idx).await?;
+        let null_map = RowAddrTreeMap::deserialize_from(bytes.as_ref())?;
+        return if let Some(frag_reuse_index) = frag_reuse_index {
+            Ok(frag_reuse_index.remap_row_addrs_tree_map(&null_map))
+        } else {
+            Ok(null_map)
+        };
+    }
+    Ok(RowAddrTreeMap::default())
+}
+
+fn serialize_list_nulls(null_map: &RowAddrTreeMap) -> Result<Bytes> {
+    let mut bytes = Vec::new();
+    null_map.serialize_into(&mut bytes)?;
+    Ok(Bytes::from(bytes))
+}
+
+async fn write_label_list_bitmap_index(
+    state: HashMap<ScalarValue, RowAddrTreeMap>,
+    store: &dyn IndexStore,
+    value_type: &DataType,
+    list_nulls: &RowAddrTreeMap,
+) -> Result<()> {
+    BitmapIndexPlugin::write_bitmap_index_with_extras(
+        state,
+        store,
+        value_type,
+        HashMap::new(),
+        vec![(
+            LABEL_LIST_NULLS_METADATA_KEY.to_string(),
+            serialize_list_nulls(list_nulls)?,
+        )],
+    )
+    .await
+}
+
+/// The serializable state of a [`LabelListIndex`].
+///
+/// `LabelListIndex` is a thin wrapper around a [`BitmapIndex`] plus a separate
+/// row bitmap tracking which list values were `NULL` (lost by unnest at build
+/// time). Its cache state is the corresponding [`BitmapIndexState`] plus the
+/// already-loaded `list_nulls`.
+#[derive(Debug, Clone)]
+pub struct LabelListIndexState {
+    bitmap_state: BitmapIndexState,
+    list_nulls: Arc<RowAddrTreeMap>,
+}
+
+impl DeepSizeOf for LabelListIndexState {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.bitmap_state.deep_size_of_children(context)
+            + self.list_nulls.deep_size_of_children(context)
+    }
+}
+
+impl LabelListIndexState {
+    fn from_index(index: &LabelListIndex) -> Result<Self> {
+        Ok(Self {
+            bitmap_state: BitmapIndexState::from_index(&index.values_index)?,
+            list_nulls: index.list_nulls.clone(),
+        })
+    }
+
+    fn into_label_list_index(
+        self,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<LabelListIndex>> {
+        let bitmap = self
+            .bitmap_state
+            .to_bitmap_index(store, index_cache, frag_reuse_index)?;
+        Ok(Arc::new(LabelListIndex::new(bitmap, self.list_nulls)))
+    }
+}
+
+impl CacheCodecImpl for LabelListIndexState {
+    /// Wire format:
+    /// ```text
+    /// [u64 list_nulls_len][list_nulls bytes]
+    /// [bitmap state bytes (self-delimiting)]
+    /// ```
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        let mut nulls_bytes = Vec::with_capacity(self.list_nulls.serialized_size());
+        self.list_nulls.serialize_into(&mut nulls_bytes)?;
+        write_len_prefixed_bytes(writer, &nulls_bytes)?;
+        self.bitmap_state.serialize(writer)?;
+        Ok(())
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let nulls_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let list_nulls = Arc::new(RowAddrTreeMap::deserialize_from(nulls_bytes.as_ref())?);
+        // The bitmap state is self-delimiting (length-prefixed null map +
+        // Arrow IPC stream with EOS marker), so we can hand the remaining
+        // tail to it directly.
+        let bitmap_state = BitmapIndexState::deserialize(&data.slice(offset..))?;
+        Ok(Self {
+            bitmap_state,
+            list_nulls,
+        })
+    }
+}
+
+struct LabelListIndexStateKey;
+
+impl CacheKey for LabelListIndexStateKey {
+    type ValueType = LabelListIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "LabelListIndexState"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<LabelListIndexState>())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LabelListIndexPlugin;
 
@@ -396,7 +619,10 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(LabelListQueryParser::new(index_name)))
+        Some(Box::new(LabelListQueryParser::new(
+            index_name,
+            self.name().to_string(),
+        )))
     }
 
     /// Train a new index
@@ -407,9 +633,9 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        request: Box<dyn TrainingRequest>,
+        _request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
-        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::invalid_input_source(
@@ -440,15 +666,18 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             .into()));
         }
 
+        let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
+        let data = track_list_nulls(data, list_nulls.clone());
         let data = unnest_chunks(data)?;
-        let bitmap_plugin = BitmapIndexPlugin;
-        bitmap_plugin
-            .train_index(data, index_store, request, fragment_ids, progress)
-            .await?;
+        let (state, value_type) =
+            BitmapIndexPlugin::build_bitmap_index_state(data, HashMap::new()).await?;
+        let list_nulls = list_nulls.lock().unwrap().clone();
+        write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -464,5 +693,35 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             LabelListIndex::load(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&LabelListIndexStateKey).await else {
+            return Ok(None);
+        };
+        let state = (*state).clone();
+        let index = state.into_label_list_index(index_store, cache, frag_reuse_index)?;
+        Ok(Some(index as Arc<dyn ScalarIndex>))
+    }
+
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+        let label_list = index
+            .as_any()
+            .downcast_ref::<LabelListIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "LabelListIndexPlugin::put_in_cache called with a non-label-list index",
+                )
+            })?;
+        let state = LabelListIndexState::from_index(label_list)?;
+        cache
+            .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
     }
 }

@@ -5,8 +5,8 @@
 
 use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Float32Type, UInt32Type};
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow::datatypes::{DataType, UInt32Type};
+use arrow_array::{ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
@@ -24,24 +24,36 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{Rng, rng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
+use super::{
+    HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
+};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
-use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
-    DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode, VisitedGenerator,
+    BorrowingGraph, DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode,
+    VisitedGenerator,
 };
-use crate::vector::graph::{Visited, greedy_search};
+use crate::vector::graph::{Visited, beam_search_borrowed, greedy_search, greedy_search_borrowed};
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
-use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
+use crate::vector::{Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
+
+/// Fixed seed for HNSW node-level assignment.
+///
+/// A constant seed makes graph construction reproducible (same data + params =>
+/// same graph), which keeps index builds deterministic and tests stable. Recall
+/// is statistically unaffected — the level distribution is identical, only the
+/// random draws become fixed. Shared by the offline ([`HNSWBuilder`]) and online
+/// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
+pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
@@ -57,6 +69,16 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
+}
+
+impl From<&HnswBuildParams> for crate::pb::HnswParameters {
+    fn from(params: &HnswBuildParams) -> Self {
+        Self {
+            max_connections: params.m as u32,
+            construction_ef: params.ef_construction as u32,
+            max_level: params.max_level as u32,
+        }
+    }
 }
 
 impl Default for HnswBuildParams {
@@ -100,11 +122,25 @@ impl HnswBuildParams {
     /// - `data`: A FixedSizeList to build the HNSW.
     /// - `distance_type`: The distance type to use.
     pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
-        let vec_store = Arc::new(FlatFloatStorage::new(
-            data.as_fixed_size_list().clone(),
-            distance_type,
-        ));
-        HNSW::index_vectors(vec_store.as_ref(), self)
+        let vectors = data.as_fixed_size_list().clone();
+        match (vectors.value_type(), distance_type) {
+            (DataType::UInt8, DistanceType::Hamming) => {
+                let vec_store = Arc::new(FlatBinStorage::new(vectors, distance_type));
+                HNSW::index_vectors(vec_store.as_ref(), self)
+            }
+            (DataType::UInt8, _) => Err(Error::invalid_input(format!(
+                "HNSW only supports hamming distance for UInt8 vectors, got {}",
+                distance_type
+            ))),
+            (_, DistanceType::Hamming) => Err(Error::invalid_input(format!(
+                "HNSW hamming distance only supports UInt8 vectors, got {}",
+                vectors.value_type()
+            ))),
+            _ => {
+                let vec_store = Arc::new(FlatFloatStorage::new(vectors, distance_type));
+                HNSW::index_vectors(vec_store.as_ref(), self)
+            }
+        }
     }
 }
 
@@ -117,7 +153,34 @@ impl HnswBuildParams {
 /// Each node in the graph has a global ID which is the index on the base layer.
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSW {
-    inner: Arc<HnswBuilder>,
+    inner: Arc<HnswCore>,
+}
+
+struct HnswCore {
+    params: HnswBuildParams,
+    graph: HnswGraph,
+    level_count: Vec<usize>,
+    entry_point: u32,
+    visited_generator_queue: Arc<ArrayQueue<VisitedGenerator>>,
+}
+
+impl DeepSizeOf for HnswCore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.params.deep_size_of_children(context)
+            + self.graph.deep_size_of_children(context)
+            + self.level_count.deep_size_of_children(context)
+        // Skipping the visited_generator_queue
+    }
+}
+
+impl HnswCore {
+    fn max_level(&self) -> u16 {
+        self.params.max_level
+    }
+
+    fn num_nodes(&self, level: usize) -> usize {
+        self.level_count[level]
+    }
 }
 
 impl Debug for HNSW {
@@ -127,11 +190,35 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    /// Construct an HNSW from its constituent parts. Used by the online
+    /// builder when finalizing.
+    pub(crate) fn from_parts(
+        params: HnswBuildParams,
+        nodes: Vec<GraphBuilderNode>,
+        level_count: Vec<usize>,
+        entry_point: u32,
+    ) -> Self {
+        let queue_size = get_num_compute_intensive_cpus().max(1) * 2;
+        let visited_generator_queue = Arc::new(ArrayQueue::new(queue_size));
+        for _ in 0..queue_size {
+            let _ = visited_generator_queue.push(VisitedGenerator::new(0));
+        }
+        Self {
+            inner: Arc::new(HnswCore {
+                params,
+                graph: HnswGraph::Built(Arc::new(nodes)),
+                level_count,
+                entry_point,
+                visited_generator_queue,
+            }),
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
-            inner: Arc::new(HnswBuilder {
+            inner: Arc::new(HnswCore {
                 params: HnswBuildParams::default(),
-                nodes: Arc::new(Vec::new()),
+                graph: HnswGraph::Built(Arc::new(Vec::new())),
                 level_count: Vec::new(),
                 entry_point: 0,
                 visited_generator_queue: Arc::new(ArrayQueue::new(1)),
@@ -140,7 +227,11 @@ impl HNSW {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.nodes.len()
+        match &self.inner.graph {
+            HnswGraph::Built(nodes) => nodes.len(),
+            // `level_count[0]` is the bottom-level (== total) node count.
+            HnswGraph::Loaded(graph) => graph.level_count[0],
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -155,8 +246,15 @@ impl HNSW {
         self.inner.num_nodes(level)
     }
 
-    pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
-        self.inner.nodes()
+    /// Returns the in-memory builder nodes, if this graph was freshly built.
+    ///
+    /// A disk-loaded graph is Arrow-backed and has no `GraphBuilderNode`s,
+    /// so this returns `None` for it.
+    pub fn nodes(&self) -> Option<Arc<Vec<GraphBuilderNode>>> {
+        match &self.inner.graph {
+            HnswGraph::Built(nodes) => Some(nodes.clone()),
+            HnswGraph::Loaded(_) => None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -171,32 +269,97 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
-        let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
-        let nodes = &self.nodes();
+        let entry = self.inner.entry_point;
+        let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
+
+        // The level descent + bottom beam search are identical across
+        // graph backends; only the view types differ. `run_search` is
+        // generic over those view types so the loop is single-sourced:
+        // each backend supplies a per-level view closure and a
+        // bottom-level view.
+        let result = match &self.inner.graph {
+            HnswGraph::Built(nodes) => {
+                let nodes = nodes.as_slice();
+                self.run_search(
+                    ep,
+                    k,
+                    params,
+                    bitset.as_ref(),
+                    visited_generator,
+                    storage.len(),
+                    prefetch_distance,
+                    &dist_calc,
+                    |level| ImmutableHnswLevelView::new(level, nodes),
+                    ImmutableHnswBottomView::new(nodes),
+                )
+            }
+            HnswGraph::Loaded(graph) => {
+                let graph = graph.as_ref();
+                self.run_search(
+                    ep,
+                    k,
+                    params,
+                    bitset.as_ref(),
+                    visited_generator,
+                    storage.len(),
+                    prefetch_distance,
+                    &dist_calc,
+                    |level| LoadedHnswLevelView::new(level, graph),
+                    LoadedHnswBottomView::new(graph),
+                )
+            }
+        };
+        Ok(result)
+    }
+
+    /// Drives the shared HNSW query path over backend-specific graph
+    /// views: a per-level view produced by `make_level` and a
+    /// bottom-level view `bottom`. The views borrow their backing store
+    /// and are created, used, and dropped entirely within this call;
+    /// only the owned result escapes. Monomorphizing over `L`/`B` is the
+    /// single seam that lets the in-memory and disk-loaded backends
+    /// share one search loop.
+    #[allow(clippy::too_many_arguments)]
+    fn run_search<L, B>(
+        &self,
+        ep: OrderedNode,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: Option<&Visited>,
+        visited_generator: &mut VisitedGenerator,
+        storage_len: usize,
+        prefetch_distance: Option<usize>,
+        dist_calc: &impl DistCalculator,
+        make_level: impl Fn(u16) -> L,
+        bottom: B,
+    ) -> Vec<OrderedNode>
+    where
+        L: BorrowingGraph,
+        B: BorrowingGraph,
+    {
+        let mut ep = ep;
         for level in (0..self.max_level()).rev() {
-            let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(
+            let cur_level = make_level(level);
+            ep = greedy_search_borrowed(
                 &cur_level,
                 ep,
-                &dist_calc,
+                dist_calc,
                 self.inner.params.prefetch_distance,
             );
         }
-
-        let bottom_level = HnswBottomView::new(nodes);
-        let mut visited = visited_generator.generate(storage.len());
-        Ok(beam_search(
-            &bottom_level,
+        let mut visited = visited_generator.generate(storage_len);
+        beam_search_borrowed(
+            &bottom,
             &ep,
             params,
-            &dist_calc,
-            bitset.as_ref(),
+            dist_calc,
+            bitset,
             prefetch_distance,
             &mut visited,
         )
         .into_iter()
         .take(k)
-        .collect())
+        .collect::<Vec<OrderedNode>>()
     }
 
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
@@ -306,10 +469,10 @@ impl HNSW {
             .inner
             .level_count
             .iter()
-            .chain(iter::once(&AtomicUsize::new(0)))
+            .chain(iter::once(&0))
             .scan(0, |state, x| {
                 let start = *state;
-                *state += x.load(Ordering::Relaxed);
+                *state += *x;
                 Some(start)
             })
             .collect();
@@ -343,16 +506,33 @@ impl DeepSizeOf for HnswBuilder {
 }
 
 impl HnswBuilder {
-    fn max_level(&self) -> u16 {
-        self.params.max_level
-    }
+    fn finish(self) -> HNSW {
+        let nodes = match Arc::try_unwrap(self.nodes) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .map(|node| node.into_inner().expect("builder lock poisoned"))
+                .collect(),
+            Err(nodes) => nodes
+                .iter()
+                .map(|node| node.read().expect("builder lock poisoned").clone())
+                .collect(),
+        };
 
-    fn num_nodes(&self, level: usize) -> usize {
-        self.level_count[level].load(Ordering::Relaxed)
-    }
+        let level_count = self
+            .level_count
+            .into_iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
 
-    fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
-        self.nodes.clone()
+        HNSW {
+            inner: Arc::new(HnswCore {
+                params: self.params,
+                graph: HnswGraph::Built(Arc::new(nodes)),
+                level_count,
+                entry_point: self.entry_point,
+                visited_generator_queue: self.visited_generator_queue,
+            }),
+        }
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
@@ -387,10 +567,11 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
+            let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,
-                    builder.random_level() as usize + 1,
+                    builder.random_level(&mut level_rng) as usize + 1,
                 )));
             }
         }
@@ -402,8 +583,7 @@ impl HnswBuilder {
     /// New node's level
     ///
     /// See paper `Algorithm 1`
-    fn random_level(&self) -> u16 {
-        let mut rng = rng();
+    fn random_level<R: Rng + ?Sized>(&self, rng: &mut R) -> u16 {
         let ml = 1.0 / (self.params.m as f32).ln();
         min(
             (-rng.random::<f32>().ln() * ml) as u16,
@@ -458,26 +638,23 @@ impl HnswBuilder {
             }
         }
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            let _: Vec<_> = pruned_neighbors
-                .iter()
-                .map(|unpruned_edge| {
-                    let level = level as u16;
-                    let m_max = match level {
-                        0 => self.params.m * 2,
-                        _ => self.params.m,
-                    };
-                    if unpruned_edge.dist
-                        < nodes[unpruned_edge.id as usize]
-                            .read()
-                            .unwrap()
-                            .cutoff(level, m_max)
-                    {
-                        let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                        chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                        self.prune(storage, &mut chosen_node, level);
-                    }
-                })
-                .collect();
+            for unpruned_edge in pruned_neighbors {
+                let level = level as u16;
+                let m_max = match level {
+                    0 => self.params.m * 2,
+                    _ => self.params.m,
+                };
+                if unpruned_edge.dist
+                    < nodes[unpruned_edge.id as usize]
+                        .read()
+                        .unwrap()
+                        .cutoff(level, m_max)
+                {
+                    let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
+                    chosen_node.add_neighbor(node, unpruned_edge.dist, level);
+                    self.prune(storage, &mut chosen_node, level);
+                }
+            }
         }
     }
 
@@ -486,7 +663,7 @@ impl HnswBuilder {
         ep: &OrderedNode,
         level: u16,
         dist_calc: &impl DistCalculator,
-        nodes: &Vec<RwLock<GraphBuilderNode>>,
+        nodes: &[RwLock<GraphBuilderNode>],
         visited_generator: &mut VisitedGenerator,
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
@@ -514,14 +691,13 @@ impl HnswBuilder {
         };
 
         let neighbors_ranked = &mut builder_node.level_neighbors_ranked[level as usize];
-        let level_neighbors = neighbors_ranked.clone();
-        if level_neighbors.len() <= m_max {
+        if neighbors_ranked.len() <= m_max {
             builder_node.update_from_ranked_neighbors(level);
             return;
-            //return level_neighbors;
         }
 
-        *neighbors_ranked = select_neighbors_heuristic(storage, &level_neighbors, m_max);
+        let level_neighbors = std::mem::take(neighbors_ranked);
+        *neighbors_ranked = select_neighbors_heuristic_owned(storage, level_neighbors, m_max);
         builder_node.update_from_ranked_neighbors(level);
     }
 }
@@ -530,11 +706,11 @@ impl HnswBuilder {
 // This is used to iterate over neighbors in a specific level.
 pub(crate) struct HnswLevelView<'a> {
     level: u16,
-    nodes: &'a Vec<RwLock<GraphBuilderNode>>,
+    nodes: &'a [RwLock<GraphBuilderNode>],
 }
 
 impl<'a> HnswLevelView<'a> {
-    pub fn new(level: u16, nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
+    pub fn new(level: u16, nodes: &'a [RwLock<GraphBuilderNode>]) -> Self {
         Self { level, nodes }
     }
 }
@@ -550,24 +726,235 @@ impl Graph for HnswLevelView<'_> {
     }
 }
 
-pub(crate) struct HnswBottomView<'a> {
-    nodes: &'a Vec<RwLock<GraphBuilderNode>>,
+pub(crate) struct ImmutableHnswLevelView<'a> {
+    level: u16,
+    nodes: &'a [GraphBuilderNode],
 }
 
-impl<'a> HnswBottomView<'a> {
-    pub fn new(nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
-        Self { nodes }
+impl<'a> ImmutableHnswLevelView<'a> {
+    pub fn new(level: u16, nodes: &'a [GraphBuilderNode]) -> Self {
+        Self { level, nodes }
     }
 }
 
-impl Graph for HnswBottomView<'_> {
+impl Graph for ImmutableHnswLevelView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
 
     fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
-        let node = &self.nodes[key as usize];
-        node.read().unwrap().bottom_neighbors.clone()
+        self.nodes[key as usize].level_neighbors[self.level as usize].clone()
+    }
+}
+
+impl BorrowingGraph for ImmutableHnswLevelView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.nodes[key as usize].level_neighbors[self.level as usize].as_slice()
+    }
+}
+
+pub(crate) struct ImmutableHnswBottomView<'a> {
+    nodes: &'a [GraphBuilderNode],
+}
+
+impl<'a> ImmutableHnswBottomView<'a> {
+    pub fn new(nodes: &'a [GraphBuilderNode]) -> Self {
+        Self { nodes }
+    }
+}
+
+impl Graph for ImmutableHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
+        self.nodes[key as usize].bottom_neighbors.clone()
+    }
+}
+
+impl BorrowingGraph for ImmutableHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.nodes[key as usize].bottom_neighbors.as_slice()
+    }
+}
+
+/// Per-level node-id -> row-index lookup for a disk-loaded HNSW graph.
+enum LevelLookup {
+    /// `row == node id`. Used only for level 0, where [`HNSW::to_batch`]
+    /// writes every node once in ascending `__vector_id` (== node id) order,
+    /// so the level-0 slice is exactly `[0, N)` with `row == id`.
+    Dense,
+    /// Upper level: an explicit `node_id -> row` map built from the level's
+    /// `__vector_id` column.
+    ///
+    /// We do *not* assume the column is sorted or that the slice is aligned
+    /// to a true level boundary: `level_offsets`/`level_count` omit the
+    /// entry-point node (it is written at every level by `to_batch` but only
+    /// counted at level 0), so upper-level slices can be off-by-one and
+    /// non-monotonic. Keying by the `__vector_id` value -- exactly what the
+    /// old per-node `load` did -- preserves behavior bit-for-bit. Upper
+    /// levels shrink geometrically, so this map stays tiny.
+    Sparse(HashMap<u32, u32>),
+}
+
+/// A search-only HNSW graph backed directly by the Arrow buffers of the
+/// on-disk `RecordBatch`.
+///
+/// Loading performs no per-node reconstruction: neighbor adjacency is served
+/// as `&[u32]` slices straight out of the `__neighbors` `ListArray` value
+/// buffer (zero copy). The full `batch` is retained so [`HNSW::to_batch`] is a
+/// near-free passthrough -- required, because the IVF partition cache
+/// re-serializes loaded indices through `to_batch()`
+/// (`lance/src/index/vector/ivf/partition_serde.rs`) -- and so a future
+/// zero-copy `CacheCodec` (#6745) can write/read it through
+/// `lance_arrow::ipc` without rebuilding the graph.
+struct LoadedHnswGraph {
+    /// The full loaded batch (all levels concatenated, level 0 first),
+    /// retained verbatim for `to_batch()` and #6745.
+    batch: RecordBatch,
+    /// Per-level `__neighbors` `List<UInt32>`, zero-copy slices of `batch`.
+    level_neighbors: Vec<ListArray>,
+    /// Per-level node-id -> row lookup (see [`LevelLookup`]).
+    level_lookup: Vec<LevelLookup>,
+    /// Number of nodes present at each level (`level_count[0]` == total).
+    level_count: Vec<usize>,
+}
+
+impl DeepSizeOf for LoadedHnswGraph {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // `level_neighbors` are zero-copy views into `batch`, so counting
+        // `batch` alone avoids double counting (mirrors
+        // `vector/flat/storage.rs`). The upper-level `level_lookup` maps are
+        // sized to the geometrically-shrinking node counts above level 0 --
+        // negligible next to the batch and not separately accounted here.
+        self.batch.get_array_memory_size()
+    }
+}
+
+impl LoadedHnswGraph {
+    /// Borrow the neighbor ids of `key` at `level` directly from the Arrow
+    /// `ListArray` value buffer -- no allocation, no copy.
+    #[inline]
+    fn neighbors_at(&self, level: usize, key: u32) -> &[u32] {
+        let row = match &self.level_lookup[level] {
+            LevelLookup::Dense => key as usize,
+            LevelLookup::Sparse(id_to_row) => match id_to_row.get(&key) {
+                Some(&row) => row as usize,
+                // The node is absent at this level -- e.g. an empty upper
+                // level the search descends through, or a node that only
+                // exists at lower levels. Mirror the old representation
+                // (`level_neighbors[level]` defaulted to empty): no
+                // neighbors here, so greedy search stays put and descends.
+                None => return &[],
+            },
+        };
+        let list = &self.level_neighbors[level];
+        let offsets = list.value_offsets();
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        // The `__neighbors` list child is `UInt32` per `HNSW::schema()`.
+        // Validity bitmap is ignored on purpose: `to_batch` never writes null
+        // neighbor lists, matching the previous `.unwrap()`-based load.
+        let values = list.values().as_primitive::<UInt32Type>();
+        &values.values()[start..end]
+    }
+}
+
+/// Per-level search view over a disk-loaded [`LoadedHnswGraph`].
+pub(crate) struct LoadedHnswLevelView<'a> {
+    level: usize,
+    graph: &'a LoadedHnswGraph,
+}
+
+impl<'a> LoadedHnswLevelView<'a> {
+    fn new(level: u16, graph: &'a LoadedHnswGraph) -> Self {
+        Self {
+            level: level as usize,
+            graph,
+        }
+    }
+}
+
+impl Graph for LoadedHnswLevelView<'_> {
+    fn len(&self) -> usize {
+        // Mirrors `ImmutableHnswLevelView::len` (total node count).
+        self.graph.level_count[0]
+    }
+
+    fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
+        // Non-hot fallback: HNSW search goes through `BorrowingGraph`. Kept
+        // only so the `Graph` trait / legacy `greedy_search` need no
+        // special-casing for loaded graphs.
+        Arc::new(self.graph.neighbors_at(self.level, key).to_vec())
+    }
+}
+
+impl BorrowingGraph for LoadedHnswLevelView<'_> {
+    fn len(&self) -> usize {
+        self.graph.level_count[0]
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.graph.neighbors_at(self.level, key)
+    }
+}
+
+/// Bottom-level (level 0) search view over a disk-loaded [`LoadedHnswGraph`].
+pub(crate) struct LoadedHnswBottomView<'a> {
+    graph: &'a LoadedHnswGraph,
+}
+
+impl<'a> LoadedHnswBottomView<'a> {
+    fn new(graph: &'a LoadedHnswGraph) -> Self {
+        Self { graph }
+    }
+}
+
+impl Graph for LoadedHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.graph.level_count[0]
+    }
+
+    fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
+        Arc::new(self.graph.neighbors_at(0, key).to_vec())
+    }
+}
+
+impl BorrowingGraph for LoadedHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.graph.level_count[0]
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.graph.neighbors_at(0, key)
+    }
+}
+
+/// The graph backing an [`HNSW`]: either built in memory or disk-loaded.
+enum HnswGraph {
+    /// Built in memory by the (online) builder / `index_vectors` /
+    /// `from_parts`. Mutable-shaped `GraphBuilderNode`s; `to_batch()`
+    /// re-encodes from these (it needs the per-node ranked distances).
+    Built(Arc<Vec<GraphBuilderNode>>),
+    /// Loaded from disk, Arrow-backed, search-only.
+    Loaded(Arc<LoadedHnswGraph>),
+}
+
+impl DeepSizeOf for HnswGraph {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        match self {
+            Self::Built(nodes) => nodes.deep_size_of_children(context),
+            Self::Loaded(graph) => graph.deep_size_of_children(context),
+        }
     }
 }
 
@@ -615,39 +1002,81 @@ impl IvfSubIndex for HNSW {
             ))
         })?;
 
-        let levels: Vec<_> = hnsw_metadata
+        // Slice the concatenated batch into one (zero-copy) view per level.
+        let level_batches: Vec<RecordBatch> = hnsw_metadata
             .level_offsets
             .iter()
             .tuple_windows()
             .map(|(start, end)| data.slice(*start, end - start))
             .collect();
 
-        let level_count = levels.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+        let level_count = level_batches
+            .iter()
+            .map(|b| b.num_rows())
+            .collect::<Vec<_>>();
 
-        let bottom_level_len = levels[0].num_rows();
-        let mut nodes = Vec::with_capacity(bottom_level_len);
-        for i in 0..bottom_level_len {
-            nodes.push(GraphBuilderNode::new(i as u32, levels.len()));
-        }
-        for (level, batch) in levels.into_iter().enumerate() {
+        // No per-node reconstruction: keep the Arrow adjacency buffers as-is
+        // and only build the tiny per-upper-level id->row lookups. The
+        // `__distance` column is never materialized here -- search doesn't
+        // need it, and `to_batch()` returns the retained `data` verbatim.
+        let mut level_neighbors = Vec::with_capacity(level_batches.len());
+        let mut level_lookup = Vec::with_capacity(level_batches.len());
+        for (level, batch) in level_batches.iter().enumerate() {
+            // `.clone()` on an Arrow array bumps a refcount; buffers stay
+            // shared with `data` (zero copy).
+            let neighbors = batch[NEIGHBORS_COL].as_list::<i32>().clone();
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
-            let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
-            let distances = batch[DIST_COL].as_list::<i32>();
-
-            for ((node, neighbors), distances) in
-                ids.iter().zip(neighbors.iter()).zip(distances.iter())
-            {
-                let node = node.unwrap();
-                let neighbors = neighbors.as_ref().unwrap().as_primitive::<UInt32Type>();
-                let distances = distances.as_ref().unwrap().as_primitive::<Float32Type>();
-
-                nodes[node as usize].level_neighbors_ranked[level] = neighbors
+            if level == 0 {
+                // `to_batch` writes every node at level 0 exactly once in
+                // ascending `__vector_id` (== node id) order, so the level-0
+                // slice is exactly `[0, N)` and the row index *is* the node
+                // id. The `Dense` lookup below depends on this: in a release
+                // build a violated invariant would silently make search read
+                // the wrong neighbor list, so enforce it at load time (not via
+                // `debug_assert!`) and reject a malformed or version-
+                // incompatible batch.
+                if let Some((row, id)) = ids
+                    .values()
                     .iter()
-                    .zip(distances.iter())
-                    .map(|(n, dist)| OrderedNode::new(n.unwrap(), OrderedFloat(dist.unwrap())))
+                    .enumerate()
+                    .find(|&(row, id)| *id != row as u32)
+                {
+                    return Err(Error::index(format!(
+                        "HNSW level-0 __vector_id must equal the row index, but \
+                         row {row} has __vector_id {id}; the on-disk batch is \
+                         malformed or was written by an incompatible version"
+                    )));
+                }
+                level_lookup.push(LevelLookup::Dense);
+            } else {
+                // Upper levels: explicit id -> row map. No ordering/alignment
+                // assumption (see `LevelLookup::Sparse`). On the rare
+                // duplicate id (a misaligned slice can repeat one across a
+                // level boundary) the last wins, matching the old load's
+                // `nodes[id].level_neighbors[level] = ...` last-write.
+                let id_to_row: HashMap<u32, u32> = ids
+                    .values()
+                    .iter()
+                    .enumerate()
+                    .map(|(row, id)| (*id, row as u32))
                     .collect();
-                nodes[node as usize].update_from_ranked_neighbors(level as u16);
+                level_lookup.push(LevelLookup::Sparse(id_to_row));
             }
+            level_neighbors.push(neighbors);
+        }
+
+        // `entry_point` is read from untrusted metadata and indexes the `Dense`
+        // level-0 lookup directly; an out-of-range value would read past the
+        // level-0 neighbor buffer during search. Validate it under the same
+        // persisted-format invariant as the level-0 ids above.
+        let num_nodes = level_count[0];
+        if hnsw_metadata.entry_point as usize >= num_nodes {
+            return Err(Error::index(format!(
+                "HNSW entry_point {} is out of range for a graph with {num_nodes} \
+                 nodes; the on-disk batch is malformed or was written by an \
+                 incompatible version",
+                hnsw_metadata.entry_point
+            )));
         }
 
         let visited_generator_queue =
@@ -657,10 +1086,17 @@ impl IvfSubIndex for HNSW {
                 .push(VisitedGenerator::new(0))
                 .unwrap();
         }
-        let inner = HnswBuilder {
+
+        let graph = LoadedHnswGraph {
+            batch: data,
+            level_neighbors,
+            level_lookup,
+            level_count: level_count.clone(),
+        };
+        let inner = HnswCore {
             params: hnsw_metadata.params,
-            nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
-            level_count: level_count.into_iter().map(AtomicUsize::new).collect(),
+            graph: HnswGraph::Loaded(Arc::new(graph)),
+            level_count,
             entry_point: hnsw_metadata.entry_point,
             visited_generator_queue,
         };
@@ -756,35 +1192,32 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
-        let inner = HnswBuilder::with_params(params, storage);
-        let hnsw = Self {
-            inner: Arc::new(inner),
-        };
+        let builder = HnswBuilder::with_params(params, storage);
 
         log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
-            hnsw.inner.params.max_level,
-            hnsw.inner.params.m,
-            hnsw.inner.params.ef_construction,
+            builder.params.max_level,
+            builder.params.m,
+            builder.params.ef_construction,
             storage.distance_type(),
         );
 
         if storage.is_empty() {
-            return Ok(hnsw);
+            return Ok(builder.finish());
         }
 
         let len = storage.len();
-        hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
+        builder.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..len).into_par_iter().for_each_init(
             || VisitedGenerator::new(len),
             |visited_generator, node| {
-                hnsw.inner.insert(node as u32, visited_generator, storage);
+                builder.insert(node as u32, visited_generator, storage);
             },
         );
 
-        assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
-        Ok(hnsw)
+        assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
+        Ok(builder.finish())
     }
 
     fn remap(
@@ -799,6 +1232,28 @@ impl IvfSubIndex for HNSW {
 
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch> {
+        let nodes = match &self.inner.graph {
+            HnswGraph::Built(nodes) => nodes,
+            HnswGraph::Loaded(graph) => {
+                // A loaded graph is already Arrow-backed: return the retained
+                // batch verbatim, re-stamped with up-to-date HNSW metadata.
+                // The IVF partition cache re-serializes loaded indices through
+                // here (`ivf/partition_serde.rs`), so this must round-trip.
+                let metadata = serde_json::to_string(&self.metadata())?;
+                let schema =
+                    graph
+                        .batch
+                        .schema()
+                        .as_ref()
+                        .clone()
+                        .with_metadata(HashMap::from_iter(vec![(
+                            HNSW_METADATA_KEY.to_string(),
+                            metadata,
+                        )]));
+                return Ok(graph.batch.clone().with_schema(Arc::new(schema))?);
+            }
+        };
+
         let mut vector_id_builder = UInt32Builder::with_capacity(self.len());
         let mut neighbors_builder = ListBuilder::with_capacity(UInt32Builder::new(), self.len());
         let mut distances_builder =
@@ -806,8 +1261,7 @@ impl IvfSubIndex for HNSW {
         let mut batches = Vec::with_capacity(self.max_level() as usize);
         for level in 0..self.max_level() {
             let level = level as usize;
-            for (id, node) in self.inner.nodes.iter().enumerate() {
-                let node = node.read().unwrap();
+            for (id, node) in nodes.iter().enumerate() {
                 if level >= node.level_neighbors.len() {
                     continue;
                 }
@@ -850,8 +1304,9 @@ impl IvfSubIndex for HNSW {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
     use arrow_schema::Schema;
+    use deepsize::DeepSizeOf;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_file::previous::{
         reader::FileReader as PreviousFileReader,
@@ -865,11 +1320,14 @@ mod tests {
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
+    use rstest::rstest;
 
+    use super::HnswGraph;
     use crate::scalar::IndexWriter;
+    use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::FlatFloatStorage,
+        flat::storage::{FlatBinStorage, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{
             HNSW, VECTOR_ID_FIELD,
@@ -937,5 +1395,392 @@ mod tests {
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
+    }
+
+    #[tokio::test]
+    async fn test_builder_write_load_binary_hamming() {
+        const DIM: usize = 8;
+        const TOTAL: usize = 256;
+        const NUM_EDGES: usize = 20;
+        let data = UInt8Array::from_iter_values((0..TOTAL * DIM).map(|v| (v % 16) as u8));
+        let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let store = Arc::new(FlatBinStorage::new(fsl.clone(), DistanceType::Hamming));
+        let builder = HnswBuildParams::default()
+            .num_edges(NUM_EDGES)
+            .ef_construction(50)
+            .build(Arc::new(fsl.clone()), DistanceType::Hamming)
+            .await
+            .unwrap();
+
+        let object_store = ObjectStore::memory();
+        let path = Path::from("test_builder_write_load_binary_hamming");
+        let writer = object_store.create(&path).await.unwrap();
+        let schema = Schema::new(vec![
+            VECTOR_ID_FIELD.clone(),
+            NEIGHBORS_FIELD.clone(),
+            DISTS_FIELD.clone(),
+        ]);
+        let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+            writer,
+            schema,
+            &PreviousFileWriterOptions::default(),
+        )
+        .unwrap();
+        let batch = builder.to_batch().unwrap();
+        let metadata = batch.schema_ref().metadata().clone();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish_with_metadata(&metadata).await.unwrap();
+
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+            .await
+            .unwrap();
+        let batch = reader
+            .read_range(0..reader.len(), reader.schema())
+            .await
+            .unwrap();
+        let loaded_hnsw = HNSW::load(batch).unwrap();
+
+        let query = fsl.value(0);
+        let k = 10;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let builder_results = builder
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
+            .unwrap();
+        let loaded_results = loaded_hnsw
+            .search_basic(query, k, &params, None, store.as_ref())
+            .unwrap();
+        assert_eq!(builder_results, loaded_results);
+    }
+
+    /// Brute-force top-`k` node ids by distance -- recall ground truth.
+    fn brute_force_topk(store: &FlatFloatStorage, query: ArrayRef, k: usize) -> Vec<u32> {
+        let dist_calc = store.dist_calculator(query, 0.0);
+        let mut all: Vec<(f32, u32)> = (0..store.len() as u32)
+            .map(|id| (dist_calc.distance(id), id))
+            .collect();
+        all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        all.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    /// The Arrow-backed loaded graph must search bit-identically to the
+    /// in-memory build, across distance types and graph sizes (single node,
+    /// pair, and a multi-level graph exercising the sparse upper-level
+    /// id->row lookup).
+    #[rstest]
+    #[case::l2_single(DistanceType::L2, 1)]
+    #[case::l2_pair(DistanceType::L2, 2)]
+    #[case::l2_multi_level(DistanceType::L2, 2048)]
+    #[case::dot_multi_level(DistanceType::Dot, 2048)]
+    #[tokio::test]
+    async fn test_loaded_search_parity_and_recall(
+        #[case] distance_type: DistanceType,
+        #[case] total: usize,
+    ) {
+        const DIM: usize = 32;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(total * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), distance_type));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
+
+        let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
+        assert_eq!(loaded.len(), total);
+
+        let k = total.min(10);
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let query = fsl.value(0);
+
+        let builder_results = builder
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
+            .unwrap();
+        let loaded_results = loaded
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
+            .unwrap();
+        assert_eq!(builder_results, loaded_results);
+
+        // Recall vs brute-force ground truth (project rule: >= 0.5).
+        let truth: std::collections::HashSet<u32> = brute_force_topk(store.as_ref(), query, k)
+            .into_iter()
+            .collect();
+        let hits = loaded_results
+            .iter()
+            .filter(|n| truth.contains(&n.id))
+            .count();
+        let recall = hits as f32 / k as f32;
+        assert!(recall >= 0.5, "recall {recall} below 0.5 (k={k})");
+    }
+
+    /// Regression guard for the `level_offsets` misalignment (issue #6746).
+    /// `to_batch` writes the entry-point node at *every* level, but
+    /// `level_count` only counts it at level 0, so the serialized batch has
+    /// strictly more rows than `sum(level_count)` and the upper-level
+    /// `level_offsets` slices are off-by-one / non-monotonic. The Arrow-backed
+    /// loaded graph must still search bit-identically to the in-memory build:
+    /// it keys upper levels by `__vector_id` value via the `Sparse` map
+    /// (last-write-wins), never `row == id`. A naive `row == id`
+    /// reimplementation would pass the small cases but break here.
+    #[tokio::test]
+    async fn test_loaded_level_offsets_misalignment_invariant() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt32Type;
+
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        // The scenario only exists on a multi-level graph.
+        assert!(
+            builder.max_level() >= 2,
+            "expected a multi-level graph (got max_level {})",
+            builder.max_level()
+        );
+
+        let batch = builder.to_batch().unwrap();
+        let md = builder.metadata();
+        let total_counted = *md.level_offsets.last().unwrap();
+
+        // The exact misalignment: more serialized rows than `level_count` sums
+        // to, because the entry-point node is written at every level yet
+        // counted only at level 0.
+        assert!(
+            batch.num_rows() > total_counted,
+            "expected serialized rows ({}) to exceed sum(level_count) ({}) -- \
+             entry point should be written at every level",
+            batch.num_rows(),
+            total_counted,
+        );
+
+        // Level-0 slice must still be exactly `[0, N)` with
+        // `__vector_id == row` -- the precondition for `LevelLookup::Dense`.
+        let n = md.level_offsets[1];
+        assert_eq!(n, TOTAL);
+        let level0 = batch.slice(0, n);
+        let ids = level0.column(0).as_primitive::<UInt32Type>();
+        assert!(
+            ids.values()
+                .iter()
+                .enumerate()
+                .all(|(row, id)| *id == row as u32),
+            "level-0 __vector_id must equal the row index",
+        );
+
+        // Despite the surplus rows and off-by-one upper slices, the loaded
+        // graph searches bit-identically to the in-memory build (old `load`
+        // semantics preserved via the `Sparse` last-write-wins map).
+        let loaded = HNSW::load(batch).unwrap();
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let query = fsl.value(0);
+        let builder_results = builder
+            .search_basic(query.clone(), 10, &params, None, store.as_ref())
+            .unwrap();
+        let loaded_results = loaded
+            .search_basic(query, 10, &params, None, store.as_ref())
+            .unwrap();
+        assert_eq!(builder_results, loaded_results);
+    }
+
+    /// `load()` must reject a batch whose level-0 `__vector_id` no longer
+    /// matches the row index. The `LevelLookup::Dense` fast path relies on
+    /// `row == id`, and the old `debug_assert!` was compiled out of release
+    /// builds -- so a corrupt batch must fail at the `load()` boundary instead
+    /// of silently searching the wrong neighbor lists.
+    #[tokio::test]
+    async fn test_load_rejects_misaligned_level0_id() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt32Type;
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let batch = builder.to_batch().unwrap();
+        // Row 0 is always a level-0 node; break its `__vector_id == row`
+        // invariant while preserving the (metadata-bearing) schema.
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        ids[0] = ids.len() as u32;
+        let mut columns = batch.columns().to_vec();
+        columns[0] = Arc::new(UInt32Array::from(ids));
+        let corrupted = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        assert!(
+            HNSW::load(corrupted).is_err(),
+            "load() must reject a misaligned level-0 __vector_id"
+        );
+    }
+
+    /// `load()` must reject metadata whose `entry_point` is out of range for
+    /// the node count: it indexes the `Dense` level-0 lookup directly, so an
+    /// out-of-range value would read past the level-0 neighbor buffer at search
+    /// time.
+    #[tokio::test]
+    async fn test_load_rejects_out_of_range_entry_point() {
+        use super::{HNSW_METADATA_KEY, HnswMetadata};
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let batch = builder.to_batch().unwrap();
+        let mut metadata = batch.schema_ref().metadata().clone();
+        let mut md: HnswMetadata =
+            serde_json::from_str(metadata.get(HNSW_METADATA_KEY).unwrap()).unwrap();
+        // Valid entry points are `[0, N)`; `level_offsets[1]` == N is one past.
+        let n = md.level_offsets[1];
+        md.entry_point = n as u32;
+        metadata.insert(
+            HNSW_METADATA_KEY.to_string(),
+            serde_json::to_string(&md).unwrap(),
+        );
+        // Rebuild the batch under the rewritten metadata. `with_schema` would
+        // reject this: it requires the new metadata to be a superset, but we
+        // are changing an existing key's value, not adding one.
+        let schema = batch.schema().as_ref().clone().with_metadata(metadata);
+        let corrupted = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap();
+
+        assert!(
+            HNSW::load(corrupted).is_err(),
+            "load() must reject an out-of-range entry_point"
+        );
+    }
+
+    /// An empty index round-trips: 0-row `to_batch` -> `load` -> empty graph.
+    #[tokio::test]
+    async fn test_loaded_empty_index() {
+        const DIM: usize = 16;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(0), DIM as i32).unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(store.as_ref(), HnswBuildParams::default()).unwrap();
+        assert!(builder.is_empty());
+
+        let batch = builder.to_batch().unwrap();
+        assert_eq!(batch.num_rows(), 0);
+
+        let loaded = HNSW::load(batch).unwrap();
+        assert!(loaded.is_empty());
+        assert_eq!(loaded.len(), 0);
+        // A 0-row load short-circuits to the empty (Built) graph.
+        assert!(!matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
+        assert_eq!(loaded.to_batch().unwrap().num_rows(), 0);
+    }
+
+    /// build -> `to_batch` (b1) -> `load` -> `to_batch` (b2) must satisfy
+    /// `b1 == b2`, and the round-tripped batch must reload and search
+    /// identically. This is exactly the IVF partition-cache path:
+    /// `ivf/partition_serde.rs` calls `to_batch()` on a *loaded* index.
+    #[tokio::test]
+    async fn test_to_batch_roundtrip_loaded() {
+        const DIM: usize = 24;
+        const TOTAL: usize = 1500;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(16).ef_construction(50),
+        )
+        .unwrap();
+
+        let b1 = builder.to_batch().unwrap();
+        let loaded = HNSW::load(b1.clone()).unwrap();
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
+        let b2 = loaded.to_batch().unwrap();
+        assert_eq!(b1, b2);
+
+        let reloaded = HNSW::load(b2).unwrap();
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let query = fsl.value(7);
+        let a = builder
+            .search_basic(query.clone(), 10, &params, None, store.as_ref())
+            .unwrap();
+        let b = reloaded
+            .search_basic(query, 10, &params, None, store.as_ref())
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// The loaded graph shares the Arrow batch and reconstructs no per-node
+    /// `Vec<GraphBuilderNode>` / `Vec<OrderedNode>`, so it is strictly
+    /// lighter than the in-memory build representation.
+    #[tokio::test]
+    async fn test_loaded_graph_is_arrow_backed() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
+
+        let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
+        assert!(
+            loaded.deep_size_of() < builder.deep_size_of(),
+            "loaded graph ({}) should be lighter than built ({})",
+            loaded.deep_size_of(),
+            builder.deep_size_of(),
+        );
     }
 }

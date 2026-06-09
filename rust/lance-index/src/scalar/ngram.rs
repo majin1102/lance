@@ -38,13 +38,15 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, utils::mask::RowAddrTreeMap};
-use lance_core::{ROW_ID, Result};
+use lance_core::{Error, ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
+use lance_select::RowAddrTreeMap;
+use lance_tokenizer::{
+    AlphaNumOnlyFilter, AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer,
+};
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
-use tantivy::tokenizer::TextAnalyzer;
 use tracing::instrument;
 
 const TOKENS_COL: &str = "tokens";
@@ -65,15 +67,15 @@ pub static POSTINGS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 pub static TEXT_PREPPER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
-    TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
-        .filter(tantivy::tokenizer::LowerCaser)
-        .filter(tantivy::tokenizer::AsciiFoldingFilter)
+    TextAnalyzer::builder(RawTokenizer::default())
+        .filter(LowerCaser)
+        .filter(AsciiFoldingFilter)
         .build()
 });
 /// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
 pub static NGRAM_TOKENIZER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
-    TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(3, 3).unwrap())
-        .filter(tantivy::tokenizer::AlphaNumOnlyFilter)
+    TextAnalyzer::builder(NgramTokenizer::all_ngrams(3, 3).unwrap())
+        .filter(AlphaNumOnlyFilter)
         .build()
 });
 
@@ -169,6 +171,10 @@ impl CacheKey for NGramPostingListKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("posting-list-{}", self.row_offset).into()
+    }
+
+    fn type_name() -> &'static str {
+        "NGramPostingList"
     }
 }
 
@@ -504,6 +510,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -511,7 +518,7 @@ impl ScalarIndex for NGramIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         let spill_files = builder.train(new_data).await?;
@@ -524,6 +531,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -1071,7 +1079,8 @@ impl NGramIndexBuilder {
             }
         }
 
-        writer.finish().await
+        writer.finish().await?;
+        Ok(())
     }
 
     async fn merge_spill_files(
@@ -1213,7 +1222,8 @@ impl NGramIndexBuilder {
             offset += batch_size;
         }
 
-        writer.finish().await
+        writer.finish().await?;
+        Ok(())
     }
 }
 
@@ -1269,7 +1279,11 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(TextQueryParser::new(index_name, true)))
+        Some(Box::new(TextQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
     }
 
     async fn train_index(
@@ -1291,6 +1305,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -1321,14 +1336,11 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{TryStreamExt, stream};
     use itertools::Itertools;
-    use lance_core::{
-        ROW_ID,
-        cache::LanceCache,
-        utils::{mask::RowAddrTreeMap, tempfile::TempDir},
-    };
+    use lance_core::{ROW_ID, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
-    use tantivy::tokenizer::TextAnalyzer;
+    use lance_select::RowAddrTreeMap;
+    use lance_tokenizer::TextAnalyzer;
 
     use crate::scalar::{
         ScalarIndex, SearchResult, TextQuery,

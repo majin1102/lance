@@ -16,6 +16,20 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from packaging.version import Version
+
+NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
+NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
+NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
+
+
+def _lance_namespace_dependency(pylance_version: str) -> str:
+    if Version(pylance_version) >= Version("7.2.0b5"):
+        return NAMESPACE_0_8_DEPENDENCY
+    if Version(pylance_version) >= Version("6.0.0b0"):
+        return NAMESPACE_0_7_DEPENDENCY
+    return NAMESPACE_0_6_DEPENDENCY
+
 
 class VenvExecutor:
     """Manages a virtual environment with a specific Lance version."""
@@ -106,6 +120,11 @@ class VenvExecutor:
                 "--extra-index-url",
                 "https://pypi.fury.io/lancedb/",
                 f"pylance=={self.version}",
+                # Older Lance wheels (e.g. 2.0.1, 4.0.0b1) import
+                # CreateEmptyTableRequest from lance_namespace, which was
+                # removed in lance-namespace 0.7.0. Pin to <0.7 so old wheels
+                # resolve a compatible transitive dep.
+                _lance_namespace_dependency(self.version),
                 "pytest",
             ],
             check=True,
@@ -162,7 +181,12 @@ class VenvExecutor:
 
         return pickle.loads(data)
 
-    def execute_method(self, obj: Any, method_name: str) -> Any:
+    def execute_method(
+        self,
+        obj: Any,
+        method_name: str,
+        env_overrides: Optional[dict[str, str]] = None,
+    ) -> Any:
         """
         Execute a method on a pickled object in the virtual environment.
 
@@ -192,8 +216,8 @@ class VenvExecutor:
         # Ensure subprocess is running
         self._ensure_subprocess()
         try:
-            # Send request: (obj, method_name)
-            self._send_message((obj, method_name))
+            # Send request: (obj, method_name, env_overrides)
+            self._send_message((obj, method_name, env_overrides or {}))
 
             # Receive response
             response = self._receive_message()

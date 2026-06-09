@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -9,13 +10,10 @@ use crate::{
     dataset::transaction::{Operation, Transaction},
 };
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowSetOps;
-use lance_core::{
-    Error, Result,
-    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
-};
+use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use std::{
@@ -501,8 +499,6 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                // unless it is the same frag reuse index or MemWAL index
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
@@ -518,9 +514,20 @@ impl<'a> TransactionRebase<'a> {
                     let other_has_mem_wal = created_indices
                         .iter()
                         .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+                    let has_regular_name_conflict = new_indices
+                        .iter()
+                        .filter(|idx| {
+                            idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
+                        })
+                        .any(|new_index| {
+                            created_indices
+                                .iter()
+                                .any(|created_index| created_index.name == new_index.name)
+                        });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
+                        || has_regular_name_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -597,7 +604,7 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
-                        for field in &replacement.1.fields {
+                        for field in replacement.1.fields.iter() {
                             if newly_indexed_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
@@ -736,9 +743,38 @@ impl<'a> TransactionRebase<'a> {
                                 .push(committed_fri.clone());
                             Ok(())
                         }
-                        // If rewrite defers index remap,
-                        // then it does not conflict with index creation
-                        (None, Some(_)) => Ok(()),
+                        // If rewrite defers index remap, the FRI handles the
+                        // post-commit bitmap update — but only if each rewrite
+                        // group is fully inside or fully outside each new
+                        // index's fragment bitmap. A group that straddles
+                        // would produce a bitmap with a mix of indexed and
+                        // non-indexed fragments, which load_indices rejects.
+                        (None, Some(_)) => {
+                            for index in new_indices {
+                                let Some(frag_bitmap) = &index.fragment_bitmap else {
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
+                                };
+                                for group in groups {
+                                    let mut indexed = 0usize;
+                                    let mut unindexed = 0usize;
+                                    for frag in &group.old_fragments {
+                                        if frag_bitmap.contains(frag.id as u32) {
+                                            indexed += 1;
+                                        } else {
+                                            unindexed += 1;
+                                        }
+                                    }
+                                    if indexed > 0 && unindexed > 0 {
+                                        return Err(self.retryable_conflict_err(
+                                            other_transaction,
+                                            other_version,
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
                         // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), None) => {
                             // this should not happen today since we don't support committing
@@ -888,7 +924,7 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
-                        for field in &replacement.1.fields {
+                        for field in replacement.1.fields.iter() {
                             if newly_indexed_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
@@ -923,7 +959,7 @@ impl<'a> TransactionRebase<'a> {
                                 continue;
                             }
 
-                            for field in &replacement.1.fields {
+                            for field in replacement.1.fields.iter() {
                                 if other_replacement.1.fields.contains(field) {
                                     return Err(self
                                         .retryable_conflict_err(other_transaction, other_version));
@@ -1085,7 +1121,7 @@ impl<'a> TransactionRebase<'a> {
                         .transaction
                         .operation
                         .upsert_key_conflict(&other_transaction.operation)
-                        | self
+                        || self
                             .transaction
                             .operation
                             .modifies_same_metadata(&other_transaction.operation)
@@ -1128,7 +1164,7 @@ impl<'a> TransactionRebase<'a> {
                     merged_generations: other_merged_generations,
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
-                    // the same region's merged_generation
+                    // the same shard's merged_generation
                     self.check_merged_generations_conflict(
                         other_merged_generations,
                         self_merged_generations,
@@ -1235,11 +1271,11 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        // Check if any region has conflicting updates
+        // Check if any shard has conflicting updates
         for committed_mg in committed {
             for to_commit_mg in to_commit {
-                if committed_mg.region_id == to_commit_mg.region_id {
-                    // Same region being updated
+                if committed_mg.shard_id == to_commit_mg.shard_id {
+                    // Same shard being updated
                     // If committed >= to_commit, data already merged or superseded - abort without retry
                     // If committed < to_commit, can retry with new state
                     if committed_mg.generation >= to_commit_mg.generation {
@@ -1325,7 +1361,7 @@ impl<'a> TransactionRebase<'a> {
                         .await
                         .map(|dv| (fragment_id, dv))
                     })
-                    .buffered(dataset.object_store().io_parallelism())
+                    .buffered(dataset.object_store.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -1381,7 +1417,7 @@ impl<'a> TransactionRebase<'a> {
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.object_store(),
+                        dataset.object_store.as_ref(),
                     )
                     .await?;
 
@@ -1440,7 +1476,11 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
-        if let Operation::CreateIndex { new_indices, .. } = &mut self.transaction.operation {
+        if let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &mut self.transaction.operation
+        {
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -1502,13 +1542,13 @@ impl<'a> TransactionRebase<'a> {
                 let current_meta = new_indices.remove(pos);
                 let mut details = load_mem_wal_index_details(current_meta)?;
 
-                // Merge conflicting merged_generations - for each region, keep higher generation
+                // Merge conflicting merged_generations - for each shard, keep higher generation
                 // We own self so we can consume conflicting_mem_wal_merged_gens directly
                 for new_mg in self.conflicting_mem_wal_merged_gens {
                     if let Some(existing) = details
                         .merged_generations
                         .iter_mut()
-                        .find(|mg| mg.region_id == new_mg.region_id)
+                        .find(|mg| mg.shard_id == new_mg.shard_id)
                     {
                         if new_mg.generation > existing.generation {
                             existing.generation = new_mg.generation;
@@ -1520,6 +1560,25 @@ impl<'a> TransactionRebase<'a> {
 
                 let new_meta = new_mem_wal_index_meta(dataset.manifest.version, details)?;
                 new_indices.push(new_meta);
+            }
+
+            for singleton_name in [FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
+                if new_indices.iter().any(|idx| idx.name == singleton_name) {
+                    for existing_idx in dataset
+                        .load_indices()
+                        .await?
+                        .iter()
+                        .filter(|idx| idx.name == singleton_name)
+                        .cloned()
+                    {
+                        if !removed_indices
+                            .iter()
+                            .any(|removed_idx| removed_idx.uuid == existing_idx.uuid)
+                        {
+                            removed_indices.push(existing_idx);
+                        }
+                    }
+                }
             }
 
             Ok(self.transaction)
@@ -1753,6 +1812,7 @@ mod tests {
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
+            updated_fragment_offsets: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1765,6 +1825,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1780,6 +1841,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1787,12 +1849,12 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store().io_stats_incremental(); // reset
+        dataset.object_store.as_ref().io_stats_incremental(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
                 .check_txn(other_transaction, other_version as u64)
                 .unwrap();
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 0);
             assert_io_eq!(io_stats, write_iops, 0);
         }
@@ -1806,7 +1868,7 @@ mod tests {
         let rebased_transaction = rebase.finish(&dataset).await.unwrap();
         assert_eq!(rebased_transaction, expected_transaction);
         // We didn't need to do any IO, so the stats should be 0.
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
     }
@@ -1822,7 +1884,7 @@ mod tests {
                 deletion_file,
                 // Reference deletion file should never enter this apply_deletion. So base path is fine.
                 &dataset.base,
-                dataset.object_store(),
+                dataset.object_store.as_ref(),
             )
             .await
             .unwrap()
@@ -1837,7 +1899,7 @@ mod tests {
             fragment.id,
             dataset.manifest.version,
             &current_deletions,
-            dataset.object_store(),
+            dataset.object_store.as_ref(),
         )
         .await
         .unwrap();
@@ -1882,6 +1944,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1897,6 +1960,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
         let transactions =
@@ -1911,12 +1975,12 @@ mod tests {
                     .await
                     .unwrap();
 
-            dataset.object_store().io_stats_incremental(); // reset
+            dataset.object_store.as_ref().io_stats_incremental(); // reset
             for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
                 rebase
                     .check_txn(other_transaction, other_version as u64)
                     .unwrap();
-                let io_stats = dataset.object_store().io_stats_incremental();
+                let io_stats = dataset.object_store.as_ref().io_stats_incremental();
                 assert_io_eq!(io_stats, read_iops, 0);
                 assert_io_eq!(io_stats, write_iops, 0);
             }
@@ -1927,7 +1991,7 @@ mod tests {
             let rebased_transaction = rebase.finish(&dataset).await.unwrap();
             assert_eq!(rebased_transaction.read_version, dataset.manifest.version);
 
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             if expected_rewrite {
                 // Read the current deletion file, and write the new one.
                 assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
@@ -1952,7 +2016,7 @@ mod tests {
                 //     original_fragment.id,
                 //     original_fragment.deletion_file.as_ref().unwrap(),
                 // );
-                // assert!(!dataset.object_store().exists(&old_path).await.unwrap());
+                // assert!(!dataset.object_store.as_ref().exists(&old_path).await.unwrap());
                 // The new deletion file should exist.
                 let final_fragment = match &rebased_transaction.operation {
                     Operation::Update {
@@ -1970,7 +2034,14 @@ mod tests {
                     final_fragment.id,
                     final_fragment.deletion_file.as_ref().unwrap(),
                 );
-                assert!(dataset.object_store().exists(&new_path).await.unwrap());
+                assert!(
+                    dataset
+                        .object_store
+                        .as_ref()
+                        .exists(&new_path)
+                        .await
+                        .unwrap()
+                );
 
                 assert_io_eq!(io_stats, num_stages, 1);
             } else {
@@ -2019,6 +2090,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
             ),
             (
@@ -2032,6 +2104,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
             ),
             (
@@ -2076,12 +2149,12 @@ mod tests {
 
         let affected_rows = RowAddrTreeMap::from_iter([0]);
 
-        dataset.object_store().io_stats_incremental(); // reset
+        dataset.object_store.as_ref().io_stats_incremental(); // reset
         let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2106,7 +2179,7 @@ mod tests {
             vec![(0, true)],
         );
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2116,7 +2189,7 @@ mod tests {
             Err(crate::Error::RetryableCommitConflict { .. })
         ));
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
         assert_io_eq!(io_stats, write_iops, 0, "failed before writing");
     }
@@ -2142,6 +2215,7 @@ mod tests {
             index_version: 0,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            files: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -2191,6 +2265,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             create_update_config_for_test(
                 Some(HashMap::from_iter(vec![(
@@ -2296,10 +2371,10 @@ mod tests {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0],
                 },
-                // Will only conflict with operations that modify row ids.
+                // Conflicts with row-id-changing operations and same-name CreateIndex.
                 [
                     Compatible,    // append
-                    Compatible,    // create index
+                    Retryable,     // create index
                     Compatible,    // delete
                     Compatible,    // merge
                     NotCompatible, // overwrite
@@ -2397,6 +2472,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
                 [
                     Compatible,    // append
@@ -2629,6 +2705,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_create_index_conflicts_only_on_same_name() {
+        let index0 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let index1 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "other".to_string(),
+            ..index0.clone()
+        };
+
+        let txn = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![index0.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut rebase = TransactionRebase {
+            transaction: txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let same_name = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![IndexMetadata {
+                    uuid: uuid::Uuid::new_v4(),
+                    ..index0
+                }],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let different_name = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![index1],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let same_name_result = rebase.check_txn(&same_name, 1);
+        assert!(
+            matches!(same_name_result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict for same-name CreateIndex, got {:?}",
+            same_name_result
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: "test".to_string(),
+                        fields: vec![0],
+                        dataset_version: 1,
+                        fragment_bitmap: None,
+                        index_details: None,
+                        index_version: 0,
+                        created_at: None,
+                        base_id: None,
+                        files: None,
+                    }],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+        let different_name_result = rebase.check_txn(&different_name, 1);
+        assert!(
+            different_name_result.is_ok(),
+            "Expected compatibility for different-name CreateIndex, got {:?}",
+            different_name_result
+        );
+    }
+
     #[tokio::test]
     async fn test_add_bases_non_conflicting() {
         let dataset = test_dataset(10, 2).await;
@@ -2821,6 +2995,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
 
@@ -3143,13 +3318,13 @@ mod tests {
     #[test]
     fn test_merged_generations_conflict_lower_generation_fails() {
         // Test: committed generation >= to_commit generation should be incompatible (no retry)
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // Committed has generation 10, we're trying to commit generation 5
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3157,7 +3332,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -3182,12 +3357,12 @@ mod tests {
     #[test]
     fn test_merged_generations_conflict_equal_generation_fails() {
         // Test: committed generation == to_commit generation should be incompatible (no retry)
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3195,7 +3370,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3220,13 +3395,13 @@ mod tests {
     #[test]
     fn test_merged_generations_conflict_higher_generation_retryable() {
         // Test: committed generation < to_commit generation should be retryable
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // Committed has generation 5, we're trying to commit generation 10
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -3234,7 +3409,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3257,15 +3432,15 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_generations_different_regions_ok() {
-        // Test: different regions should not conflict
-        let region1 = Uuid::new_v4();
-        let region2 = Uuid::new_v4();
+    fn test_merged_generations_different_shards_ok() {
+        // Test: different shards should not conflict
+        let shard1 = Uuid::new_v4();
+        let shard2 = Uuid::new_v4();
 
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region1, 10)],
+                merged_generations: vec![MergedGeneration::new(shard1, 10)],
             },
             None,
         );
@@ -3273,7 +3448,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region2, 5)],
+                merged_generations: vec![MergedGeneration::new(shard2, 5)],
             },
             None,
         );
@@ -3290,7 +3465,7 @@ mod tests {
         let result = rebase.check_txn(&committed_txn, 1);
         assert!(
             result.is_ok(),
-            "Expected OK for different regions, got {:?}",
+            "Expected OK for different shards, got {:?}",
             result
         );
     }
@@ -3300,11 +3475,11 @@ mod tests {
         use crate::index::mem_wal::new_mem_wal_index_meta;
         use lance_index::mem_wal::MemWalIndexDetails;
 
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // Create a MemWalIndex with merged_generations
         let details = MemWalIndexDetails {
-            merged_generations: vec![MergedGeneration::new(region, 10)],
+            merged_generations: vec![MergedGeneration::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
@@ -3323,7 +3498,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -3348,7 +3523,7 @@ mod tests {
         let to_commit_txn_higher = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 15)],
+                merged_generations: vec![MergedGeneration::new(shard, 15)],
             },
             None,
         );
@@ -3375,7 +3550,7 @@ mod tests {
         use crate::index::mem_wal::new_mem_wal_index_meta;
         use lance_index::mem_wal::MemWalIndexDetails;
 
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // CreateIndex with MemWalIndex (no merged_generations initially)
         let details = MemWalIndexDetails::default();
@@ -3394,7 +3569,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3419,7 +3594,7 @@ mod tests {
 
         // Verify that merged_generations were collected
         assert_eq!(rebase.conflicting_mem_wal_merged_gens.len(), 1);
-        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].region_id, region);
+        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].shard_id, shard);
         assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].generation, 10);
     }
 

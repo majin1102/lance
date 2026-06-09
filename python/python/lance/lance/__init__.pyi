@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -20,6 +21,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Self,
     Sequence,
@@ -28,6 +30,7 @@ from typing import (
 )
 
 import pyarrow as pa
+from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
 from ..commit import CommitLock
@@ -46,8 +49,8 @@ from ..fragment import (
     DataFile,
     FragmentMetadata,
 )
-from ..io import StorageOptionsProvider
 from ..progress import FragmentWriteProgress as FragmentWriteProgress
+from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
 from .debug import format_fragment as format_fragment
@@ -61,6 +64,7 @@ from .fragment import (
     RowIdMeta as RowIdMeta,
 )
 from .indices import IndexDescription as IndexDescription
+from .indices import IndexSegment as IndexSegment
 from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
@@ -99,7 +103,8 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int],
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
-        storage_options_provider: Optional[StorageOptionsProvider],
+        namespace_client: Optional[LanceNamespace],
+        table_id: Optional[List[str]],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -113,7 +118,8 @@ class LanceFileSession:
         self,
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -137,7 +143,8 @@ class LanceFileReader:
         self,
         path: str,
         storage_options: Optional[Dict[str, str]],
-        storage_options_provider: Optional[StorageOptionsProvider],
+        namespace_client: Optional[LanceNamespace],
+        table_id: Optional[List[str]],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -221,7 +228,6 @@ class _Dataset:
     def data_storage_version(self) -> str: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
-    def load_indices(self) -> List[Index]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
     def scanner(
         self,
@@ -239,6 +245,7 @@ class _Dataset:
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[List[_Fragment]] = None,
+        index_segments: Optional[List[str]] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
@@ -283,6 +290,27 @@ class _Dataset:
         row_indices: List[int],
         blob_column: str,
     ) -> List[LanceBlobFile]: ...
+    def read_blobs(
+        self,
+        row_ids: List[int],
+        blob_column: str,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]: ...
+    def read_blobs_by_addresses(
+        self,
+        row_addresses: List[int],
+        blob_column: str,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]: ...
+    def read_blobs_by_indices(
+        self,
+        row_indices: List[int],
+        blob_column: str,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
@@ -317,6 +345,7 @@ class _Dataset:
         older_than_micros: int,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
@@ -333,6 +362,11 @@ class _Dataset:
         tag: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
     ): ...
+    def replace_tag_metadata(
+        self,
+        tag: str,
+        metadata: Dict[str, str],
+    ) -> None: ...
     # Branch operations
     def branches(self) -> Dict[str, Branch]: ...
     def branches_ordered(self, order: Optional[str]) -> List[Tuple[str, Branch]]: ...
@@ -344,6 +378,11 @@ class _Dataset:
         **kwargs,
     ) -> _Dataset: ...
     def delete_branch(self, branch: str) -> None: ...
+    def replace_branch_metadata(
+        self,
+        branch: str,
+        metadata: Dict[str, str],
+    ) -> None: ...
     def optimize_indices(self, **kwargs): ...
     def create_index(
         self,
@@ -355,10 +394,18 @@ class _Dataset:
         kwargs: Optional[Dict[str, Any]] = None,
     ): ...
     def drop_index(self, name: str): ...
-    def prewarm_index(self, name: str): ...
+    def prewarm_index(self, name: str, *, with_position: bool = False): ...
     def merge_index_metadata(
-        self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None
+        self,
+        index_uuid: str,
+        index_type: str,
+        batch_readhead: Optional[int] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
+    def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
+    def commit_existing_index_segments(
+        self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
+    ) -> None: ...
     def count_fragments(self) -> int: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
@@ -379,11 +426,11 @@ class _Dataset:
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        commit_timeout: Optional[timedelta] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -392,10 +439,10 @@ class _Dataset:
         transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        commit_timeout: Optional[timedelta] = None,
     ) -> Tuple[_Dataset, Transaction]: ...
     def validate(self): ...
     def migrate_manifest_paths_v2(self): ...
@@ -427,7 +474,7 @@ class _Scanner:
     @property
     def schema(self) -> pa.Schema: ...
     def explain_plan(self, verbose: bool) -> str: ...
-    def analyze_plan(self) -> str: ...
+    def analyze_plan(self, count_rows: bool = False) -> str: ...
     def count_rows(self) -> int: ...
     def to_pyarrow(self) -> pa.RecordBatchReader: ...
 
@@ -503,7 +550,14 @@ def _write_fragments(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
+    namespace_client: Optional[LanceNamespace],
+    table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List[Any]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -515,10 +569,95 @@ def _write_fragments_transaction(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
+    namespace_client: Optional[LanceNamespace],
+    table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List[Any]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
+def _parse_field_path(path: str) -> list[str]: ...
+def _format_field_path(segments: list[str]) -> str: ...
+def _evaluate_sharding_spec(
+    batch: pa.RecordBatch,
+    spec: Dict[str, Any],
+    schema: LanceSchema,
+) -> pa.RecordBatch: ...
+
+class _MergedGeneration:
+    shard_id: str
+    generation: int
+    def __init__(self, shard_id: str, generation: int) -> None: ...
+
+class _ShardSnapshot:
+    shard_id: str
+    def __init__(self, shard_id: str) -> None: ...
+    def with_spec_id(self, spec_id: int) -> Self: ...
+    def with_current_generation(self, generation: int) -> Self: ...
+    def with_flushed_generation(self, generation: int, path: str) -> Self: ...
+
+class _ShardWriter:
+    shard_id: str
+    def put(self, data: Any) -> None: ...
+    def close(self) -> None: ...
+    def stats(self) -> Dict[str, Any]: ...
+    def memtable_stats(self) -> Dict[str, Any]: ...
+    def lsm_scanner(
+        self, shard_snapshots: Optional[List[_ShardSnapshot]] = None
+    ) -> _LsmScanner: ...
+
+class _LsmScanner:
+    @staticmethod
+    def from_snapshots(
+        dataset: _Dataset, shard_snapshots: List[_ShardSnapshot]
+    ) -> _LsmScanner: ...
+    def project(self, columns: List[str]) -> Self: ...
+    def filter(self, expr: str) -> Self: ...
+    def limit(self, n: int, offset: Optional[int] = None) -> Self: ...
+    def with_row_address(self) -> Self: ...
+    def with_memtable_gen(self) -> Self: ...
+    def to_batch(self) -> pa.RecordBatch: ...
+    def to_batches(self) -> List[pa.RecordBatch]: ...
+    def count_rows(self) -> int: ...
+
+class _ExecutionPlan:
+    schema: pa.Schema
+    dataset_schema: pa.Schema
+    def explain(self) -> str: ...
+    def to_reader(self) -> pa.RecordBatchReader: ...
+    def to_batches(self) -> List[pa.RecordBatch]: ...
+
+class _LsmPointLookupPlanner:
+    def __init__(
+        self,
+        dataset: _Dataset,
+        shard_snapshots: List[_ShardSnapshot],
+        pk_columns: Optional[List[str]] = None,
+    ) -> None: ...
+    def plan_lookup(
+        self, pk_value: pa.Array, columns: Optional[List[str]] = None
+    ) -> _ExecutionPlan: ...
+
+class _LsmVectorSearchPlanner:
+    def __init__(
+        self,
+        dataset: _Dataset,
+        shard_snapshots: List[_ShardSnapshot],
+        vector_column: str,
+        pk_columns: Optional[List[str]] = None,
+        distance_type: Optional[str] = None,
+    ) -> None: ...
+    def plan_search(
+        self,
+        query: pa.Array,
+        k: int = 10,
+        nprobes: int = 20,
+        columns: Optional[List[str]] = None,
+    ) -> _ExecutionPlan: ...
 
 class _Hnsw:
     @staticmethod

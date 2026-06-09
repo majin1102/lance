@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{UInt32Array, cast::AsArray, types::Int32Type};
 use arrow_schema::DataType;
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{FutureExt, StreamExt};
 use lance_core::utils::{tempfile::TempDir, tokio::get_num_compute_intensive_cpus};
 use lance_datagen::ArrayGeneratorExt;
@@ -42,7 +44,7 @@ fn bench_reader(c: &mut Criterion) {
             .block_on(ObjectStore::from_uri(&tmpdir.path_str()))
             .unwrap();
 
-        let file_path = base_path.child("foo.lance");
+        let file_path = base_path.clone().join("foo.lance");
         let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
 
         let mut writer = FileWriter::try_new(
@@ -89,6 +91,7 @@ fn bench_reader(c: &mut Criterion) {
                             None,
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .unwrap();
                     let stats = Arc::new(Mutex::new((0, 0)));
                     let mut stream = stream
@@ -200,7 +203,7 @@ fn get_cached_readers(
 
     // Create filename with version to avoid collisions
     let filename = format!("bench_{}.lance", version);
-    let file_path = base_path.child(filename.as_str());
+    let file_path = base_path.join(filename.as_str());
 
     // Generate data
     let data = lance_datagen::gen_batch()
@@ -305,6 +308,7 @@ fn read_task(
                 None,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
         let stats = Arc::new(Mutex::new((0, 0)));
         let mut stream = stream.then(|batch_task| {
@@ -463,7 +467,7 @@ fn bench_random_access(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+        .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_reader, bench_random_access);
 
 // Non-linux version does not support pprof.

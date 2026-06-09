@@ -14,6 +14,7 @@ use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
+use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
 use datafusion::common::DFSchema;
@@ -39,13 +40,11 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::{
     common::Column,
     logical_expr::{Between, BinaryExpr, Like, Operator},
-    physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
     scalar::ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 
@@ -340,7 +339,7 @@ impl Planner {
 
     fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
         Ok(match op {
-            UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
 
@@ -918,15 +917,17 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
-        // DataFusion needs the simplify and coerce passes to be applied before
+        // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
-        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-        let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
+        let simplify_context = SimplifyContext::default()
+            .with_schema(df_schema.clone())
+            .with_query_execution_start_time(Some(Utc::now()));
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 
-        let expr = simplifier.simplify(expr)?;
+        // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+        let expr = simplifier.simplify(expr)?;
 
         Ok(expr)
     }
@@ -1011,6 +1012,7 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
 
     use crate::logical_expr::ExprExt;
 
@@ -1098,6 +1100,59 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[derive(Debug, Eq, PartialEq, Hash)]
+    struct StrictFloat64Udf {
+        signature: Signature,
+    }
+
+    impl StrictFloat64Udf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![DataType::Float64], Volatility::Immutable),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for StrictFloat64Udf {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn name(&self) -> &str {
+            "strict_float64"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+            Ok(DataType::Float64)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+            let data_type = args.args[0].data_type();
+            assert_eq!(
+                data_type,
+                DataType::Float64,
+                "strict_float64 expected Float64, got {data_type}"
+            );
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(0.0))))
+        }
+    }
+
+    #[test]
+    fn test_coerce_before_simplify() {
+        let planner = Planner::new(Arc::new(Schema::empty()));
+        let strict_float64 = Arc::new(ScalarUDF::new_from_impl(StrictFloat64Udf::new()));
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(strict_float64, vec![lit(0_i64)]))
+            .eq(lit(0.0_f64));
+
+        let optimized = planner.optimize_expr(expr).unwrap();
+
+        planner.create_physical_expr(&optimized).unwrap();
     }
 
     #[test]

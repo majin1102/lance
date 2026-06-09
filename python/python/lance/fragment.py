@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Iterator,
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
         Transaction,
     )
     from .lance import LanceSchema
+    from .namespace import LanceNamespace
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
@@ -142,7 +144,7 @@ class FragmentMetadata:
 
         row_id_meta = json_data.get("row_id_meta")
         if row_id_meta is not None:
-            row_id_meta = RowIdMeta(**row_id_meta)
+            row_id_meta = RowIdMeta.from_dict(row_id_meta)
 
         created_at_version_meta = json_data.get("created_at_version_meta")
         if created_at_version_meta is not None:
@@ -249,6 +251,36 @@ class DataFile:
         )
         return self.fields
 
+    @classmethod
+    def create(
+        cls,
+        dataset: "LanceDataset",
+        path: str,
+        *,
+        base_id: Optional[int] = None,
+    ) -> "DataFile":
+        """Create a DataFile by reading metadata from an existing lance file.
+
+        This is a convenience method for creating DataFile metadata needed
+        for operations like DataReplacement. It opens the file, reads its
+        schema and version information, matches columns to the dataset's
+        schema to determine field IDs, and calculates column indices.
+
+        Parameters
+        ----------
+        dataset : LanceDataset
+            The dataset this file will belong to.
+        path : str
+            The path to the data file, relative to the dataset's data directory.
+        base_id : int, optional
+            The base path ID if the file is outside the dataset directory.
+
+        Returns
+        -------
+        DataFile
+        """
+        return _Fragment.create_data_file(dataset._ds, path, base_id=base_id)
+
 
 class LanceFragment(pa.dataset.Fragment):
     def __init__(
@@ -314,6 +346,8 @@ class LanceFragment(pa.dataset.Fragment):
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -353,6 +387,15 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh. When provided with
+            `table_id`, a storage options provider will be created automatically to
+            refresh credentials via the namespace. Must be provided together with
+            `table_id`. The caller should provide initial/merged storage options via
+            the `storage_options` parameter.
+        table_id : optional, List[str]
+            The table identifier when using a namespace (e.g., ["my_table"]).
+            Must be provided together with `namespace_client`.
 
         See Also
         --------
@@ -368,6 +411,16 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
+        # Validate namespace_client and table_id are provided together
+        if namespace_client is not None and table_id is None:
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+        elif table_id is not None and namespace_client is None:
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+
         if use_legacy_format is not None:
             warnings.warn(
                 "use_legacy_format is deprecated, use data_storage_version instead",
@@ -394,6 +447,8 @@ class LanceFragment(pa.dataset.Fragment):
             mode=mode,
             data_storage_version=data_storage_version,
             storage_options=storage_options,
+            namespace_client=namespace_client,
+            table_id=table_id,
         )
 
     @property
@@ -477,7 +532,40 @@ class LanceFragment(pa.dataset.Fragment):
         )
         from .dataset import LanceScanner
 
-        return LanceScanner(s, self._ds)
+        snapshot = {
+            "_limit": limit,
+            "_filter": filter_str,
+            "_search_filter": None,
+            "_substrait_filter": None,
+            "_prefilter": False,
+            "_late_materialization": None,
+            "_blob_handling": blob_handling,
+            "_offset": offset,
+            "_columns": tuple(columns) if isinstance(columns, list) else None,
+            "_columns_with_transform": (
+                tuple(columns.items()) if isinstance(columns, dict) else None
+            ),
+            "_nearest": None,
+            "_batch_size": batch_size,
+            "_io_buffer_size": None,
+            "_batch_readahead": batch_readahead,
+            "_fragment_readahead": None,
+            "_scan_in_order": True,
+            "_fragments": (self._fragment,),
+            "_with_row_id": with_row_id,
+            "_with_row_address": with_row_address,
+            "_use_stats": True,
+            "_fast_search": False,
+            "_full_text_query": None,
+            "_use_scalar_index": None,
+            "_include_deleted_rows": None,
+            "_scan_stats_callback": None,
+            "_strict_batch_size": False,
+            "_orderings": tuple(order_by) if order_by is not None else None,
+            "_disable_scoring_autoprojection": False,
+            "_substrait_aggregate": None,
+        }
+        return LanceScanner(s, self._ds, snapshot=snapshot)
 
     def open_session(
         self,
@@ -560,6 +648,49 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
         ).to_table()
+
+    def to_pandas(
+        self,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        with_row_id: bool = False,
+        with_row_address: bool = False,
+        blob_mode: str = "lazy",
+        order_by: Optional[List[ColumnOrdering]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Read this fragment into a :py:class:`pandas.DataFrame`.
+
+        Parameters are the same as :meth:`to_table`, except pandas export uses
+        ``blob_mode`` instead of Arrow-facing ``blob_handling`` and accepts
+        ``batch_size`` for scan batching.
+
+        Parameters
+        ----------
+        blob_mode: str, default "lazy"
+            Controls how blob columns are returned.
+
+            - ``"lazy"``: return :class:`lance.BlobFile` objects
+            - ``"bytes"``: return Python ``bytes``
+            - ``"descriptions"``: preserve ``to_table().to_pandas()`` behavior
+        batch_size: int, optional
+            The maximum number of rows per scan batch.
+        **kwargs
+            Forwarded to :meth:`pyarrow.Table.to_pandas` for non-blob columns.
+        """
+        return self.scanner(
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            with_row_id=with_row_id,
+            with_row_address=with_row_address,
+            order_by=order_by,
+        ).to_pandas(blob_mode=blob_mode, **kwargs)
 
     def merge(
         self,
@@ -877,10 +1008,14 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider=None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        external_blob_mode: Literal["reference", "ingest"] = "reference",
+        allow_external_blob_outside_bases: bool = False,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -898,10 +1033,14 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider=None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        external_blob_mode: Literal["reference", "ingest"] = "reference",
+        allow_external_blob_outside_bases: bool = False,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -919,10 +1058,14 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    storage_options_provider=None,
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
+    namespace_client: Optional[LanceNamespace] = None,
+    table_id: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -971,10 +1114,6 @@ def write_fragments(
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    storage_options_provider : Optional[StorageOptionsProvider]
-        A storage options provider that can fetch and refresh storage options
-        dynamically. This is useful for credentials that expire and need to be
-        refreshed automatically.
     enable_stable_row_ids: bool
         Experimental: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
@@ -1002,6 +1141,34 @@ def write_fragments(
 
         **Only valid in CREATE mode**. Will raise an error if used with
         APPEND/OVERWRITE modes.
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by exact base path URI.
+        Each value is a dict of storage options for that base. These settings
+        are not persisted to the manifest. When a base has no explicit entry,
+        top-level ``storage_options`` is used as a fallback. If ``dataset_uri``
+        is a LanceDataset and this is omitted, the dataset's base store params
+        are inherited.
+    external_blob_mode: {"reference", "ingest"}, default "reference"
+        How external blob URIs are handled on write.
+
+        - ``"reference"`` stores the URI as an external blob reference.
+        - ``"ingest"`` reads the external bytes during write and stores them in
+          Lance-managed storage using the normal inline / packed / dedicated
+          thresholds.
+    allow_external_blob_outside_bases: bool, default False
+        If False, external blob URIs must map to a registered non-dataset-root
+        base path. If True, external blob URIs outside registered bases are
+        allowed. Only valid when ``external_blob_mode="reference"``. Setting
+        this to True with ``"ingest"`` mode raises an error.
+    namespace_client : optional, LanceNamespace
+        A namespace client for automatic credential refresh. When provided with
+        `table_id`, a storage options provider will be created automatically to
+        refresh credentials via the namespace. Must be provided together with
+        `table_id`. The caller should provide initial/merged storage options via
+        the `storage_options` parameter.
+    table_id : optional, List[str]
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace_client`.
 
     Returns
     -------
@@ -1019,11 +1186,25 @@ def write_fragments(
     """
     from .dataset import LanceDataset
 
+    # Validate namespace_client and table_id are provided together
+    if namespace_client is not None and table_id is None:
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
+    elif table_id is not None and namespace_client is None:
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
+
     reader = _coerce_reader(data, schema)
 
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
     elif isinstance(dataset_uri, LanceDataset):
+        if base_store_params is None:
+            base_store_params = dataset_uri._base_store_params
+        if storage_options is None:
+            storage_options = dataset_uri._storage_options
         dataset_uri = dataset_uri._ds
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
@@ -1050,10 +1231,14 @@ def write_fragments(
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
-        storage_options_provider=storage_options_provider,
+        namespace_client=namespace_client,
+        table_id=table_id,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
         initial_bases=initial_bases,
+        base_store_params=base_store_params,
+        external_blob_mode=external_blob_mode,
+        allow_external_blob_outside_bases=allow_external_blob_outside_bases,
     )
 
 

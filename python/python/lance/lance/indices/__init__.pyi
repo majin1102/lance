@@ -21,6 +21,13 @@ class IndexConfig:
     index_type: str
     config: str
 
+class IndexSegment:
+    uuid: str
+    fragment_ids: set[int]
+    index_version: int
+
+    def __repr__(self) -> str: ...
+
 def train_ivf_model(
     dataset,
     column: str,
@@ -29,6 +36,7 @@ def train_ivf_model(
     distance_type: str,
     sample_rate: int,
     max_iters: int,
+    fragment_ids: Optional[list[int]] = None,
 ) -> pa.Array: ...
 def train_pq_model(
     dataset,
@@ -39,6 +47,7 @@ def train_pq_model(
     sample_rate: int,
     max_iters: int,
     ivf_model: pa.Array,
+    fragment_ids: Optional[list[int]] = None,
 ) -> pa.Array: ...
 def transform_vectors(
     dataset,
@@ -50,6 +59,11 @@ def transform_vectors(
     pq_codebook: pa.Array,
     dst_uri: str,
 ): ...
+def build_rq_model(
+    dimension: int,
+    num_bits: int = 1,
+    dtype: str = "float32",
+) -> str: ...
 
 class IndexSegmentDescription:
     uuid: str
@@ -57,6 +71,8 @@ class IndexSegmentDescription:
     fragment_ids: set[int]
     index_version: int
     created_at: Optional[datetime]
+    size_bytes: Optional[int]
+    base_id: Optional[int]
 
     def __repr__(self) -> str: ...
 
@@ -69,5 +85,6 @@ class IndexDescription:
     field_names: list[str]
     segments: list[IndexSegmentDescription]
     details: dict
+    total_size_bytes: Optional[int]
 
     def __repr__(self) -> str: ...

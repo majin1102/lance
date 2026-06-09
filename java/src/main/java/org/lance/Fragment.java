@@ -15,9 +15,10 @@ package org.lance;
 
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.fragment.FragmentUpdateResult;
-import org.lance.io.StorageOptionsProvider;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.namespace.LanceNamespace;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -234,30 +235,44 @@ public class Fragment {
   @Deprecated
   public static List<FragmentMetadata> create(
       String datasetUri, BufferAllocator allocator, VectorSchemaRoot root, WriteParams params) {
-    return create(datasetUri, allocator, root, params, null);
+    return create(datasetUri, allocator, root, params, null, null);
   }
 
   /**
-   * Create a fragment from the given data with optional storage options provider.
+   * Create a fragment from the given arrow stream.
    *
    * @param datasetUri the dataset uri
-   * @param allocator the buffer allocator
-   * @param root the vector schema root
+   * @param stream the arrow stream
    * @param params the write params
-   * @param storageOptionsProvider optional provider for dynamic storage options with automatic
-   *     credential refresh
    * @return the fragment metadata
-   * @deprecated Use {@link #write()} builder instead. For example: {@code Fragment.write()
-   *     .datasetUri(uri).allocator(allocator).data(root).writeParams(params)
-   *     .storageOptionsProvider(provider).execute()}
+   * @deprecated Use {@link #write()} builder instead.
    */
   @Deprecated
   public static List<FragmentMetadata> create(
+      String datasetUri, ArrowArrayStream stream, WriteParams params) {
+    return create(datasetUri, stream, params, null, null);
+  }
+
+  /** Create a fragment from the given arrow array and schema. */
+  static List<FragmentMetadata> create(
       String datasetUri,
       BufferAllocator allocator,
       VectorSchemaRoot root,
       WriteParams params,
-      StorageOptionsProvider storageOptionsProvider) {
+      LanceNamespace namespaceClient,
+      List<String> tableId) {
+    return create(datasetUri, allocator, root, params, namespaceClient, tableId, null);
+  }
+
+  /** Create a fragment from the given arrow array and schema. */
+  static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      VectorSchemaRoot root,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      LanceSchema schema) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
@@ -265,6 +280,30 @@ public class Fragment {
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
+      if (schema != null) {
+        try (ArrowSchema lanceSchema = ArrowSchema.allocateNew(allocator)) {
+          Data.exportSchema(allocator, schema.asArrowSchemaWithFieldIds(), null, lanceSchema);
+          return createWithFfiArray(
+              datasetUri,
+              arrowArray.memoryAddress(),
+              arrowSchema.memoryAddress(),
+              params.getMaxRowsPerFile(),
+              params.getMaxRowsPerGroup(),
+              params.getMaxBytesPerFile(),
+              params.getMode(),
+              params.getEnableStableRowIds(),
+              params.getDataStorageVersion(),
+              params.getStorageOptions(),
+              params.getBaseStoreParams(),
+              params.getInitialBases(),
+              params.getTargetBases(),
+              namespaceClient,
+              tableId,
+              params.getAllowExternalBlobOutsideBases(),
+              params.getBlobPackFileSizeThreshold(),
+              lanceSchema.memoryAddress());
+        }
+      }
       return createWithFfiArray(
           datasetUri,
           arrowArray.memoryAddress(),
@@ -276,48 +315,63 @@ public class Fragment {
           params.getEnableStableRowIds(),
           params.getDataStorageVersion(),
           params.getStorageOptions(),
-          Optional.ofNullable(storageOptionsProvider));
+          params.getBaseStoreParams(),
+          params.getInitialBases(),
+          params.getTargetBases(),
+          namespaceClient,
+          tableId,
+          params.getAllowExternalBlobOutsideBases(),
+          params.getBlobPackFileSizeThreshold(),
+          0L);
     }
   }
 
-  /**
-   * Create a fragment from the given arrow stream.
-   *
-   * @param datasetUri the dataset uri
-   * @param stream the arrow stream
-   * @param params the write params
-   * @return the fragment metadata
-   * @deprecated Use {@link #write()} builder instead. For example: {@code Fragment.write()
-   *     .datasetUri(uri).data(stream).writeParams(params).execute()}
-   */
-  @Deprecated
-  public static List<FragmentMetadata> create(
-      String datasetUri, ArrowArrayStream stream, WriteParams params) {
-    return create(datasetUri, stream, params, null);
-  }
-
-  /**
-   * Create a fragment from the given arrow stream with optional storage options provider.
-   *
-   * @param datasetUri the dataset uri
-   * @param stream the arrow stream
-   * @param params the write params
-   * @param storageOptionsProvider optional provider for dynamic storage options with automatic
-   *     credential refresh
-   * @return the fragment metadata
-   * @deprecated Use {@link #write()} builder instead. For example: {@code
-   *     Fragment.write().datasetUri(uri).data(stream).writeParams(params)
-   *     .storageOptionsProvider(provider).execute()}
-   */
-  @Deprecated
-  public static List<FragmentMetadata> create(
+  /** Create a fragment from the given arrow stream. */
+  static List<FragmentMetadata> create(
       String datasetUri,
       ArrowArrayStream stream,
       WriteParams params,
-      StorageOptionsProvider storageOptionsProvider) {
+      LanceNamespace namespaceClient,
+      List<String> tableId) {
+    return create(datasetUri, null, stream, params, namespaceClient, tableId, null);
+  }
+
+  /** Create a fragment from the given arrow stream. */
+  static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      LanceSchema schema) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
+    if (schema != null) {
+      Preconditions.checkNotNull(allocator, "allocator is required with schema");
+      try (ArrowSchema lanceSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema.asArrowSchemaWithFieldIds(), null, lanceSchema);
+        return createWithFfiStream(
+            datasetUri,
+            stream.memoryAddress(),
+            params.getMaxRowsPerFile(),
+            params.getMaxRowsPerGroup(),
+            params.getMaxBytesPerFile(),
+            params.getMode(),
+            params.getEnableStableRowIds(),
+            params.getDataStorageVersion(),
+            params.getStorageOptions(),
+            params.getBaseStoreParams(),
+            params.getInitialBases(),
+            params.getTargetBases(),
+            namespaceClient,
+            tableId,
+            params.getAllowExternalBlobOutsideBases(),
+            params.getBlobPackFileSizeThreshold(),
+            lanceSchema.memoryAddress());
+      }
+    }
     return createWithFfiStream(
         datasetUri,
         stream.memoryAddress(),
@@ -328,14 +382,17 @@ public class Fragment {
         params.getEnableStableRowIds(),
         params.getDataStorageVersion(),
         params.getStorageOptions(),
-        Optional.ofNullable(storageOptionsProvider));
+        params.getBaseStoreParams(),
+        params.getInitialBases(),
+        params.getTargetBases(),
+        namespaceClient,
+        tableId,
+        params.getAllowExternalBlobOutsideBases(),
+        params.getBlobPackFileSizeThreshold(),
+        0L);
   }
 
-  /**
-   * Create a fragment from the given arrow array and schema.
-   *
-   * @return the fragment metadata
-   */
+  /** Create a fragment from the given arrow array and schema. */
   private static native List<FragmentMetadata> createWithFfiArray(
       String datasetUri,
       long arrowArrayMemoryAddress,
@@ -347,13 +404,16 @@ public class Fragment {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<StorageOptionsProvider> storageOptionsProvider);
+      Map<String, Map<String, String>> baseStoreParams,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      Optional<Boolean> allowExternalBlobOutsideBases,
+      Optional<Long> blobPackFileSizeThreshold,
+      long schemaMemoryAddress);
 
-  /**
-   * Create a fragment from the given arrow stream.
-   *
-   * @return the fragment metadata
-   */
+  /** Create a fragment from the given arrow stream. */
   private static native List<FragmentMetadata> createWithFfiStream(
       String datasetUri,
       long arrowStreamMemoryAddress,
@@ -364,5 +424,12 @@ public class Fragment {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<StorageOptionsProvider> storageOptionsProvider);
+      Map<String, Map<String, String>> baseStoreParams,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      Optional<Boolean> allowExternalBlobOutsideBases,
+      Optional<Long> blobPackFileSizeThreshold,
+      long schemaMemoryAddress);
 }

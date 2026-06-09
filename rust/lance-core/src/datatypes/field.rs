@@ -48,6 +48,12 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
 
+/// Use this config key in Arrow field metadata to specify the position of a clustering key column.
+/// The value is a 1-based integer indicating the order within the composite clustering key.
+/// Clustering key fields are ordered by this position value.
+pub const LANCE_UNENFORCED_CLUSTERING_KEY_POSITION: &str =
+    "lance-schema:unenforced-clustering-key:position";
+
 /// Use this config key in Arrow field metadata to specify the field id of the lance field.
 /// The value should be non-negative i32 value. Any negative value will be seen as -1.
 pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
@@ -144,6 +150,11 @@ pub struct Field {
     /// None means the field is not part of the primary key.
     /// Some(n) means this field is the nth column in the primary key.
     pub unenforced_primary_key_position: Option<u32>,
+
+    /// Position of this field in the clustering key (1-based).
+    /// None means the field is not part of the clustering key.
+    /// Some(n) means this field is the nth column in the clustering key.
+    pub unenforced_clustering_key_position: Option<u32>,
 }
 
 impl Field {
@@ -258,10 +269,24 @@ impl Field {
     }
 
     pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
-        // For Map types, we must preserve ALL children (entries struct with key/value)
-        // Map internal structure should not be subject to projection filtering
+        // Map fields encode their physical layout as a single child entries
+        // struct (`Struct<key, value>`) whose presence is required for the
+        // parent to be readable — we never want to filter into that subtree.
+        // But the parent field itself is still subject to selection: if the
+        // caller didn't ask for this Map column, drop it like any other
+        // non-selected leaf. Without this early return the unconditional
+        // children clone would keep `children.is_empty() == false` forever
+        // and every Map column in the schema would survive every projection,
+        // pulling tens-of-bytes-per-row of unrelated data through downstream
+        // operators (notably `SortExec` in scalar-index training, where it
+        // was responsible for >100 GiB external-sort spills on real-world
+        // tables).
+        if self.logical_type.is_map() && !projection.contains_field_id(self.id) {
+            return None;
+        }
+
         let children = if self.logical_type.is_map() {
-            // Map field: keep all children intact (entries struct and its key/value fields)
+            // Map field is selected: keep all children intact.
             self.children.clone()
         } else {
             self.children
@@ -526,6 +551,14 @@ impl Field {
             .unwrap_or(false)
     }
 
+    // Blob columns intentionally have two schema representations:
+    // the loaded value view (legacy LargeBinary or blob v2 struct) and the unloaded
+    // descriptor view used by projection/planning. Schema set operations need to
+    // treat them as the same logical column instead of ordinary incompatible types.
+    fn is_compatible_blob_projection(&self, other: &Self) -> bool {
+        self.is_blob() && other.is_blob() && self.is_blob_v2() == other.is_blob_v2()
+    }
+
     /// If the field is a blob, update this field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
@@ -554,6 +587,7 @@ impl Field {
             children: vec![],
             dictionary: self.dictionary.clone(),
             unenforced_primary_key_position: self.unenforced_primary_key_position,
+            unenforced_clustering_key_position: self.unenforced_clustering_key_position,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -639,6 +673,10 @@ impl Field {
                 self.name, other.name,
             )));
         };
+
+        if self.is_compatible_blob_projection(other) {
+            return Ok(self.clone());
+        }
 
         match (self.data_type(), other.data_type()) {
             (DataType::Boolean, DataType::Boolean) => Ok(self.clone()),
@@ -768,6 +806,14 @@ impl Field {
             )));
         }
 
+        if self.is_compatible_blob_projection(other) {
+            return Ok(if self.id >= 0 {
+                self.clone()
+            } else {
+                other.clone()
+            });
+        }
+
         let self_type = self.data_type();
         let other_type = other.data_type();
 
@@ -807,6 +853,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
+                unenforced_clustering_key_position: self.unenforced_clustering_key_position,
             };
             return Ok(f);
         }
@@ -867,6 +914,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
+                unenforced_clustering_key_position: self.unenforced_clustering_key_position,
             })
         }
     }
@@ -998,6 +1046,10 @@ impl Field {
     pub fn is_unenforced_primary_key(&self) -> bool {
         self.unenforced_primary_key_position.is_some()
     }
+
+    pub fn is_unenforced_clustering_key(&self) -> bool {
+        self.unenforced_clustering_key_position.is_some()
+    }
 }
 
 impl fmt::Display for Field {
@@ -1088,6 +1140,9 @@ impl TryFrom<&ArrowField> for Field {
                     .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
                     .map(|_| 0)
             });
+        let unenforced_clustering_key_position = metadata
+            .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok());
         let is_blob_v2 = has_blob_v2_extension(field);
 
         if is_blob_v2 {
@@ -1125,6 +1180,7 @@ impl TryFrom<&ArrowField> for Field {
             children,
             dictionary: None,
             unenforced_primary_key_position,
+            unenforced_clustering_key_position,
         })
     }
 }
@@ -1244,6 +1300,23 @@ mod tests {
             assert_eq!(field.data_type(), data_type);
             assert_eq!(ArrowField::from(&field), arrow_field);
         }
+    }
+
+    #[test]
+    fn test_view_types_stored_as_lance_base_types() {
+        let field = Field::try_from(&ArrowField::new("s", DataType::Utf8View, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Utf8);
+        assert_eq!(
+            LogicalType::try_from(&DataType::Utf8View).unwrap().0,
+            "string"
+        );
+
+        let field = Field::try_from(&ArrowField::new("b", DataType::BinaryView, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Binary);
+        assert_eq!(
+            LogicalType::try_from(&DataType::BinaryView).unwrap().0,
+            "binary"
+        );
     }
 
     #[test]
@@ -1789,5 +1862,26 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 5);
         assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn project_by_field_accepts_blob_descriptor_projection() {
+        let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+        let mut unloaded = field.clone();
+        unloaded.unloaded_mut();
+
+        let projected = field
+            .project_by_field(&unloaded, OnTypeMismatch::Error)
+            .unwrap();
+        assert_eq!(projected, field);
+
+        let unloaded_projected = unloaded
+            .project_by_field(&field, OnTypeMismatch::Error)
+            .unwrap();
+        assert_eq!(unloaded_projected, unloaded);
     }
 }

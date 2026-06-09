@@ -11,7 +11,7 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -21,9 +21,47 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// Add Index bindings
-impl FromPyObject<'_> for PyLance<IndexMetadata> {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+// IndexFile bindings
+impl FromPyObject<'_, '_> for PyLance<IndexFile> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        let path = ob.getattr("path")?.extract()?;
+        let size_bytes = ob.getattr("size_bytes")?.extract()?;
+        Ok(Self(IndexFile { path, size_bytes }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&IndexFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .expect("Failed to import lance module");
+
+        let cls = namespace
+            .getattr("IndexFile")
+            .expect("Failed to get IndexFile class");
+        cls.call1((self.0.path.clone(), self.0.size_bytes))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<IndexFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
+    }
+}
+
+// IndexMetadata bindings
+impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let uuid = ob.getattr("uuid")?.to_string();
         let name = ob.getattr("name")?.extract()?;
         let fields = ob.getattr("fields")?.extract()?;
@@ -32,7 +70,7 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
         let fragment_ids = ob.getattr("fragment_ids")?;
         let created_at = ob.getattr("created_at")?.extract()?;
 
-        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
+        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.cast()?;
         let fragment_bitmap = Some(
             fragment_ids_ref
                 .into_iter()
@@ -44,16 +82,28 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             .extract::<Option<i64>>()?
             .map(|id| id as u32);
 
+        let files: Option<Vec<IndexFile>> = ob
+            .getattr("files")?
+            .extract::<Option<Vec<PyLance<IndexFile>>>>()?
+            .map(|v| v.into_iter().map(|f| f.0).collect());
+        let index_details = match ob.getattr("index_details") {
+            Ok(details) => details
+                .extract::<Option<(String, Vec<u8>)>>()?
+                .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
+            Err(_) => None,
+        };
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
             dataset_version,
             fragment_bitmap,
-            index_details: None,
+            index_details,
             index_version,
             created_at,
             base_id,
+            files,
         }))
     }
 }
@@ -85,6 +135,17 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         );
         let created_at = self.0.created_at;
         let base_id = self.0.base_id.map(|id| id as i64);
+        let files = self
+            .0
+            .files
+            .as_ref()
+            .map(|f| export_vec(py, f.as_slice()))
+            .transpose()?;
+        let index_details = self
+            .0
+            .index_details
+            .as_ref()
+            .map(|details| (details.type_url.clone(), details.value.clone()));
 
         let cls = namespace
             .getattr("Index")
@@ -98,6 +159,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             index_version,
             created_at,
             base_id,
+            files,
+            index_details,
         ))
     }
 }
@@ -112,8 +175,9 @@ impl<'py> IntoPyObject<'py> for PyLance<IndexMetadata> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<DataReplacementGroup> {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<DataReplacementGroup> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
         let new_file = &ob.getattr("new_file")?.extract::<PyLance<DataFile>>()?;
 
@@ -145,8 +209,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
 #[derive(Debug, Clone)]
 pub struct PyUpdateMode(pub UpdateMode);
 
-impl FromPyObject<'_> for PyUpdateMode {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyUpdateMode {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let mode_str: String = ob.extract()?;
         match mode_str.as_str() {
             "rewrite_rows" => Ok(Self(UpdateMode::RewriteRows)),
@@ -159,9 +224,10 @@ impl FromPyObject<'_> for PyUpdateMode {
     }
 }
 
-impl FromPyObject<'_> for PyLance<Operation> {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        match class_name(ob)?.as_str() {
+impl FromPyObject<'_, '_> for PyLance<Operation> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        match class_name(&ob)?.as_str() {
             "Overwrite" => {
                 let schema = extract_schema(&ob.getattr("new_schema")?)?;
 
@@ -233,6 +299,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 };
                 Ok(Self(op))
             }
@@ -306,7 +373,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     for item in items.try_iter()? {
                         let item = item?;
                         // Extract as a tuple and then get individual elements
-                        let tuple = item.downcast::<pyo3::types::PyTuple>()?;
+                        let tuple = item.cast::<pyo3::types::PyTuple>()?;
                         let field_id = tuple.get_item(0)?.extract::<i32>()?;
                         let update_map = tuple.get_item(1)?;
                         if let Some(map) = extract_update_map(&update_map)? {
@@ -533,8 +600,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<Transaction> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<Transaction> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
@@ -592,8 +660,9 @@ impl<'py> IntoPyObject<'py> for PyLance<Transaction> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<RewriteGroup> {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<RewriteGroup> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         Ok(Self(RewriteGroup {
             old_fragments: extract_vec(&ob.getattr("old_fragments")?)?,
             new_fragments: extract_vec(&ob.getattr("new_fragments")?)?,
@@ -620,8 +689,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&RewriteGroup> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<RewrittenIndex> {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<RewrittenIndex> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let old_id: String = ob.getattr("old_id")?.extract()?;
         let new_id: String = ob.getattr("new_id")?.extract()?;
         let old_id = Uuid::parse_str(&old_id)
@@ -639,6 +709,7 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
                 value: new_details_value,
             },
             new_index_version,
+            new_index_files: None,
         }))
     }
 }
@@ -708,7 +779,7 @@ fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult
 }
 
 fn extract_schema(schema: &Bound<'_, PyAny>) -> PyResult<Schema> {
-    match schema.downcast::<LanceSchema>() {
+    match schema.cast::<LanceSchema>() {
         Ok(schema) => Ok(schema.borrow().0.clone()),
         Err(_) => {
             let arrow_schema = schema.extract::<PyArrowType<ArrowSchema>>()?.0;

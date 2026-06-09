@@ -7,8 +7,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
@@ -32,9 +30,6 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::{
-    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
-};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
@@ -42,8 +37,12 @@ use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
+use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::expression::FilterPlan;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_select::{
+    IndexExprResult, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
@@ -56,6 +55,7 @@ use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
+    get_default_io_buffer_size_override,
 };
 
 use super::utils::IoMetrics;
@@ -79,30 +79,7 @@ impl EvaluatedIndex {
     }
 
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
-        if batch.num_rows() != 2 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Expected a batch with exactly 2 rows but there are {} rows",
-                    batch.num_rows()
-                )
-                .into(),
-            ));
-        }
-        if batch.num_columns() != 3 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Expected a batch with exactly two columns but there are {} columns",
-                    batch.num_columns()
-                )
-                .into(),
-            ));
-        }
-        let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-        let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        let index_result = IndexExprResult::from_parts(row_addr_mask, match_type)?;
-
-        let applicable_fragments = batch.column(2).as_binary::<i32>();
-        let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
+        let (index_result, applicable_fragments) = IndexExprResult::deserialize(batch)?;
 
         Ok(Self {
             index_result,
@@ -118,6 +95,7 @@ struct ScopedFragmentRead {
     projection: Arc<Projection>,
     with_deleted_rows: bool,
     batch_size: u32,
+    file_reader_options: Option<FileReaderOptions>,
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
     filter: Option<Expr>,
@@ -127,13 +105,17 @@ struct ScopedFragmentRead {
 
 impl ScopedFragmentRead {
     fn frag_read_config(&self) -> FragReadConfig {
-        FragReadConfig::default()
+        let mut config = FragReadConfig::default()
             .with_row_id(self.with_deleted_rows || self.projection.with_row_id)
             .with_row_address(self.projection.with_row_addr)
             .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
-            .with_reader_priority(self.priority)
+            .with_reader_priority(self.priority);
+        if let Some(file_reader_options) = &self.file_reader_options {
+            config = config.with_file_reader_options(file_reader_options.clone());
+        }
+        config
     }
 }
 
@@ -406,7 +388,12 @@ impl FilteredReadStream {
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store.clone();
-        let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
+        // Explicit options take precedence; otherwise fall back to the
+        // LANCE_DEFAULT_IO_BUFFER_SIZE env var if set; otherwise max_bandwidth.
+        let scheduler_config = if let Some(io_buffer_size_bytes) = options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
             SchedulerConfig::new(io_buffer_size_bytes)
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
@@ -503,18 +490,31 @@ impl FilteredReadStream {
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
     ) -> FilteredReadInternalPlan {
-        // For pushing down scan_range_after_filter
+        // For pushing down scan_range_after_filter.
+        //
+        // This is only valid when there is no refine filter left to evaluate.  An exact scalar
+        // index result is exact for the indexed predicate, but not for the full predicate if a
+        // refine filter can still reject rows.
+        let can_push_down_scan_range_after_filter = options.refine_filter.is_none();
         let mut scan_planned_with_limit_pushed_down = false;
-        let mut to_skip = options
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| r.start)
-            .unwrap_or(0);
-        let mut to_take = options
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| r.end - r.start)
-            .unwrap_or(u64::MAX);
+        let mut to_skip = if can_push_down_scan_range_after_filter {
+            options
+                .scan_range_after_filter
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut to_take = if can_push_down_scan_range_after_filter {
+            options
+                .scan_range_after_filter
+                .as_ref()
+                .map(|r| r.end - r.start)
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
 
         // Full fragment ranges to read before applying scan_range_after_filter
         let mut fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
@@ -568,9 +568,10 @@ impl FilteredReadStream {
                 &mut to_take,
                 &mut fragments_to_read,
                 &mut scan_push_down_fragments_to_read,
+                options.only_indexed_fragments,
             );
 
-            if to_take == 0 {
+            if can_push_down_scan_range_after_filter && to_take == 0 {
                 scan_planned_with_limit_pushed_down = true;
                 fragments_to_read = scan_push_down_fragments_to_read;
                 break;
@@ -586,14 +587,17 @@ impl FilteredReadStream {
                     // Resolve filter for this fragment
                     let filter = if let Some(evaluated_index) = evaluated_index {
                         if evaluated_index.applicable_fragments.contains(fragment_id) {
-                            match &evaluated_index.index_result {
-                                IndexExprResult::Exact(_) => options.refine_filter.clone(),
-                                IndexExprResult::AtLeast(_)
-                                    if scan_planned_with_limit_pushed_down =>
-                                {
-                                    options.refine_filter.clone()
-                                }
-                                _ => options.full_filter.clone(),
+                            let r = &evaluated_index.index_result;
+                            // `Exact` results don't need a recheck. `AtLeast`
+                            // results can also skip recheck when the
+                            // skip/take pushdown is in play (we only read the
+                            // guaranteed-match ranges in that case).
+                            let can_skip_recheck = r.is_exact()
+                                || (r.is_at_least() && scan_planned_with_limit_pushed_down);
+                            if can_skip_recheck {
+                                options.refine_filter.clone()
+                            } else {
+                                options.full_filter.clone()
                             }
                         } else {
                             options.full_filter.clone()
@@ -645,7 +649,10 @@ impl FilteredReadStream {
     ) -> Vec<ScopedFragmentRead> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
-                std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
+                std::cmp::max(
+                    dataset.object_store.as_ref().block_size() / 4,
+                    BATCH_SIZE_FALLBACK,
+                )
             }) as u32
         });
         let projection = Arc::new(options.projection.clone());
@@ -669,6 +676,7 @@ impl FilteredReadStream {
                     projection: projection.clone(),
                     with_deleted_rows: options.with_deleted_rows,
                     batch_size: default_batch_size,
+                    file_reader_options: options.file_reader_options.clone(),
                     filter,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
@@ -690,6 +698,7 @@ impl FilteredReadStream {
         to_take: &mut u64,
         fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
         scan_push_down_fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
+        only_indexed_fragments: bool,
     ) {
         let fragment_id = fragment.id() as u32;
 
@@ -697,35 +706,49 @@ impl FilteredReadStream {
             if evaluated_index.applicable_fragments.contains(fragment_id) {
                 let _span = tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
 
-                match &evaluated_index.index_result {
-                    IndexExprResult::Exact(row_addr_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, matched_ranges.clone());
+                let index_result = &evaluated_index.index_result;
+                if index_result.is_exact() {
+                    // lower == upper; either side gives the precise answer.
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.upper);
+                    let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
-                        scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
-                    }
-                    IndexExprResult::AtMost(row_addr_mask) => {
-                        // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, matched_ranges);
-                    }
-                    IndexExprResult::AtLeast(row_addr_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
+                    Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
+                    scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
+                } else if index_result.is_at_least() {
+                    // upper is universe; lower is the guaranteed-match set
+                    // used for the skip/take push-down path.
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.lower);
+                    let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
-                    }
+                    Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
+                    scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                } else {
+                    // AtMost or true Refined: read everything in `upper`
+                    // and rely on the full-filter recheck for survivors.
+                    //
+                    // For AtMost the index gives no lower bound, so there's
+                    // no skip/take push-down to do. For Refined the lower
+                    // bound *is* a guaranteed-match set, but exploiting it
+                    // requires per-range filter push-down (different filter
+                    // per range within a fragment), which the current plan
+                    // doesn't support. The recheck-skip opportunity on the
+                    // `lower` portion would also be visible up at the
+                    // `can_skip_recheck` block — both are deferred. See
+                    // TODO(refined-pushdown).
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.upper);
+                    let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, matched_ranges);
                 }
             } else {
-                // Fragment not indexed - add full fragment to unindexed_ranges
-                fragments_to_read.insert(fragment_id, to_read);
+                // Fragment not indexed.  Normally we add the full fragment to keep
+                // results complete.  Fast search intentionally accepts staleness.
+                if !only_indexed_fragments {
+                    fragments_to_read.insert(fragment_id, to_read);
+                }
             }
-        } else {
+        } else if !only_indexed_fragments {
             // No index at all - add full fragment to unindexed_ranges
             fragments_to_read.insert(fragment_id, to_read);
         }
@@ -974,6 +997,10 @@ impl FilteredReadStream {
                     base_batch_stream.boxed()
                 };
 
+                // Clone so the finally handler can record a final snapshot even when
+                // no output batches were produced (inspect_ok never fires in that case).
+                let global_metrics_final = global_metrics.clone();
+                let scan_scheduler_final = scan_scheduler.clone();
                 let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
                         partition_metrics_clone
@@ -982,6 +1009,9 @@ impl FilteredReadStream {
                         global_metrics.io_metrics.record(&scan_scheduler);
                     })
                     .finally(move || {
+                        global_metrics_final
+                            .io_metrics
+                            .record(&scan_scheduler_final);
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
@@ -1100,7 +1130,8 @@ impl FilteredReadStream {
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
-            )?
+            )
+            .await?
             .map(move |batch_fut: ReadBatchFut| {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
@@ -1243,6 +1274,8 @@ pub struct FilteredReadOptions {
     pub with_deleted_rows: bool,
     /// The maximum number of rows per batch
     pub batch_size: Option<u32>,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
     /// Controls how many fragments to read ahead
     pub fragment_readahead: Option<usize>,
     /// The fragments to read
@@ -1260,6 +1293,8 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
+    /// If true, skip fragments that are not covered by the scalar index result.
+    pub only_indexed_fragments: bool,
 }
 
 impl FilteredReadOptions {
@@ -1281,12 +1316,14 @@ impl FilteredReadOptions {
             scan_range_after_filter: None,
             with_deleted_rows: false,
             batch_size: None,
+            file_reader_options: None,
             fragment_readahead: None,
             fragments: None,
             projection,
             refine_filter: None,
             full_filter: None,
             io_buffer_size_bytes: None,
+            only_indexed_fragments: false,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1369,6 +1406,12 @@ impl FilteredReadOptions {
         self
     }
 
+    /// Specify the file reader options to use when reading data files.
+    pub fn with_file_reader_options(mut self, file_reader_options: FileReaderOptions) -> Self {
+        self.file_reader_options = Some(file_reader_options);
+        self
+    }
+
     /// Controls how many fragments to read ahead.
     ///
     /// If not set, the default will be 2 * the I/O parallelism.  Generally, reading ahead
@@ -1433,6 +1476,12 @@ impl FilteredReadOptions {
         self.io_buffer_size_bytes = Some(io_buffer_size);
         self
     }
+
+    /// Only read fragments covered by a scalar index result.
+    pub fn with_only_indexed_fragments(mut self) -> Self {
+        self.only_indexed_fragments = true;
+        self
+    }
 }
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
@@ -1453,7 +1502,7 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     // Precomputed internal plan
@@ -1552,12 +1601,12 @@ impl FilteredReadExec {
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         let metrics = ExecutionPlanMetricsSet::new();
 
@@ -1690,17 +1739,25 @@ impl FilteredReadExec {
         // Second, multiple partitions all share the same underlying task stream (see get_stream)
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
-        let options = self.options.clone();
+        let target_partitions = context.session_config().target_partitions();
+        let mut options = self.options.clone();
+        if let FilteredReadThreadingMode::OnePartitionMultipleThreads(n) = options.threading_mode {
+            options.threading_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                n.min(target_partitions).max(1),
+            );
+        }
+        let batch_size_bytes = options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
         let index_input = self.index_input.clone();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
-            if let Some(running_stream) = &*running_stream {
-                DataFusionResult::<SendableRecordBatchStream>::Ok(
-                    running_stream.get_stream(&metrics, partition),
-                )
+            let inner = if let Some(running_stream) = &*running_stream {
+                running_stream.get_stream(&metrics, partition)
             } else {
                 let plan = Self::get_or_create_plan_impl(
                     &plan_cell,
@@ -1710,13 +1767,32 @@ impl FilteredReadExec {
                     partition,
                     context.clone(),
                 )
-                .await?;
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone()).await?;
+                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
+                        .await
+                        .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
-                DataFusionResult::Ok(first_stream)
-            }
+                first_stream
+            };
+            let stream: SendableRecordBatchStream = match batch_size_bytes {
+                Some(target) => {
+                    let schema = inner.schema();
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema.clone(),
+                        lance_arrow::stream::rechunk_stream_by_size(
+                            inner,
+                            schema,
+                            0,
+                            target as usize,
+                        ),
+                    ))
+                }
+                None => inner,
+            };
+            DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
 
@@ -1820,7 +1896,7 @@ impl ExecutionPlan for FilteredReadExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1854,7 +1930,7 @@ impl ExecutionPlan for FilteredReadExec {
 
         let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
 
-        if self.options.full_filter.is_none() {
+        let Some(filter) = self.options.full_filter.as_ref() else {
             // If there is no filter, we just return the total number of rows (sans any before-filter range)
             // divided by the number of partitions.
             let total_rows =
@@ -1876,83 +1952,81 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
-            Ok(Statistics {
+            return Ok(Statistics {
                 num_rows: Precision::Exact(total_rows as usize),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
-            })
-        } else {
-            // We could evaluate the indexed filter here but this is still during the planning
-            // phase so we want to avoid that.
-            //
-            // Instead, we create a mock input which is the filtered read (without the filter)
-            // and then use DF's FilterExec logic to calculate the statistics (which uses column
-            // stats and basic filter shape)
-            let filter = self.options.full_filter.as_ref().unwrap();
+            });
+        };
 
-            // Need to add in filter columns even though they aren't part of the projection
-            let filter_columns = Planner::column_names_in_expr(filter);
-            let read_projection = self
-                .options
-                .projection
-                .clone()
-                .union_columns(filter_columns, OnMissing::Error)?;
+        // We could evaluate the indexed filter here but this is still during the planning
+        // phase so we want to avoid that.
+        //
+        // Instead, we create a mock input which is the filtered read (without the filter)
+        // and then use DF's FilterExec logic to calculate the statistics (which uses column
+        // stats and basic filter shape)
 
-            let read_schema = Arc::new(read_projection.to_arrow_schema());
+        // Need to add in filter columns even though they aren't part of the projection
+        let filter_columns = Planner::column_names_in_expr(filter);
+        let read_projection = self
+            .options
+            .projection
+            .clone()
+            .union_columns(filter_columns, OnMissing::Error)?;
 
-            let planner = Arc::new(Planner::new(read_schema.clone()));
-            let physical_filter = planner.create_physical_expr(filter)?;
+        let read_schema = Arc::new(read_projection.to_arrow_schema());
 
-            let mock_input = Arc::new(Self::try_new(
-                self.dataset.clone(),
-                FilteredReadOptions {
-                    scan_range_after_filter: None,
-                    refine_filter: None,
-                    full_filter: None,
-                    projection: read_projection,
-                    ..self.options.clone()
-                },
-                None,
-            )?);
-            let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-            let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+        let planner = Arc::new(Planner::new(read_schema.clone()));
+        let physical_filter = planner.create_physical_expr(filter)?;
 
-            // If we have an after-filter range, we should apply it to the stats (the before-filter range
-            // is applied in the mock input)
-            let total_rows = if let Some(scan_range_after_filter) =
-                &self.options.scan_range_after_filter
-            {
+        let mock_input = Arc::new(Self::try_new(
+            self.dataset.clone(),
+            FilteredReadOptions {
+                scan_range_after_filter: None,
+                refine_filter: None,
+                full_filter: None,
+                projection: read_projection,
+                ..self.options.clone()
+            },
+            None,
+        )?);
+        let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
+        let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+
+        // If we have an after-filter range, we should apply it to the stats (the before-filter range
+        // is applied in the mock input)
+        let total_rows =
+            if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
                 df_stats.num_rows.min(&Precision::Exact(
                     scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
                 ))
             } else {
                 df_stats.num_rows
             };
-            df_stats.num_rows = total_rows;
+        df_stats.num_rows = total_rows;
 
-            let schema = self.schema();
+        let schema = self.schema();
 
-            // We might have added some columns to the schema so the filter compiles but we drop this
-            // columns during the filtered read and they aren't part of the output.  So we need to make
-            // sure and drop them from the column stats as well.
-            assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
-            let mut proj_iter = schema.fields.iter().peekable();
-            let mut stats_iter = read_schema.fields.iter();
-            df_stats.column_statistics.retain(|_| {
-                let stats_field = stats_iter.next().unwrap();
-                if let Some(proj_field) = proj_iter.peek() {
-                    if proj_field.name() == stats_field.name() {
-                        proj_iter.next();
-                        true
-                    } else {
-                        false
-                    }
+        // We might have added some columns to the schema so the filter compiles but we drop this
+        // columns during the filtered read and they aren't part of the output.  So we need to make
+        // sure and drop them from the column stats as well.
+        assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
+        let mut proj_iter = schema.fields.iter().peekable();
+        let mut stats_iter = read_schema.fields.iter();
+        df_stats.column_statistics.retain(|_| {
+            let stats_field = stats_iter.next().unwrap();
+            if let Some(proj_field) = proj_iter.peek() {
+                if proj_field.name() == stats_field.name() {
+                    proj_iter.next();
+                    true
                 } else {
                     false
                 }
-            });
+            } else {
+                false
+            }
+        });
 
-            Ok(df_stats)
-        }
+        Ok(df_stats)
     }
 
     fn with_new_children(
@@ -2018,6 +2092,10 @@ impl ExecutionPlan for FilteredReadExec {
         }
         let limit = limit?;
 
+        if self.dataset.manifest.uses_stable_row_ids() {
+            return None;
+        }
+
         let mut updated_options = self.options.clone();
 
         if self.options.full_filter.is_none() && self.options.refine_filter.is_none() {
@@ -2054,6 +2132,7 @@ impl ExecutionPlan for FilteredReadExec {
 mod tests {
     use std::collections::HashSet;
 
+    use crate::index::DatasetIndexExt;
     use arrow::{
         compute::concat_batches,
         datatypes::{Float32Type, UInt32Type, UInt64Type},
@@ -2066,10 +2145,11 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::{
-        DatasetIndexExt, IndexType,
+        IndexType,
         optimize::OptimizeOptions,
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
+    use lance_select::result::IndexExprResultWireFormat;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2200,6 +2280,7 @@ mod tests {
                     Some(Arc::new(ScalarIndexExec::new(
                         self.dataset.clone(),
                         index_query,
+                        IndexExprResultWireFormat::default(),
                     )))
                 } else {
                     None
@@ -2293,6 +2374,53 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    /// Round-trip every interval shape through the arrow wire format and
+    /// confirm the endpoints survive. Exercises both
+    /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
+    /// so the schema names stay in sync.
+    #[test]
+    fn test_index_expr_result_serialize_roundtrip() {
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        let mk = |rows: &[u64]| RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(rows));
+
+        let mut frags = RoaringBitmap::new();
+        frags.insert(0);
+        frags.insert(7);
+
+        let cases = vec![
+            ("exact", IndexExprResult::exact(mk(&[1, 2, 3]))),
+            ("at_most", IndexExprResult::at_most(mk(&[1, 2, 3]))),
+            ("at_least", IndexExprResult::at_least(mk(&[1, 2]))),
+            // Refined: non-empty lower strictly inside non-universe upper.
+            ("refined", IndexExprResult::new(mk(&[1, 2]), mk(&[1, 2, 3]))),
+        ];
+
+        for (name, original) in cases {
+            let batch = original
+                .serialize(&frags, IndexExprResultWireFormat::default())
+                .unwrap_or_else(|e| panic!("serialize {name}: {e}"));
+            let decoded = EvaluatedIndex::try_from_arrow(&batch)
+                .unwrap_or_else(|e| panic!("try_from_arrow {name}: {e}"));
+
+            // The underlying RowAddrTreeMap is PartialEq; compare via mask
+            // emptiness + symmetric difference being empty would be more
+            // robust, but the canonical builders preserve representation.
+            assert_eq!(
+                decoded.index_result.lower, original.lower,
+                "{name}: lower endpoint changed across round-trip",
+            );
+            assert_eq!(
+                decoded.index_result.upper, original.upper,
+                "{name}: upper endpoint changed across round-trip",
+            );
+            assert_eq!(
+                decoded.applicable_fragments, frags,
+                "{name}: applicable fragments changed across round-trip",
+            );
+        }
     }
 
     #[test_log::test(tokio::test)]
@@ -2911,6 +3039,34 @@ mod tests {
             let result = plan.with_fetch(None);
             assert!(result.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_with_fetch_limit_after_scalar_index_refine_filter() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let filter_plan = fixture
+            .filter_plan("fully_indexed < 50 AND not_indexed >= 10", true)
+            .await;
+        let options = base_options.with_filter_plan(filter_plan);
+        let plan = fixture.make_plan(options).await;
+
+        assert!(plan.index_input.is_some());
+        assert!(plan.options().refine_filter.is_some());
+
+        let limited_plan = plan.with_fetch(Some(10)).unwrap();
+        let limited_plan = limited_plan
+            .as_any()
+            .downcast_ref::<FilteredReadExec>()
+            .unwrap();
+        assert_eq!(limited_plan.options().scan_range_after_filter, Some(0..10));
+
+        let stream = limited_plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let actual_values = get_fully_indexed_values(batches).await;
+        assert_eq!(actual_values, (10..20).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -3573,6 +3729,55 @@ mod tests {
         assert!(iops > 0, "Should have recorded IO operations");
     }
 
+    // Reproduces a bug where bytes_read (and iops/requests) stay at 0 when a filter matches
+    // no rows. io_metrics.record is only called inside inspect_ok on the output batch stream,
+    // so when the filter produces zero output batches, the I/O that did occur is never counted.
+    #[tokio::test]
+    async fn test_io_metrics_recorded_when_filter_matches_no_rows() {
+        let fixture = TestFixture::new().await;
+        // not_indexed values in the fixture go up to ~400; this filter matches nothing
+        let filter_plan = fixture.filter_plan("not_indexed > 10000", false).await;
+        let options =
+            FilteredReadOptions::basic_full_read(&fixture.dataset).with_filter_plan(filter_plan);
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "filter should match no rows"
+        );
+
+        let metrics = filtered_read.metrics().unwrap();
+
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            rows_scanned > 0,
+            "rows_scanned ({}) should be > 0: data was read even though filter matched nothing",
+            rows_scanned
+        );
+
+        let bytes_read = metrics
+            .sum_by_name("bytes_read")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            bytes_read > 0,
+            "bytes_read ({}) should be > 0: io_metrics.record is only called when output batches \
+             are produced, so bytes_read stays 0 even though I/O occurred",
+            bytes_read
+        );
+    }
+
     /// Test that direct execution gives the same result as get_plan + execute_with_plan
     #[test_log::test(tokio::test)]
     async fn test_plan_round_trip() {
@@ -3654,5 +3859,38 @@ mod tests {
         for i in 0..result1.num_columns() {
             assert_eq!(result1.column(i).as_ref(), result3.column(i).as_ref());
         }
+    }
+
+    /// Verify that executing with target_partitions=1 produces the same results as the default
+    /// context and does not panic. This is a regression guard for the parallelism cap.
+    #[test_log::test(tokio::test)]
+    async fn test_target_partitions_cap_produces_correct_results() {
+        use datafusion::prelude::SessionConfig;
+
+        let fixture = TestFixture::new().await;
+
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+
+        // Execute with default context (high thread count)
+        let default_ctx = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, default_ctx).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let default_result = concat_batches(&schema, &batches).unwrap();
+
+        // Execute fresh plan with target_partitions=1
+        let plan2 = FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap();
+        let low_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::default().with_target_partitions(1)),
+        );
+        let stream2 = plan2.execute(0, low_ctx).unwrap();
+        let schema2 = stream2.schema();
+        let batches2 = stream2.try_collect::<Vec<_>>().await.unwrap();
+        let capped_result = concat_batches(&schema2, &batches2).unwrap();
+
+        assert_eq!(default_result.num_rows(), capped_result.num_rows());
     }
 }

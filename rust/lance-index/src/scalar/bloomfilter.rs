@@ -7,7 +7,6 @@
 //! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
 //! It's an inexact filter - they may include false positives that require rechecking.
 
-use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -17,9 +16,10 @@ use crate::scalar::{
 };
 use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
-mod as_bytes;
-pub mod sbbf;
 use arrow_schema::{DataType, Field};
+use lance_arrow_stats::StatisticsAccumulator;
+use lance_core::utils::bloomfilter::as_bytes;
+use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
@@ -443,7 +443,7 @@ impl ScalarIndex for BloomFilterIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Re-train bloom filters for the appended data using the shared trainer
         let params = BloomFilterIndexBuilderParams {
@@ -464,6 +464,7 @@ impl ScalarIndex for BloomFilterIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -646,7 +647,7 @@ impl BloomFilterIndexBuilder {
 struct BloomFilterProcessor {
     params: BloomFilterIndexBuilderParams,
     sbbf: Option<Sbbf>,
-    cur_zone_has_null: bool,
+    statistics: Option<StatisticsAccumulator>,
 }
 
 impl BloomFilterProcessor {
@@ -654,7 +655,7 @@ impl BloomFilterProcessor {
         let mut processor = Self {
             params,
             sbbf: None,
-            cur_zone_has_null: false,
+            statistics: None,
         };
         processor.reset()?;
         Ok(processor)
@@ -742,6 +743,11 @@ impl ZoneProcessor for BloomFilterProcessor {
         let sbbf = self.sbbf.as_mut().ok_or_else(|| {
             Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
+
+        let statistics = self
+            .statistics
+            .get_or_insert_with(|| StatisticsAccumulator::new(array.data_type()));
+        statistics.update(array)?;
 
         let has_null = match array.data_type() {
             // Signed integers
@@ -945,7 +951,7 @@ impl ZoneProcessor for BloomFilterProcessor {
         };
 
         // Update the current zone's null tracking
-        self.cur_zone_has_null = self.cur_zone_has_null || has_null;
+        debug_assert_eq!(has_null, array.null_count() > 0);
         Ok(())
     }
 
@@ -953,16 +959,21 @@ impl ZoneProcessor for BloomFilterProcessor {
         let bloom_filter = self.sbbf.as_ref().ok_or_else(|| {
             Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
+        let has_null = self
+            .statistics
+            .as_ref()
+            .map(|statistics| statistics.statistics().null_count > 0)
+            .unwrap_or(false);
         Ok(BloomFilterStatistics {
             bound,
-            has_null: self.cur_zone_has_null,
+            has_null,
             bloom_filter: bloom_filter.clone(),
         })
     }
 
     fn reset(&mut self) -> Result<()> {
         self.sbbf = Some(Self::build_filter(&self.params)?);
-        self.cur_zone_has_null = false;
+        self.statistics = None;
         Ok(())
     }
 }
@@ -1070,6 +1081,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -1086,7 +1098,11 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(BloomFilterQueryParser::new(index_name, true)))
+        Some(Box::new(BloomFilterQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
     }
 
     async fn load_index(
@@ -1148,12 +1164,9 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{StreamExt, stream};
-    use lance_core::{
-        ROW_ADDR,
-        cache::LanceCache,
-        utils::{mask::RowAddrTreeMap, tempfile::TempObjDir},
-    };
+    use lance_core::{ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
+    use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
         BloomFilterQuery, ScalarIndex, SearchResult,

@@ -119,6 +119,12 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation timed out: {message}, {location}"))]
+    Timeout {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"
     ))]
@@ -315,6 +321,14 @@ impl Error {
     #[track_caller]
     pub fn internal(message: impl Into<String>) -> Self {
         InternalSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        TimeoutSnafu {
             message: message.into(),
         }
         .build()
@@ -602,10 +616,10 @@ impl From<datafusion_common::DataFusionError> for Error {
         match e {
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
-            | datafusion_common::DataFusionError::Configuration(..) => {
+            | datafusion_common::DataFusionError::Configuration(..)
+            | datafusion_common::DataFusionError::SchemaError(..) => {
                 Self::invalid_input_source(box_error(e))
             }
-            datafusion_common::DataFusionError::SchemaError(..) => Self::schema(e.to_string()),
             datafusion_common::DataFusionError::ArrowError(arrow_err, _) => Self::from(*arrow_err),
             datafusion_common::DataFusionError::NotImplemented(..) => {
                 Self::not_supported_source(box_error(e))
@@ -796,6 +810,34 @@ mod test {
                 assert_eq!(recovered.code, 999);
             }
             _ => panic!("Expected ExternalError variant"),
+        }
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_schema_error_is_invalid_input() {
+        // Schema errors from DataFusion (e.g., a filter referencing an unknown
+        // column) are user-input failures, not internal lance failures. They
+        // must surface as `Error::InvalidInput` so downstream FFI/Python
+        // bindings can map them to the right user-facing error code.
+        use datafusion_common::Column;
+
+        let schema_err = datafusion_common::SchemaError::FieldNotFound {
+            field: Box::new(Column::from_name("missing_col")),
+            valid_fields: vec![],
+        };
+        let df_err =
+            datafusion_common::DataFusionError::SchemaError(Box::new(schema_err), Box::new(None));
+        let lance_err: Error = df_err.into();
+
+        match lance_err {
+            Error::InvalidInput { .. } => {
+                assert!(
+                    lance_err.to_string().contains("missing_col"),
+                    "expected the column name to survive in the error message, got: {lance_err}"
+                );
+            }
+            _ => panic!("Expected InvalidInput variant, got {:?}", lance_err),
         }
     }
 

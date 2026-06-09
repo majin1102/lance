@@ -207,7 +207,7 @@ mod test {
                 assert_query_value: assert_query,
                 ret_val: RecordBatch::new_empty(Arc::new(Schema::new(vec![
                     Field::new("id", DataType::UInt64, false),
-                    Field::new("_distance", DataType::Float32, false),
+                    Field::new("_distance", DataType::Float32, true),
                 ]))),
             });
             IVFIndex::try_new(
@@ -266,6 +266,7 @@ mod test {
                 refine_factor: None,
                 metric_type: Some(metric),
                 use_index: true,
+                query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                 dist_q_c: 0.0,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
@@ -278,6 +279,7 @@ mod test {
                 Arc::new(DatasetPreFilter {
                     deleted_ids: None,
                     filtered_ids: None,
+                    deleted_fragments: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
                 &NoOpMetricsCollector,

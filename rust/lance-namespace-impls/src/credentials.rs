@@ -40,10 +40,13 @@
 //! # Note: GCP token duration cannot be configured; it's determined by the STS endpoint
 //! # To use a service account key file, set GOOGLE_APPLICATION_CREDENTIALS env var before starting
 //! credential_vendor.gcp_service_account = "my-sa@project.iam.gserviceaccount.com"
+//! credential_vendor.gcp_workload_identity_provider = "projects/123456/locations/global/workloadIdentityPools/pool/providers/provider"
+//! credential_vendor.gcp_impersonation_service_account = "my-sa@project.iam.gserviceaccount.com"
 //!
 //! # Azure-specific properties (for az:// locations)
 //! credential_vendor.azure_account_name = "mystorageaccount"  # required for Azure
 //! credential_vendor.azure_tenant_id = "my-tenant-id"
+//! credential_vendor.azure_federated_client_id = "my-app-client-id"
 //! credential_vendor.azure_duration_millis = "3600000"  # 1 hour (default, up to 7 days)
 //! ```
 //!
@@ -353,7 +356,7 @@ pub fn detect_provider_from_uri(uri: &str) -> &'static str {
     match url.scheme() {
         "s3" => "aws",
         "gs" => "gcp",
-        "az" => "azure",
+        "az" | "abfss" => "azure",
         _ => "unknown",
     }
 }
@@ -440,7 +443,12 @@ pub async fn create_credential_vendor_for_location(
 }
 
 /// Parse permission from properties, defaulting to Read
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
     properties
         .get(PERMISSION)
@@ -449,7 +457,12 @@ fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
 }
 
 /// Parse duration from properties using a vendor-specific key, defaulting to DEFAULT_CREDENTIAL_DURATION_MILLIS
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_duration_millis(properties: &HashMap<String, String>, key: &str) -> u64 {
     properties
         .get(key)
@@ -462,13 +475,14 @@ async fn create_aws_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use aws::{AwsCredentialVendor, AwsCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // AWS requires role_arn to be configured
     let role_arn = properties.get(aws_props::ROLE_ARN).ok_or_else(|| {
-        Error::invalid_input_source(
-            "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set".into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message: "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set"
+                .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, aws_props::DURATION_MILLIS);
@@ -506,8 +520,14 @@ async fn create_gcp_vendor(
     if let Some(sa) = properties.get(gcp_props::SERVICE_ACCOUNT) {
         config = config.with_service_account(sa);
     }
+    if let Some(provider) = properties.get(gcp_props::WORKLOAD_IDENTITY_PROVIDER) {
+        config = config.with_workload_identity_provider(provider);
+    }
+    if let Some(service_account) = properties.get(gcp_props::IMPERSONATION_SERVICE_ACCOUNT) {
+        config = config.with_impersonation_service_account(service_account);
+    }
 
-    let vendor = GcpCredentialVendor::new(config).await?;
+    let vendor = GcpCredentialVendor::new(config)?;
     Ok(Some(Box::new(vendor)))
 }
 
@@ -516,14 +536,15 @@ fn create_azure_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use azure::{AzureCredentialVendor, AzureCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // Azure requires account_name to be configured
     let account_name = properties.get(azure_props::ACCOUNT_NAME).ok_or_else(|| {
-        Error::invalid_input_source(
-            "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
-                .into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message:
+                "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
+                    .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, azure_props::DURATION_MILLIS);
@@ -536,6 +557,9 @@ fn create_azure_vendor(
 
     if let Some(tenant_id) = properties.get(azure_props::TENANT_ID) {
         config = config.with_tenant_id(tenant_id);
+    }
+    if let Some(client_id) = properties.get(azure_props::FEDERATED_CLIENT_ID) {
+        config = config.with_federated_client_id(client_id);
     }
 
     let vendor = AzureCredentialVendor::new(config);
@@ -556,8 +580,16 @@ mod tests {
         assert_eq!(detect_provider_from_uri("gs://bucket/path"), "gcp");
         assert_eq!(detect_provider_from_uri("GS://bucket/path"), "gcp");
 
-        // Azure (supported scheme: az://)
+        // Azure (supported schemes: az:// and abfss://)
         assert_eq!(detect_provider_from_uri("az://container/path"), "azure");
+        assert_eq!(
+            detect_provider_from_uri("az://container@account.blob.core.windows.net/path"),
+            "azure"
+        );
+        assert_eq!(
+            detect_provider_from_uri("abfss://container@account.dfs.core.windows.net/path"),
+            "azure"
+        );
 
         // Unknown (unsupported schemes)
         assert_eq!(detect_provider_from_uri("/local/path"), "unknown");
@@ -565,10 +597,6 @@ mod tests {
         assert_eq!(detect_provider_from_uri("memory://test"), "unknown");
         // Hadoop-style schemes not supported by lance-io
         assert_eq!(detect_provider_from_uri("s3a://bucket/path"), "unknown");
-        assert_eq!(
-            detect_provider_from_uri("abfss://container@account.dfs.core.windows.net/path"),
-            "unknown"
-        );
         assert_eq!(
             detect_provider_from_uri("wasbs://container@account.blob.core.windows.net/path"),
             "unknown"

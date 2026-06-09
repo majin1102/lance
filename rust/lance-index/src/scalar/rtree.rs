@@ -34,12 +34,12 @@ use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use sort::hilbert_sort::HilbertSorter;
@@ -248,6 +248,10 @@ impl CacheKey for RTreeCacheKey {
             Self::Page(page_id) => format!("page-{}", page_id).into(),
             Self::Nulls => "nulls".into(),
         }
+    }
+
+    fn type_name() -> &'static str {
+        "RTree"
     }
 }
 
@@ -559,7 +563,7 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
         let tmpdir = Arc::new(TempDir::default());
@@ -600,6 +604,7 @@ impl ScalarIndex for RTreeIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
             index_version: RTREE_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -880,7 +885,8 @@ impl RTreeIndexPlugin {
         )?;
 
         writer.write_record_batch(batch).await?;
-        writer.finish().await
+        writer.finish().await?;
+        Ok(())
     }
 
     async fn train_rtree_index(
@@ -964,6 +970,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
             index_version: RTREE_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -980,7 +987,10 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(GeoQueryParser::new(index_name)))
+        Some(Box::new(GeoQueryParser::new(
+            index_name,
+            self.name().to_string(),
+        )))
     }
 
     async fn load_index(

@@ -19,6 +19,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use mock_instant::thread_local::MockClock;
 
 use crate::dataset::refs::branch_contents_path;
 use futures::TryStreamExt;
@@ -33,6 +34,8 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         .read_dir()
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        // Ignore the version hint file, which is not a manifest.
+        .filter(|name| !name.starts_with("latest_version_hint"))
         .collect::<Vec<_>>();
     assert!(
         entries_names
@@ -161,6 +164,53 @@ async fn test_strict_overwrite() {
         .expect("Unstrict overwrite should succeed when committing to a stale version");
 }
 
+#[tokio::test]
+async fn test_version_id_fast_path() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+
+    let original = Dataset::write(reader, &test_uri, None).await.unwrap();
+    assert_eq!(original.version_id(), 1);
+    assert_eq!(original.version_id(), original.version().version);
+    assert_eq!(original.latest_version_id().await.unwrap(), 1);
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(5..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let updated = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.version_id(), 2);
+    assert_eq!(updated.version_id(), updated.version().version);
+    assert_eq!(updated.latest_version_id().await.unwrap(), 2);
+
+    let historical = updated.checkout_version(1).await.unwrap();
+    assert_eq!(historical.version_id(), 1);
+    assert_eq!(historical.version_id(), historical.version().version);
+    assert_eq!(historical.latest_version_id().await.unwrap(), 2);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_restore(
@@ -277,7 +327,12 @@ async fn test_tag(
         "Ref not found error: tag tag1 does not exist"
     );
 
+    MockClock::set_system_time(std::time::Duration::from_secs(1));
     dataset.tags().create("tag1", 1).await.unwrap();
+    let mut tag_map = dataset.tags().list().await.unwrap();
+    let tag1_meta = tag_map.remove("tag1").unwrap();
+    assert_eq!(tag1_meta.created_at, tag1_meta.updated_at);
+    assert!(tag1_meta.created_at.is_some());
 
     assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
 
@@ -358,11 +413,24 @@ async fn test_tag(
         "Version not found error: version main:3 does not exist"
     );
 
+    let tag1_before_update = dataset.tags().get("tag1").await.unwrap();
+    MockClock::set_system_time(std::time::Duration::from_secs(2));
     dataset.tags().update("tag1", 2).await.unwrap();
+    let tag1_after_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(tag1_after_update.created_at, tag1_before_update.created_at);
+    assert!(tag1_after_update.updated_at > tag1_before_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 2);
 
+    let tag1_before_second_update = dataset.tags().get("tag1").await.unwrap();
+    MockClock::set_system_time(std::time::Duration::from_secs(3));
     dataset.tags().update("tag1", 1).await.unwrap();
+    let tag1_after_second_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(
+        tag1_after_second_update.created_at,
+        tag1_before_second_update.created_at
+    );
+    assert!(tag1_after_second_update.updated_at > tag1_before_second_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
 }
@@ -759,16 +827,16 @@ async fn test_branch() {
     let test_path = tempdir.obj_path();
     let branches = dataset
         .object_store
-        .read_dir(test_path.child("tree"))
+        .read_dir(test_path.clone().join("tree"))
         .await
         .unwrap();
     assert!(branches.is_empty());
 }
 
 #[tokio::test]
-async fn test_versions_with_checkpoint_partial() {
-    // This test verifies that versions() correctly merges checkpoint and manifest data
-    use crate::dataset::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
+async fn test_versions_with_archive_partial() {
+    // This test verifies that versions() correctly merges archive and manifest data
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionArchiveEntry};
     use lance_table::format::ManifestSummary;
     use std::collections::HashMap;
 
@@ -802,45 +870,116 @@ async fn test_versions_with_checkpoint_partial() {
     .await
     .unwrap();
 
-    // Now manually create a checkpoint with version 1
+    // Now manually create an archive with version 1
     let dataset = Dataset::open(test_uri).await.unwrap();
     let object_store = dataset.object_store.clone();
     let base_path = dataset.base.clone();
 
-    let config = CheckpointConfig::default();
-    let mut checkpoint =
-        VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
-            .await
-            .unwrap();
+    let config = VersionArchiveConfig::default();
+    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+        .await
+        .unwrap();
 
-    let summaries = vec![VersionSummary {
+    let entries = vec![VersionArchiveEntry {
         version: 1,
         timestamp_millis: 1000,
         manifest_summary: ManifestSummary::default(),
         is_tagged: false,
-        is_cleaned_up: false,
         transaction_uuid: None,
         read_version: None,
         operation_type: None,
         transaction_properties: HashMap::new(),
     }];
 
-    checkpoint.add_summaries(&summaries);
-    checkpoint.flush().await.unwrap();
+    archive.add_entries(&entries);
+    archive.flush().await.unwrap();
 
     // Open dataset and get versions
     let dataset = Dataset::open(test_uri).await.unwrap();
     let versions = dataset.versions().await.unwrap();
 
-    // Should have 2 versions (1 from checkpoint, 1 from manifest)
+    // Should have 2 versions (1 from archive, 1 from manifest)
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].version, 1);
     assert_eq!(versions[1].version, 2);
 }
 
 #[tokio::test]
-async fn test_versions_no_checkpoint() {
-    // This test verifies that versions() works when no checkpoint exists
+async fn test_versions_reads_live_manifests_not_retained_in_archive() {
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionArchiveEntry};
+    use lance_table::format::ManifestSummary;
+    use std::collections::HashMap;
+
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+
+    let schema = data.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..4 {
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let config = VersionArchiveConfig {
+        max_entries: 2,
+        ..Default::default()
+    };
+    let mut archive =
+        VersionArchive::load_or_new(dataset.base.clone(), dataset.object_store.clone(), config)
+            .await
+            .unwrap();
+
+    let entries: Vec<_> = (1..=5)
+        .map(|version| VersionArchiveEntry {
+            version,
+            timestamp_millis: version as i64 * 1000,
+            manifest_summary: ManifestSummary::default(),
+            is_tagged: false,
+            transaction_uuid: None,
+            read_version: None,
+            operation_type: None,
+            transaction_properties: HashMap::new(),
+        })
+        .collect();
+    archive.add_entries(&entries);
+    archive.flush().await.unwrap();
+
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let versions = dataset.versions().await.unwrap();
+
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
+#[tokio::test]
+async fn test_versions_no_archive() {
+    // This test verifies that versions() works when no archive exists
     let test_dir = TempStdDir::default();
     let test_uri = test_dir.to_str().unwrap();
 
@@ -893,11 +1032,11 @@ async fn test_versions_no_checkpoint() {
 }
 
 #[tokio::test]
-async fn test_versions_full_checkpoint() {
-    // This test verifies that versions() works when all versions are in checkpoint
-    use crate::dataset::checkpoint::{CheckpointConfig, VersionCheckpoint, VersionSummary};
+async fn test_versions_full_archive() {
+    // This test verifies that versions() only returns checkout-able archived versions.
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig, VersionArchiveEntry};
     use lance_table::format::ManifestSummary;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     let test_dir = TempStdDir::default();
     let test_uri = test_dir.to_str().unwrap();
@@ -928,35 +1067,32 @@ async fn test_versions_full_checkpoint() {
     .await
     .unwrap();
 
-    // Create checkpoint with BOTH versions
+    // Create archive with both versions, marking version 1 as cleaned up.
     let dataset = Dataset::open(test_uri).await.unwrap();
     let object_store = dataset.object_store.clone();
     let base_path = dataset.base.clone();
 
-    let config = CheckpointConfig::default();
-    let mut checkpoint =
-        VersionCheckpoint::load_or_new(base_path.clone(), object_store.clone(), config)
-            .await
-            .unwrap();
+    let config = VersionArchiveConfig::default();
+    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+        .await
+        .unwrap();
 
-    let summaries = vec![
-        VersionSummary {
+    let entries = vec![
+        VersionArchiveEntry {
             version: 1,
             timestamp_millis: 1000,
             manifest_summary: ManifestSummary::default(),
             is_tagged: false,
-            is_cleaned_up: false,
             transaction_uuid: None,
             read_version: None,
             operation_type: None,
             transaction_properties: HashMap::new(),
         },
-        VersionSummary {
+        VersionArchiveEntry {
             version: 2,
             timestamp_millis: 2000,
             manifest_summary: ManifestSummary::default(),
             is_tagged: false,
-            is_cleaned_up: false,
             transaction_uuid: None,
             read_version: None,
             operation_type: None,
@@ -964,15 +1100,36 @@ async fn test_versions_full_checkpoint() {
         },
     ];
 
-    checkpoint.add_summaries(&summaries);
-    checkpoint.flush().await.unwrap();
+    archive.add_entries(&entries);
+    archive.flush().await.unwrap();
+
+    let version_1_manifest_path = dataset
+        .checkout_version(1)
+        .await
+        .unwrap()
+        .manifest_location
+        .path;
+    object_store.delete(&version_1_manifest_path).await.unwrap();
 
     // Open dataset and get versions
     let dataset = Dataset::open(test_uri).await.unwrap();
     let versions = dataset.versions().await.unwrap();
 
-    // Should have 2 versions (both from checkpoint)
-    assert_eq!(versions.len(), 2);
-    assert_eq!(versions[0].version, 1);
-    assert_eq!(versions[1].version, 2);
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version, 2);
+
+    let archive_entries = VersionArchive::scan(base_path.clone(), object_store.clone(), config)
+        .await
+        .unwrap();
+    assert_eq!(archive_entries.len(), 2);
+    assert_eq!(archive_entries[0].version, 1);
+    assert_eq!(archive_entries[1].version, 2);
+
+    let live_versions: HashSet<u64> = versions.iter().map(|version| version.version).collect();
+    let cleaned_versions: Vec<u64> = archive_entries
+        .iter()
+        .filter(|entry| !live_versions.contains(&entry.version))
+        .map(|entry| entry.version)
+        .collect();
+    assert_eq!(cleaned_versions, vec![1]);
 }

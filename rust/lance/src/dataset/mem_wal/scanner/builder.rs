@@ -4,21 +4,73 @@
 //! LSM Scanner builder.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::ScalarValue;
 use datafusion::common::ToDFSchema;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, is_system_column};
 use uuid::Uuid;
 
-use super::collector::{ActiveMemTableRef, LsmDataSourceCollector};
-use super::data_source::RegionSnapshot;
+use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
+use super::data_source::ShardSnapshot;
+use super::flushed_cache::FlushedMemTableCache;
 use super::planner::LsmScanPlanner;
+use super::point_lookup::LsmPointLookupPlanner;
 use crate::dataset::Dataset;
+use crate::session::Session;
+
+/// If `filter` is a point-lookup shape on `pk_col` — `pk = lit` (either
+/// operand order) or `pk IN (lit, …)` — return the literal key values. Any
+/// other shape returns `None`, so the scanner falls through to the general
+/// scan plan. Type coercion is left to the lookup path (an exact-type literal
+/// takes the fast BTree path; a coercible one falls back internally).
+fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>> {
+    match filter {
+        Expr::BinaryExpr(b) if matches!(b.op, Operator::Eq) => {
+            match (b.left.as_ref(), b.right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(lit, _))
+                | (Expr::Literal(lit, _), Expr::Column(c))
+                    if c.name == pk_col =>
+                {
+                    Some(vec![lit.clone()])
+                }
+                _ => None,
+            }
+        }
+        Expr::InList(in_list) if !in_list.negated => {
+            let Expr::Column(c) = in_list.expr.as_ref() else {
+                return None;
+            };
+            if c.name != pk_col {
+                return None;
+            }
+            let mut vals = Vec::with_capacity(in_list.list.len());
+            for e in &in_list.list {
+                let Expr::Literal(lit, _) = e else {
+                    return None; // a non-literal IN element → not a point lookup
+                };
+                vals.push(lit.clone());
+            }
+            (!vals.is_empty()).then_some(vals)
+        }
+        _ => None,
+    }
+}
+
+/// Either a base Lance table, or an explicit base path used to resolve
+/// flushed-generation directories when no base dataset is configured.
+enum BaseSource {
+    Table(Arc<Dataset>),
+    PathOnly(String),
+}
 
 /// Scanner for LSM tree data spanning base table, flushed MemTables, and active MemTable.
 ///
@@ -34,7 +86,7 @@ use crate::dataset::Dataset;
 /// # Example
 ///
 /// ```ignore
-/// let scanner = LsmScanner::new(base_table, region_snapshots, vec!["pk".to_string()])
+/// let scanner = LsmScanner::new(base_table, shard_snapshots, vec!["pk".to_string()])
 ///     .project(&["id", "name"])
 ///     .filter("id > 10")?
 ///     .limit(100, None);
@@ -43,9 +95,15 @@ use crate::dataset::Dataset;
 /// ```
 pub struct LsmScanner {
     // Data sources
-    base_table: Arc<Dataset>,
-    region_snapshots: Vec<RegionSnapshot>,
-    active_memtables: HashMap<Uuid, ActiveMemTableRef>,
+    base: BaseSource,
+    /// Schema used for projection, empty plans, and filter parsing.
+    /// Derived from the base dataset when one is present, otherwise supplied
+    /// explicitly by [`Self::without_base_table`].
+    schema: SchemaRef,
+    shard_snapshots: Vec<ShardSnapshot>,
+    /// In-memory memtables by shard (active + frozen-awaiting-flush), so
+    /// the scanner path carries frozen-undrained generations too.
+    in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
 
     // Query configuration
     projection: Option<Vec<String>>,
@@ -59,6 +117,14 @@ pub struct LsmScanner {
 
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
+
+    /// Session threaded into flushed-generation opens so the first open of
+    /// each generation populates the shared index / file-metadata caches.
+    /// Defaults to the base table's session when one is present.
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets. When set, repeated
+    /// queries against the same generation skip the manifest read entirely.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmScanner {
@@ -67,17 +133,24 @@ impl LsmScanner {
     /// # Arguments
     ///
     /// * `base_table` - The base Lance table (merged data)
-    /// * `region_snapshots` - Snapshots of region states from MemWAL index
+    /// * `shard_snapshots` - Snapshots of shard states from MemWAL index
     /// * `pk_columns` - Primary key column names for deduplication
     pub fn new(
         base_table: Arc<Dataset>,
-        region_snapshots: Vec<RegionSnapshot>,
+        shard_snapshots: Vec<ShardSnapshot>,
         pk_columns: Vec<String>,
     ) -> Self {
+        let lance_schema = base_table.schema();
+        let arrow_schema: arrow_schema::Schema = lance_schema.into();
+        // Default the session to the base table's so the common path reuses
+        // the shared index / metadata caches without extra wiring. An
+        // explicit `with_session` still overrides this.
+        let session = Some(base_table.session());
         Self {
-            base_table,
-            region_snapshots,
-            active_memtables: HashMap::new(),
+            base: BaseSource::Table(base_table),
+            schema: Arc::new(arrow_schema),
+            shard_snapshots,
+            in_memory_memtables: HashMap::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -85,16 +158,98 @@ impl LsmScanner {
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
+            session,
+            flushed_cache: None,
         }
     }
 
-    /// Add an active MemTable for strong consistency reads.
+    /// Create a scanner that reads only the fresh tier (active memtable and
+    /// flushed generations) without including a base Lance table.
     ///
-    /// Active MemTables contain data that may not be persisted yet.
-    /// Including them provides strong consistency at the cost of
-    /// requiring coordination with the writer.
-    pub fn with_active_memtable(mut self, region_id: Uuid, memtable: ActiveMemTableRef) -> Self {
-        self.active_memtables.insert(region_id, memtable);
+    /// This is useful when the caller owns the base read path separately and
+    /// only needs the WAL's contribution: active memtable ∪ L0 flushed
+    /// generations. Deduplication semantics are unchanged — newer generations
+    /// still win on PK conflicts.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - Schema used for projection, filter parsing, and empty plans.
+    ///   Should match the schema flushed generations were written with.
+    /// * `base_path` - Table-root URI used to resolve relative flushed paths.
+    /// * `shard_snapshots` - Snapshots of shard states from MemWAL index.
+    /// * `pk_columns` - Primary key column names for deduplication.
+    pub fn without_base_table(
+        schema: SchemaRef,
+        base_path: impl Into<String>,
+        shard_snapshots: Vec<ShardSnapshot>,
+        pk_columns: Vec<String>,
+    ) -> Self {
+        Self {
+            base: BaseSource::PathOnly(base_path.into()),
+            schema,
+            shard_snapshots,
+            in_memory_memtables: HashMap::new(),
+            projection: None,
+            filter: None,
+            limit: None,
+            offset: None,
+            with_row_address: false,
+            with_memtable_gen: false,
+            pk_columns,
+            session: None,
+            flushed_cache: None,
+        }
+    }
+
+    /// Set a shard's active memtable. Back-compat / test entry point; the
+    /// read path uses [`Self::with_in_memory_memtables`]. Replaces the
+    /// active memtable, preserving any frozen memtables already registered.
+    pub fn with_active_memtable(mut self, shard_id: Uuid, memtable: InMemoryMemTableRef) -> Self {
+        match self.in_memory_memtables.entry(shard_id) {
+            Entry::Occupied(mut e) => e.get_mut().active = memtable,
+            Entry::Vacant(e) => {
+                e.insert(InMemoryMemTables {
+                    active: memtable,
+                    frozen: Vec::new(),
+                });
+            }
+        }
+        self
+    }
+
+    /// Register a shard's in-memory memtables (active + frozen-awaiting-
+    /// flush) captured atomically by `ShardWriter::in_memory_memtable_refs`.
+    /// The read path's entry point — closes the concurrent-read-vs-flush
+    /// hole by carrying frozen-undrained generations into the scan.
+    pub fn with_in_memory_memtables(
+        mut self,
+        shard_id: Uuid,
+        memtables: InMemoryMemTables,
+    ) -> Self {
+        self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Thread an existing session into flushed-generation opens.
+    ///
+    /// The first open of each flushed generation then populates the shared
+    /// index / file-metadata caches, so later queries skip re-decoding them.
+    /// When a base table is configured this defaults to its session; call
+    /// this to override (e.g. on a fresh-tier-only scanner that owns its own
+    /// long-lived session).
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets.
+    ///
+    /// With a cache, repeated queries against the same generation become a
+    /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
+    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
+    /// set by default, so behavior is unchanged unless opted in.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
         self
     }
 
@@ -112,9 +267,10 @@ impl LsmScanner {
     /// The filter is pushed down to each data source when possible.
     pub fn filter(mut self, filter_expr: &str) -> Result<Self> {
         let ctx = SessionContext::new();
-        let lance_schema = self.base_table.schema();
-        let arrow_schema: arrow_schema::Schema = lance_schema.into();
-        let df_schema = arrow_schema
+        let df_schema = self
+            .schema
+            .as_ref()
+            .clone()
             .to_dfschema()
             .map_err(|e| Error::invalid_input(format!("Failed to create DFSchema: {}", e)))?;
         let expr = ctx.parse_sql_expr(filter_expr, &df_schema).map_err(|e| {
@@ -157,18 +313,63 @@ impl LsmScanner {
 
     /// Get the output schema.
     pub fn schema(&self) -> SchemaRef {
-        // For now, return base schema. Full implementation would compute
-        // the projected schema with optional _gen/_rowaddr columns.
-        let lance_schema = self.base_table.schema();
-        let arrow_schema: arrow_schema::Schema = lance_schema.into();
-        Arc::new(arrow_schema)
+        // For now, return the configured schema. Full implementation would
+        // compute the projected schema with optional _gen/_rowaddr columns.
+        self.schema.clone()
+    }
+
+    /// Whether the projection requests any system column (e.g. `_rowaddr`,
+    /// `_memtable_gen`), which only the union scan path can produce.
+    fn projection_has_system_columns(&self) -> bool {
+        self.projection
+            .as_ref()
+            .map(|p| p.iter().any(|c| is_system_column(c)))
+            .unwrap_or(false)
     }
 
     /// Create the execution plan.
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        let planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+
+        // Fast point-lookup routing: a `pk = lit` / `pk IN (..)` filter on the
+        // single pk column — with no offset and no scan-only system columns —
+        // bypasses the union/dedup scan for the direct BTree point-lookup path
+        // (`LsmPointLookupPlanner`), composed as a normal `ExecutionPlan` so a
+        // `limit` still applies on top. Any other shape falls through to the
+        // general scan, so this never changes results for unmatched queries.
+        if self.pk_columns.len() == 1
+            && self.offset.is_none()
+            && !self.with_memtable_gen
+            && !self.with_row_address
+            && !self.projection_has_system_columns()
+            && let Some(filter) = &self.filter
+            && let Some(keys) = extract_pk_point_keys(filter, &self.pk_columns[0])
+        {
+            let mut planner =
+                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
+            if let Some(session) = &self.session {
+                planner = planner.with_session(session.clone());
+            }
+            if let Some(cache) = &self.flushed_cache {
+                planner = planner.with_flushed_cache(cache.clone());
+            }
+            let plan = planner
+                .plan_point_lookup(&keys, self.projection.as_deref())
+                .await?;
+            return Ok(match self.limit {
+                Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),
+                None => plan,
+            });
+        }
+
+        let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        if let Some(session) = &self.session {
+            planner = planner.with_session(session.clone());
+        }
+        if let Some(cache) = &self.flushed_cache {
+            planner = planner.with_flushed_cache(cache.clone());
+        }
 
         planner
             .plan_scan(
@@ -179,6 +380,33 @@ impl LsmScanner {
                 self.with_memtable_gen,
                 self.with_row_address,
             )
+            .await
+    }
+
+    /// Build a local-scoring FTS plan spanning base + flushed + active sources.
+    ///
+    /// Routes through [`super::LsmFtsSearchPlanner`]. Output schema is
+    /// `projection ∪ pk_columns + _score`; per-source local BM25 `_score`
+    /// is merged DESC and capped at `k`. `column` must be FTS-indexed on
+    /// the queried sources.
+    pub async fn full_text_search(
+        &self,
+        column: &str,
+        query: lance_index::scalar::FullTextSearchQuery,
+        k: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let collector = self.build_collector();
+        let base_schema = self.schema();
+        let mut planner =
+            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        if let Some(session) = &self.session {
+            planner = planner.with_session(session.clone());
+        }
+        if let Some(cache) = &self.flushed_cache {
+            planner = planner.with_flushed_cache(cache.clone());
+        }
+        planner
+            .plan_search(column, query, k, self.projection.as_deref())
             .await
     }
 
@@ -220,13 +448,46 @@ impl LsmScanner {
         Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
     }
 
+    /// Test which `pks` have been (re)written in the WAL fresh tier — the active
+    /// and frozen memtables and flushed generations this scanner spans — i.e.
+    /// are shadowed above the base table. `pks` is a batch whose columns include
+    /// the primary-key columns; the returned `Vec<bool>` is aligned with its
+    /// rows. Hashing matches the scanner's internal dedup, so the caller never
+    /// hashes PKs itself. Flushed membership comes from the injected
+    /// [`FlushedMemTableCache`] when one is set.
+    pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
+        let sources = self.build_collector().collect()?;
+        let sets = super::block_list::fresh_tier_block_list(
+            &sources,
+            &self.pk_columns,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        )
+        .await?;
+        let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
+        Ok((0..pks.num_rows())
+            .map(|row| {
+                let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
+                sets.iter().any(|set| set.contains(&hash))
+            })
+            .collect())
+    }
+
     /// Build the data source collector.
     fn build_collector(&self) -> LsmDataSourceCollector {
-        let mut collector =
-            LsmDataSourceCollector::new(self.base_table.clone(), self.region_snapshots.clone());
+        let mut collector = match &self.base {
+            BaseSource::Table(dataset) => {
+                LsmDataSourceCollector::new(dataset.clone(), self.shard_snapshots.clone())
+            }
+            BaseSource::PathOnly(path) => LsmDataSourceCollector::without_base_table(
+                path.clone(),
+                self.shard_snapshots.clone(),
+            ),
+        };
 
-        for (region_id, memtable) in &self.active_memtables {
-            collector = collector.with_active_memtable(*region_id, memtable.clone());
+        for (shard_id, mems) in &self.in_memory_memtables {
+            collector = collector.with_in_memory_memtables(*shard_id, mems.clone());
         }
 
         collector
@@ -235,10 +496,21 @@ impl LsmScanner {
 
 impl std::fmt::Debug for LsmScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (label, value) = match &self.base {
+            BaseSource::Table(dataset) => ("base_table", dataset.uri().to_string()),
+            BaseSource::PathOnly(path) => ("base_path", path.clone()),
+        };
         f.debug_struct("LsmScanner")
-            .field("base_table", &self.base_table.uri())
-            .field("num_regions", &self.region_snapshots.len())
-            .field("num_active_memtables", &self.active_memtables.len())
+            .field(label, &value)
+            .field("num_shards", &self.shard_snapshots.len())
+            .field(
+                "num_in_memory_memtables",
+                &self
+                    .in_memory_memtables
+                    .values()
+                    .map(|m| 1 + m.frozen.len())
+                    .sum::<usize>(),
+            )
             .field("projection", &self.projection)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
@@ -257,40 +529,40 @@ mod tests {
         // Full integration tests would require a real dataset
 
         let pk_columns = ["id".to_string()];
-        let region_snapshots: Vec<RegionSnapshot> = vec![];
+        let shard_snapshots: Vec<ShardSnapshot> = vec![];
 
         // We can't easily create an Arc<Dataset> without I/O,
         // so just test the type construction
         assert_eq!(pk_columns.len(), 1);
-        assert!(region_snapshots.is_empty());
+        assert!(shard_snapshots.is_empty());
     }
 
     #[test]
-    fn test_region_snapshot_construction() {
-        use super::super::data_source::RegionSnapshot;
+    fn test_shard_snapshot_construction() {
+        use super::super::data_source::ShardSnapshot;
 
-        let region_id = Uuid::new_v4();
-        let snapshot = RegionSnapshot::new(region_id)
+        let shard_id = Uuid::new_v4();
+        let snapshot = ShardSnapshot::new(shard_id)
             .with_spec_id(1)
             .with_current_generation(5)
             .with_flushed_generation(1, "path/gen_1".to_string())
             .with_flushed_generation(2, "path/gen_2".to_string());
 
-        assert_eq!(snapshot.region_id, region_id);
+        assert_eq!(snapshot.shard_id, shard_id);
         assert_eq!(snapshot.spec_id, 1);
         assert_eq!(snapshot.current_generation, 5);
         assert_eq!(snapshot.flushed_generations.len(), 2);
     }
 
     #[test]
-    fn test_active_memtable_ref() {
+    fn test_in_memory_memtable_ref() {
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
         let batch_store = Arc::new(BatchStore::with_capacity(100));
         let index_store = Arc::new(IndexStore::new());
         let schema = Arc::new(arrow_schema::Schema::empty());
 
-        let memtable_ref = ActiveMemTableRef {
+        let memtable_ref = InMemoryMemTableRef {
             batch_store,
             index_store,
             schema,
@@ -298,5 +570,160 @@ mod tests {
         };
 
         assert_eq!(memtable_ref.generation, 10);
+    }
+
+    #[tokio::test]
+    async fn contains_pks_reports_fresh_tier_membership() {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_batch = |ids: &[i32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids.to_vec()))],
+            )
+            .unwrap()
+        };
+        let mk = |ids: &[i32], generation: u64| {
+            let store = BatchStore::with_capacity(8);
+            store.append(id_batch(ids)).unwrap();
+            InMemoryMemTableRef {
+                batch_store: Arc::new(store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation,
+            }
+        };
+
+        // Fresh-tier only: active gen 2 (pk=1,2) + frozen gen 1 (pk=3).
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk(&[1, 2], 2),
+                frozen: vec![mk(&[3], 1)],
+            },
+        );
+
+        // pk=1 (active), pk=4 (absent), pk=3 (frozen).
+        let result = scanner.contains_pks(&id_batch(&[1, 4, 3])).await.unwrap();
+        assert_eq!(result, vec![true, false, true]);
+    }
+
+    /// One active memtable with a maintained BTree on `id`, all rows visible.
+    fn mk_indexed_memtable(schema: &SchemaRef, ids: &[i32], names: &[&str]) -> InMemoryMemTableRef {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::{Int32Array, StringArray};
+
+        let store = BatchStore::with_capacity(8);
+        let mut index = IndexStore::new();
+        index.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+            ],
+        )
+        .unwrap();
+        let (idx, row_offset, _) = store.append(batch.clone()).unwrap();
+        index
+            .insert_with_batch_position(&batch, row_offset, Some(idx))
+            .unwrap();
+        InMemoryMemTableRef {
+            batch_store: Arc::new(store),
+            index_store: Arc::new(index),
+            schema: schema.clone(),
+            generation: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn point_lookup_filter_routes_to_fast_path() {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::{SessionContext, col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let memtable = mk_indexed_memtable(&schema, &[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"]);
+        let shard = Uuid::new_v4();
+        let scanner = || {
+            LsmScanner::without_base_table(
+                schema.clone(),
+                "memory://t",
+                vec![],
+                vec!["id".to_string()],
+            )
+            .with_in_memory_memtables(
+                shard,
+                InMemoryMemTables {
+                    active: memtable.clone(),
+                    frozen: vec![],
+                },
+            )
+        };
+        let ctx = SessionContext::new();
+        let count = |plan: Arc<dyn ExecutionPlan>| {
+            let ctx = ctx.clone();
+            async move {
+                let rows: Vec<RecordBatch> = plan
+                    .execute(0, ctx.task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                rows.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+        };
+
+        // `id = 2` routes to the direct point-lookup node (OneShotStream), not the
+        // union/dedup scan, and returns the one matching row.
+        let plan = scanner()
+            .filter_expr(col("id").eq(lit(2i32)))
+            .create_plan()
+            .await
+            .unwrap();
+        let disp = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(disp.contains("OneShotStream"), "pk=lit must route: {disp}");
+        assert!(
+            !disp.contains("Union"),
+            "must not use the union path: {disp}"
+        );
+        assert_eq!(count(plan).await, 1);
+
+        // `id IN (1, 3)` routes and returns both rows.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(3i32)], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert!(
+            format!("{}", displayable(plan.as_ref()).indent(true)).contains("OneShotStream"),
+            "pk IN (..) must route"
+        );
+        assert_eq!(count(plan).await, 2);
+
+        // A range filter is NOT a point lookup → falls through to the scan path.
+        let plan = scanner()
+            .filter_expr(col("id").gt(lit(2i32)))
+            .create_plan()
+            .await
+            .unwrap();
+        assert!(
+            !format!("{}", displayable(plan.as_ref()).indent(true)).contains("OneShotStream"),
+            "range filter must not route to the point-lookup node"
+        );
+        assert_eq!(count(plan).await, 3); // 3,4,5
     }
 }

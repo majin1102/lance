@@ -4,8 +4,15 @@
 //! Utilities for integrating scalar indices with datasets
 //!
 
+pub(crate) mod bitmap;
+pub(crate) mod btree;
+pub(crate) mod inverted;
+
+pub use inverted::{load_segment_details, load_segments};
+
 use std::sync::{Arc, LazyLock};
 
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
@@ -18,6 +25,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
+use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
@@ -28,15 +36,18 @@ use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::label_list::{
+    LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
+};
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
+use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
     lance_format::LanceIndexStore,
 };
-use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
+use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use tracing::instrument;
@@ -299,12 +310,59 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    plugin
+    let created_index = plugin
         .train_index(
             training_data,
             &index_store,
             training_request,
             fragment_ids,
+            progress,
+        )
+        .await?;
+
+    Ok(created_index)
+}
+
+/// Build a canonical bitmap index segment over a caller-selected fragment set.
+///
+/// This is intentionally separate from `build_scalar_index(..., fragment_ids=Some(...))`.
+/// The latter is the legacy distributed scalar-index shard path. Here fragment ids only
+/// restrict the scanned rows; the bitmap plugin receives no shard id and writes the
+/// canonical bitmap layout for the staged segment root.
+#[instrument(level = "debug", skip_all)]
+pub(super) async fn build_bitmap_index_segment(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &str,
+    fragment_ids: Vec<u32>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<CreatedIndex> {
+    let field = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ))?;
+    let field: arrow_schema::Field = field.into();
+
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let training_request =
+        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+    let criteria = training_request.criteria();
+
+    progress.stage_start("load_data", None, "rows").await?;
+    let training_data =
+        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
+    progress.stage_complete("load_data").await?;
+
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
+    plugin
+        .train_index(
+            training_data,
+            &index_store,
+            training_request,
+            None,
             progress,
         )
         .await
@@ -329,6 +387,43 @@ pub async fn fetch_index_details(
     Ok(index_details)
 }
 
+async fn validate_label_list_index_compatibility(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+    index_store: &Arc<LanceIndexStore>,
+) -> Result<()> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Ok(());
+    };
+
+    if !field.nullable {
+        return Ok(());
+    }
+
+    if index.index_version < LABEL_LIST_NULLS_MIN_VERSION {
+        log::warn!(
+            "LabelList index {} is old; NOT filters may be incorrect on nullable lists. Consider rebuilding.",
+            index.name
+        );
+        return Ok(());
+    }
+
+    let reader = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+    if !reader
+        .schema()
+        .metadata
+        .contains_key(LABEL_LIST_NULLS_METADATA_KEY)
+    {
+        return Err(Error::internal(format!(
+            "LabelList index {} is missing required metadata key {}",
+            index.name, LABEL_LIST_NULLS_METADATA_KEY
+        )));
+    }
+
+    Ok(())
+}
+
 pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
@@ -336,7 +431,7 @@ pub async fn open_scalar_index(
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
-    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index)?);
+    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
@@ -347,9 +442,29 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    plugin
+    if let Some(index) = plugin
+        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
+        .await?
+    {
+        // Compatibility check is only needed on first load; a cache hit means
+        // the index was already validated when it was originally opened in
+        // this session, so we can skip the extra `open_index_file` IOP.
+        return Ok(index);
+    }
+
+    if index_details.type_url.ends_with("LabelListIndexDetails") {
+        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
+    }
+
+    let index = plugin
         .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
-        .await
+        .await?;
+
+    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = uuid_str, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
+    metrics.record_index_load();
+
+    plugin.put_in_cache(&index_cache, index.clone()).await?;
+    Ok(index)
 }
 
 pub(crate) async fn infer_scalar_index_details(
@@ -363,7 +478,7 @@ pub(crate) async fn infer_scalar_index_details(
         return Ok(index_details.0.clone());
     }
 
-    let index_dir = dataset.indice_files_dir(index)?.child(uuid.clone());
+    let index_dir = dataset.indice_files_dir(index)?.join(uuid.clone());
     let col = dataset
         .schema()
         .field(column)
@@ -372,19 +487,22 @@ pub(crate) async fn infer_scalar_index_details(
             column
         )))?;
 
-    let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
-    let inverted_list_lookup = index_dir.child(METADATA_FILE);
-    let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
+    let bitmap_page_lookup = index_dir.clone().join(BITMAP_LOOKUP_NAME);
+    let inverted_list_lookup = index_dir.clone().join(METADATA_FILE);
+    let legacy_inverted_list_lookup = index_dir.clone().join(INVERT_LIST_FILE);
+    let object_store = dataset.object_store_for_index(index).await?;
     let index_details = if let DataType::List(_) = col.data_type() {
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
-    } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
+    } else if object_store.exists(&bitmap_page_lookup).await? {
         prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
-    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
+    } else if object_store.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
         let parse_params = async || {
-            let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index).ok()?;
+            let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index)
+                .await
+                .ok()?;
             let reader = index_store.open_index_file(METADATA_FILE).await.ok()?;
             let params_str = reader.schema().metadata.get("params")?;
             let params = ::serde_json::from_str::<InvertedIndexParams>(params_str).ok()?;
@@ -392,11 +510,7 @@ pub(crate) async fn infer_scalar_index_details(
             Some(prost_types::Any::from_msg(&details).unwrap())
         };
         parse_params().await.unwrap_or(default_details)
-    } else if dataset
-        .object_store
-        .exists(&legacy_inverted_list_lookup)
-        .await?
-    {
+    } else if object_store.exists(&legacy_inverted_list_lookup).await? {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
@@ -461,21 +575,19 @@ pub fn index_matches_criteria(
         return Ok(true);
     };
 
-    if index_details.is_vector() {
-        // This method is only for finding matching scalar indexes today so reject any vector indexes
-        return Ok(false);
-    }
-
-    if criteria.must_support_fts && !index_details.supports_fts() {
-        return Ok(false);
-    }
-
-    // We should not use FTS / NGram indices for exact equality queries
-    // (i.e. merge insert with a join on the indexed column)
-    if criteria.must_support_exact_equality {
-        let plugin = index_details.get_plugin()?;
-        if !plugin.provides_exact_answer() {
+    // Only apply scalar-specific checks to scalar indices
+    if !index_details.is_vector() {
+        if criteria.must_support_fts && !index_details.supports_fts() {
             return Ok(false);
+        }
+
+        // We should not use FTS / NGram indices for exact equality queries
+        // (i.e. merge insert with a join on the indexed column)
+        if criteria.must_support_exact_equality {
+            let plugin = index_details.get_plugin()?;
+            if !plugin.provides_exact_answer() {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -549,6 +661,7 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
+    use crate::dataset::Dataset;
     use arrow::{
         array::AsArray,
         datatypes::{Int32Type, UInt64Type},
@@ -558,9 +671,12 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::{IndexType, optimize::OptimizeOptions};
-    use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
-    use lance_table::format::pb::VectorIndexDetails;
+    use lance_index::{
+        pbold::NGramIndexDetails,
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+    };
 
     fn make_index_metadata(
         name: &str,
@@ -596,6 +712,7 @@ mod tests {
             index_version: 0,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -615,11 +732,12 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
+        // Vector indices should now match basic criteria
         let result = index_matches_criteria(&index1, &criteria, &[&field], true, &schema).unwrap();
-        assert!(!result);
+        assert!(result);
 
         let result = index_matches_criteria(&index1, &criteria, &[&field], false, &schema).unwrap();
-        assert!(!result);
+        assert!(result);
     }
 
     #[test]
@@ -729,6 +847,194 @@ mod tests {
         assert!(result);
     }
 
+    /// Regression guard for over-projection of `Map` siblings in
+    /// `Field::apply_projection`. Before the parent-selection guard,
+    /// every `Map` column in a schema survived every projection because
+    /// `apply_projection` cloned `Map` children unconditionally without
+    /// checking whether the parent itself was selected. On scalar-index
+    /// training scans this turned a single-column projection into a wide
+    /// one, ballooning the per-row tuple width fed into `SortExec` and
+    /// producing >100 GiB external-sort spills on tables with several
+    /// `Map` columns.
+    ///
+    /// Coverage:
+    ///
+    /// 1. Plain `Binary` siblings stay narrow — sanity check that
+    ///    non-Map schemas weren't affected by the bug.
+    /// 2. `Map` siblings stay narrow — the actual regression guard.
+    /// 3. The same `Map`-sibling schema scanned via `with_fragments`,
+    ///    the path `optimize_indices` uses for delta training scans.
+    /// 4. When the caller *does* request a Map column, the Map's
+    ///    internal children (entries struct + key/value) are still
+    ///    preserved (the original intent of PR #5349).
+    #[tokio::test]
+    async fn scan_training_data_does_not_pull_unrelated_map_siblings() {
+        use arrow_array::types::Int32Type;
+        use lance_datagen::ByteCount;
+        use lance_file::version::LanceFileVersion;
+
+        const FRAGMENTS: u32 = 2;
+        const ROWS_PER_FRAGMENT: u32 = 32;
+        const BINARY_BYTES: u64 = 20;
+
+        async fn projection_columns(dataset: &Dataset, column: &str) -> Vec<String> {
+            let mut scan = dataset.scan();
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                column.to_string(),
+            )]))
+            .unwrap();
+            scan.with_row_id();
+            scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])
+                .unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            // FilteredReadExec's Display emits `projection=[col1, col2, ...]`;
+            // pluck the column list out of the line. We do not depend on
+            // ordering or whitespace beyond the literal `projection=[` /
+            // `]` markers so the assertion stays robust to unrelated plan
+            // formatting changes.
+            let line = plan
+                .lines()
+                .find(|l| l.contains("projection=["))
+                .unwrap_or_else(|| panic!("LanceRead line missing in plan:\n{}", plan));
+            let start = line.find("projection=[").unwrap() + "projection=[".len();
+            let rest = &line[start..];
+            let end = rest.find(']').unwrap();
+            rest[..end]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+
+        // Variant 1: plain `Binary` siblings — sanity check that the prior
+        // narrow-projection behaviour still holds for non-Map schemas.
+        let bin_dataset = lance_datagen::gen_batch()
+            .col(
+                "bin_a",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col(
+                "bin_b",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col(
+                "bin_c",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col(
+                "bin_d",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(
+                FragmentCount::from(FRAGMENTS),
+                FragmentRowCount::from(ROWS_PER_FRAGMENT),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projection_columns(&bin_dataset, "idx").await,
+            vec!["idx".to_string()],
+            "binary-siblings schema must project only the requested column"
+        );
+
+        // Variant 2: `Map` siblings + a fixed-size `Binary` index column —
+        // the actual regression guard. Multiple Map types with different
+        // value shapes (`Utf8`, `List<Utf8>`, `Float64`) exercise the
+        // children-clone codepath across a few representative shapes.
+        let map_dir = TempStrDir::default();
+        let map_uri = format!("{}/maps", map_dir.as_str());
+        let map_params = crate::dataset::WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+            ..Default::default()
+        };
+        let map_dataset = lance_datagen::gen_batch()
+            .col("map_a", array::rand_map(&DataType::Utf8, &DataType::Utf8))
+            .col(
+                "map_b",
+                array::rand_map(
+                    &DataType::Utf8,
+                    &DataType::List(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::Utf8,
+                        true,
+                    ))),
+                ),
+            )
+            .col(
+                "map_c",
+                array::rand_map(&DataType::Utf8, &DataType::Float64),
+            )
+            .col(
+                "map_d",
+                array::rand_map(&DataType::Utf8, &DataType::Float64),
+            )
+            .col(
+                "indexed",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .into_dataset_with_params(
+                &map_uri,
+                FragmentCount::from(FRAGMENTS),
+                FragmentRowCount::from(ROWS_PER_FRAGMENT),
+                Some(map_params),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projection_columns(&map_dataset, "indexed").await,
+            vec!["indexed".to_string()],
+            "map-siblings schema must not pull unrelated Map columns into LanceRead"
+        );
+
+        // Variant 3: same dataset, exercising the `with_fragments` delta
+        // path used by `optimize_indices` for incremental BTree updates.
+        let frag = map_dataset.fragments().first().cloned().unwrap();
+        let mut scan = map_dataset.scan();
+        scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "indexed".to_string(),
+        )]))
+        .unwrap();
+        scan.with_row_id();
+        scan.with_fragments(vec![frag]);
+        scan.project_with_transform(&[(VALUE_COLUMN_NAME, "indexed")])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        let line = plan
+            .lines()
+            .find(|l| l.contains("projection=["))
+            .unwrap_or_else(|| panic!("LanceRead line missing:\n{}", plan));
+        assert!(
+            line.contains("projection=[indexed]"),
+            "with_fragments delta scan must also project only the indexed column; got:\n{}",
+            line
+        );
+
+        // Variant 4: when the Map column itself is requested, its internal
+        // children (entries struct with key/value) must still be preserved
+        // — this is the original intent of PR #5349 and the reason
+        // `apply_projection` clones the children whole-cloth for selected
+        // Map fields.
+        let mut scan = map_dataset.scan();
+        scan.project(&["map_c"]).unwrap();
+        let projected_schema = scan.schema().await.unwrap();
+        let projected = projected_schema.field_with_name("map_c").unwrap();
+        match projected.data_type() {
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(children) => {
+                    assert_eq!(
+                        children.len(),
+                        2,
+                        "selected Map column must keep its key/value entries struct"
+                    );
+                }
+                other => panic!("Map entries should be Struct, got {:?}", other),
+            },
+            other => panic!("expected Map type, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn test_load_training_data_addr_sort() {
         // Create test data using lance_datagen
@@ -773,9 +1079,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_btree() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
 
@@ -879,9 +1185,9 @@ mod tests {
     #[tokio::test]
     async fn test_optimize_scalar_index_btree() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
 
@@ -997,9 +1303,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_bitmap() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::scalar::ScalarIndexParams;
 
         let test_dir = TempStrDir::default();
@@ -1077,8 +1383,8 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_inverted() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use lance_datagen::{BatchCount, ByteCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 
@@ -1216,9 +1522,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_zonemap() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;

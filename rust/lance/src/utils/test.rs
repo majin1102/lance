@@ -21,8 +21,10 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+mod failing_store;
 mod throttle_store;
 
+pub use failing_store::FailingProxyStore;
 pub use throttle_store::ThrottledStoreWrapper;
 
 /// A dataset generator that can generate random layouts. This is used to test
@@ -52,7 +54,6 @@ impl TestDatasetGenerator {
     /// Set the seed for the random number generator.
     ///
     /// If not set, a random seed will be generated on each call to [`Self::make_hostile`].
-    #[allow(dead_code)]
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -263,7 +264,7 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
     fragment
         .files
         .iter()
-        .map(|file| file.fields.clone())
+        .map(|file| file.fields.to_vec())
         .collect::<Vec<_>>()
 }
 
@@ -382,7 +383,11 @@ impl Default for NoContextTestFixture {
 
 impl NoContextTestFixture {
     pub fn new() -> Self {
+        // `enable_time` is required because `Dataset::write` runs the commit
+        // through `tokio::time::timeout` (CommitBuilder's default timeout),
+        // which panics without a timer driver.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
 

@@ -65,6 +65,32 @@ def mostly_null_dataset(tmpdir, request):
     return ds
 
 
+def make_multivector_dataset(tmpdir):
+    dimension = 4
+    vector_type = pa.list_(pa.list_(pa.float32(), dimension))
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("embeddings", vector_type),
+        ]
+    )
+    table = pa.Table.from_pylist(
+        [
+            {"id": 1, "embeddings": [[0.1, 0.2, 0.3, 0.4], [0.2, 0.3, 0.4, 0.5]]},
+            {"id": 2, "embeddings": [[0.8, 0.7, 0.6, 0.5]]},
+            {"id": 3, "embeddings": [[0.3, 0.2, 0.1, 0.0], [0.9, 0.8, 0.7, 0.6]]},
+            {"id": 4, "embeddings": [[0.4, 0.1, 0.2, 0.3]]},
+        ],
+        schema=schema,
+    )
+    ds = lance.write_dataset(
+        table,
+        pathlib.Path(tmpdir) / "multivector_fragment_ivf",
+        max_rows_per_file=2,
+    )
+    return ds, dimension
+
+
 def test_ivf_centroids(tmpdir, rand_dataset):
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
 
@@ -74,6 +100,31 @@ def test_ivf_centroids(tmpdir, rand_dataset):
     ivf.save(str(tmpdir / "ivf"))
     reloaded = IvfModel.load(str(tmpdir / "ivf"))
     assert reloaded.distance_type == "l2"
+    assert ivf.centroids == reloaded.centroids
+
+
+def test_ivf_centroids_hamming(tmpdir):
+    num_rows = NUM_ROWS
+    vectors = np.random.randint(0, 256, size=(num_rows, DIMENSION), dtype=np.uint8)
+    vectors_flat = vectors.reshape(-1)
+    vectors_arr = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors_flat, type=pa.uint8()), DIMENSION
+    )
+    table = pa.Table.from_arrays([vectors_arr], names=["vectors"])
+    uri = str(tmpdir / "hamming_dataset")
+    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        sample_rate=16, distance_type="hamming"
+    )
+
+    assert ivf.distance_type == "hamming"
+    expected_partitions = round(math.sqrt(num_rows))
+    assert len(ivf.centroids) == expected_partitions
+
+    ivf.save(str(tmpdir / "ivf_hamming"))
+    reloaded = IvfModel.load(str(tmpdir / "ivf_hamming"))
+    assert reloaded.distance_type == "hamming"
     assert ivf.centroids == reloaded.centroids
 
 
@@ -157,6 +208,140 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     reloaded = PqModel.load(str(tmpdir / "pq"))
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
+
+
+def test_ivf_centroids_fragment_ids(tmpdir):
+    rows_per_fragment = 32
+    vectors = np.concatenate(
+        [
+            np.zeros((rows_per_fragment, DIMENSION), dtype=np.float32),
+            np.full((rows_per_fragment, DIMENSION), 10.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    vectors.shape = -1
+    table = pa.Table.from_arrays(
+        [pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)], names=["vectors"]
+    )
+    ds = lance.write_dataset(
+        table,
+        pathlib.Path(tmpdir) / "fragment_ivf",
+        max_rows_per_file=rows_per_fragment,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+
+    first_ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[0]]
+    )
+    second_ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[1]]
+    )
+
+    first_centroid = first_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
+    second_centroid = second_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
+
+    assert np.allclose(first_centroid, 0.0, atol=1e-4)
+    assert np.allclose(second_centroid, 10.0, atol=1e-4)
+
+
+def test_ivf_centroids_multivector_fragment_ids(tmpdir):
+    ds, dimension = make_multivector_dataset(tmpdir)
+    builder = IndicesBuilder(ds, "embeddings")
+    assert builder.dimension == dimension
+
+    centroids = pa.FixedSizeListArray.from_arrays(
+        pa.array(
+            [
+                0.1,
+                0.2,
+                0.3,
+                0.4,
+                0.8,
+                0.7,
+                0.6,
+                0.5,
+            ],
+            type=pa.float32(),
+        ),
+        dimension,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+
+    index = ds.create_index_uncommitted(
+        "embeddings",
+        index_type="IVF_HNSW_SQ",
+        metric="cosine",
+        num_partitions=2,
+        fragment_ids=fragment_ids,
+        index_uuid="00000000-0000-4000-8000-000000000001",
+        ivf_centroids=centroids,
+    )
+
+    assert index.uuid == "00000000-0000-4000-8000-000000000001"
+    assert index.fragment_ids == set(fragment_ids)
+    assert index.name == "embeddings_idx"
+
+
+def test_indices_builder_multivector_distributed_dimensions(tmpdir, monkeypatch):
+    ds, dimension = make_multivector_dataset(tmpdir)
+    builder = IndicesBuilder(ds, "embeddings")
+    centroids = pa.FixedSizeListArray.from_arrays(
+        pa.array([0.1, 0.2, 0.3, 0.4], type=pa.float32()),
+        dimension,
+    )
+    codebook = pa.FixedSizeListArray.from_arrays(
+        pa.array([0.1, 0.2, 0.3, 0.4], type=pa.float32()),
+        dimension,
+    )
+    ivf = IvfModel(centroids, "l2")
+    pq = PqModel(2, codebook)
+
+    from lance.lance import indices
+
+    captured_dimensions = {}
+
+    def train_pq_model(*args):
+        captured_dimensions["train_pq"] = args[2]
+        return codebook
+
+    def transform_vectors(*args):
+        captured_dimensions["transform_vectors"] = args[2]
+
+    def load_shuffled_vectors(*args):
+        captured_dimensions["load_shuffled_vectors"] = args[6]
+
+    monkeypatch.setattr(indices, "train_pq_model", train_pq_model)
+    monkeypatch.setattr(indices, "transform_vectors", transform_vectors)
+    monkeypatch.setattr(indices, "load_shuffled_vectors", load_shuffled_vectors)
+    monkeypatch.setattr(builder, "_verify_pq_sample_rate", lambda *args: None)
+
+    builder.train_pq(ivf, num_subvectors=2, sample_rate=2)
+    builder.transform_vectors(ivf, pq, str(pathlib.Path(tmpdir) / "transformed"))
+    builder.load_shuffled_vectors(["sorted"], str(tmpdir), ivf, pq)
+
+    assert captured_dimensions == {
+        "train_pq": dimension,
+        "transform_vectors": dimension,
+        "load_shuffled_vectors": dimension,
+    }
+
+
+def test_pq_fragment_ids(rand_dataset):
+    fragment_id = rand_dataset.get_fragments()[0].fragment_id
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        num_partitions=4,
+        sample_rate=16,
+        fragment_ids=[fragment_id],
+    )
+
+    pq = IndicesBuilder(rand_dataset, "vectors").train_pq(
+        ivf,
+        sample_rate=2,
+        fragment_ids=[fragment_id],
+    )
+
+    assert pq.dimension == DIMENSION
+    assert pq.num_subvectors == NUM_SUBVECTORS
 
 
 def test_pq_invalid_sub_vectors(tmpdir, rand_dataset, rand_ivf):

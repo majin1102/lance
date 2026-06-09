@@ -235,7 +235,7 @@ impl VectorIndex for PQIndex {
         let pq = self.pq.clone();
         let query = query.clone();
         let num_sub_vectors = self.pq.code_dim() as i32;
-        spawn_cpu(move || {
+        let search = move || {
             let (code, row_ids) = if pre_filter.is_empty() {
                 Ok((code, row_ids))
             } else {
@@ -284,8 +284,8 @@ impl VectorIndex for PQIndex {
                     vec![dists, ids],
                 )?)
             }
-        })
-        .await
+        };
+        spawn_cpu(search).await
     }
 
     fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
@@ -503,6 +503,18 @@ pub async fn build_pq_model(
     params: &PQBuildParams,
     ivf: Option<&IvfModel>,
 ) -> Result<ProductQuantizer> {
+    build_pq_model_in_fragments(dataset, column, dim, metric_type, params, ivf, None).await
+}
+
+pub async fn build_pq_model_in_fragments(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &PQBuildParams,
+    ivf: Option<&IvfModel>,
+    fragment_ids: Option<&[u32]>,
+) -> Result<ProductQuantizer> {
     let num_codes = 2_usize.pow(params.num_bits as u32);
 
     if let Some(codebook) = &params.codebook {
@@ -542,7 +554,7 @@ pub async fn build_pq_model(
     );
     let start = std::time::Instant::now();
     let mut training_data =
-        maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+        maybe_sample_training_data(dataset, column, expected_sample_size, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -624,7 +636,7 @@ pub(crate) fn build_pq_storage(
 mod tests {
     use super::*;
 
-    use std::ops::Range;
+    use std::{ops::Range, sync::Mutex};
 
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
@@ -633,8 +645,10 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowAddrMask;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
     use lance_index::vector::ivf::IvfBuildParams;
+    use lance_select::RowAddrMask;
     use lance_testing::datagen::{
         generate_random_array_with_range, generate_random_array_with_seed,
     };
@@ -712,6 +726,7 @@ mod tests {
             DIM,
             MetricType::Cosine,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -799,11 +814,22 @@ mod tests {
 
     struct TestPreFilter {
         row_ids: Vec<u64>,
+        is_empty_threads: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl TestPreFilter {
         fn new(row_ids: Vec<u64>) -> Self {
-            Self { row_ids }
+            Self {
+                row_ids,
+                is_empty_threads: None,
+            }
+        }
+
+        fn with_thread_capture(row_ids: Vec<u64>, threads: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                row_ids,
+                is_empty_threads: Some(threads),
+            }
         }
     }
 
@@ -814,6 +840,14 @@ mod tests {
         }
 
         fn is_empty(&self) -> bool {
+            if let Some(threads) = &self.is_empty_threads {
+                threads.lock().unwrap().push(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                );
+            }
             self.row_ids.is_empty()
         }
 
@@ -838,5 +872,56 @@ mod tests {
         let (code, row_ids) = PQIndex::filter_arrays(&pre_filter, code, row_ids, 16).unwrap();
         assert!(code.values().is_empty());
         assert!(row_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pq_search_runs_on_cpu_thread_in_sequential_mode() {
+        let codebook_values = Float32Array::from_iter_values((0..256).map(|value| value as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook_values, 1).unwrap();
+        let index = PQIndex {
+            pq: ProductQuantizer::new(1, 8, 1, codebook, DistanceType::L2),
+            code: Some(Arc::new(UInt8Array::from(vec![0, 1, 0]))),
+            row_ids: Some(Arc::new(UInt64Array::from(vec![10, 11, 12]))),
+            metric_type: MetricType::L2,
+            frag_reuse_index: None,
+        };
+        let query = Query {
+            column: "vector".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0])) as ArrayRef,
+            k: 2,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+        };
+        let is_empty_threads = Arc::new(Mutex::new(Vec::new()));
+        let pre_filter = Arc::new(TestPreFilter::with_thread_capture(
+            vec![],
+            is_empty_threads.clone(),
+        ));
+
+        let batch = index
+            .search(&query, pre_filter, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        let is_empty_threads = is_empty_threads.lock().unwrap();
+        assert!(
+            !is_empty_threads.is_empty(),
+            "expected PQ search closure to evaluate the prefilter"
+        );
+        assert!(
+            is_empty_threads
+                .iter()
+                .all(|name| name.contains("lance-cpu")),
+            "expected PQ search closure to run on a lance-cpu thread, got {is_empty_threads:?}"
+        );
     }
 }

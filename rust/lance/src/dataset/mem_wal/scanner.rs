@@ -23,7 +23,7 @@
 //! ```ignore
 //! use lance::dataset::mem_wal::scanner::LsmScanner;
 //!
-//! let scanner = LsmScanner::new(base_table, region_snapshots, vec!["pk".to_string()])
+//! let scanner = LsmScanner::new(base_table, shard_snapshots, vec!["pk".to_string()])
 //!     .project(&["id", "name"])
 //!     .filter("id > 10")?
 //!     .limit(100, None);
@@ -31,16 +31,25 @@
 //! let stream = scanner.try_into_stream().await?;
 //! ```
 
+mod block_list;
 mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
+pub(crate) mod flushed_cache;
+mod fts_search;
 mod planner;
 mod point_lookup;
+mod projection;
 mod vector_search;
 
 pub use builder::LsmScanner;
-pub use collector::{ActiveMemTableRef, LsmDataSourceCollector};
-pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, RegionSnapshot};
+pub use collector::{
+    ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,
+};
+pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
+pub use flushed_cache::FlushedMemTableCache;
+pub use fts_search::{LsmFtsSearchPlanner, SCORE_COLUMN};
 pub use point_lookup::LsmPointLookupPlanner;
-pub use vector_search::{DISTANCE_COLUMN, LsmVectorSearchPlanner};
+pub use projection::DISTANCE_COLUMN;
+pub use vector_search::LsmVectorSearchPlanner;

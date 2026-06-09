@@ -12,15 +12,17 @@ use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
+use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::do_write_fragments;
-use crate::dataset::{DATA_DIR, WriteMode, WriteParams};
+use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases};
+use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
 ///
@@ -136,7 +138,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let data_file_key = generate_random_filename();
         let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
@@ -164,25 +166,29 @@ impl<'a> FragmentCreateBuilder<'a> {
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
-        fragment.physical_rows = Some(writer.finish().await? as usize);
+        let write_summary = writer.finish().await?;
+        fragment.physical_rows = Some(write_summary.num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        let field_ids = writer
+        let field_ids: Arc<[i32]> = writer
             .field_id_to_column_indices()
             .iter()
             .map(|(field_id, _)| *field_id as i32)
-            .collect::<Vec<_>>();
-        let column_indices = writer
+            .collect::<Vec<_>>()
+            .into();
+        let column_indices: Arc<[i32]> = writer
             .field_id_to_column_indices()
             .iter()
             .map(|(_, column_index)| *column_index as i32)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .into();
 
         fragment.files[0].fields = field_ids;
         fragment.files[0].column_indices = column_indices;
+        fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
 
         progress.complete(&fragment).await?;
 
@@ -193,11 +199,27 @@ impl<'a> FragmentCreateBuilder<'a> {
         stream: SendableRecordBatchStream,
         schema: Schema,
     ) -> Result<Vec<Fragment>> {
-        let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+        let mut params = self.write_params.cloned().unwrap_or_default();
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let version = params.data_storage_version.unwrap_or_default();
+        let needs_existing_dataset = params.target_base_names_or_paths.is_some()
+            || params.target_bases.is_some()
+            || params.initial_bases.is_some();
+        let existing_dataset = if needs_existing_dataset {
+            self.existing_dataset(&params).await?
+        } else {
+            None
+        };
+        let existing_base_paths = existing_dataset
+            .as_ref()
+            .map(|dataset| &dataset.manifest.base_paths);
+        let target_bases_info = if needs_existing_dataset {
+            validate_and_resolve_target_bases(&mut params, existing_base_paths).await?
+        } else {
+            None
+        };
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -205,14 +227,14 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
         do_write_fragments(
-            None,
+            existing_dataset.as_ref(),
             object_store,
             &base_path,
             &schema,
             stream,
-            params.into_owned(),
+            params,
             version,
-            None, // Fragment creation doesn't use target_bases
+            target_bases_info,
         )
         .await
     }
@@ -244,7 +266,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         .await?;
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
@@ -310,6 +332,25 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
     }
 
+    async fn existing_dataset(&self, params: &WriteParams) -> Result<Option<Dataset>> {
+        let mut builder = DatasetBuilder::from_uri(self.dataset_uri).with_read_params(ReadParams {
+            store_options: params.store_params.clone(),
+            commit_handler: params.commit_handler.clone(),
+            session: params.session.clone(),
+            ..Default::default()
+        });
+        if let Some(base_store_params) = &params.base_store_params {
+            for (base_path, store_params) in base_store_params {
+                builder = builder.with_base_store_params(base_path, store_params.clone());
+            }
+        }
+        match builder.load().await {
+            Ok(dataset) => Ok(Some(dataset)),
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
         if actual.fields().is_empty() {
             return Err(Error::invalid_input("Cannot write with an empty schema."));
@@ -331,9 +372,11 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::{TempDir, TempStrDir};
+    use lance_table::format::BasePath;
     use rstest::rstest;
 
     use super::*;
+    use crate::dataset::InsertBuilder;
 
     fn test_data() -> Box<dyn RecordBatchReader + Send> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -414,7 +457,7 @@ mod tests {
         assert_eq!(fragment.id, 0);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![0, 1]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
@@ -437,8 +480,8 @@ mod tests {
         assert_eq!(fragment.id, 42);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![3, 1]);
-        assert_eq!(fragment.files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
+        assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
@@ -500,7 +543,7 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].deletion_file, None);
         assert_eq!(fragments[0].files.len(), 1);
-        assert_eq!(fragments[0].files[0].fields, vec![0, 1]);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
@@ -521,13 +564,46 @@ mod tests {
         assert_eq!(fragments.len(), 3);
         assert_eq!(fragments[0].deletion_file, None);
         assert_eq!(fragments[0].files.len(), 1);
-        assert_eq!(fragments[0].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[0].files[0].column_indices.as_ref(), &[0, 1]);
         assert_eq!(fragments[1].deletion_file, None);
         assert_eq!(fragments[1].files.len(), 1);
-        assert_eq!(fragments[1].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[1].files[0].column_indices.as_ref(), &[0, 1]);
         assert_eq!(fragments[2].deletion_file, None);
         assert_eq!(fragments[2].files.len(), 1);
-        assert_eq!(fragments[2].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[2].files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_with_target_base() {
+        let primary = TempStrDir::default();
+        let base1 = TempStrDir::default();
+        let base2 = TempStrDir::default();
+        let create_params = WriteParams::default()
+            .with_initial_bases(vec![
+                BasePath::new(0, base1.to_string(), Some("base1".to_string()), false),
+                BasePath::new(0, base2.to_string(), Some("base2".to_string()), false),
+            ])
+            .with_target_base_names_or_paths(vec!["base1".to_string()]);
+
+        let dataset = InsertBuilder::new(primary.as_str())
+            .with_params(&create_params)
+            .execute_stream(test_data())
+            .await
+            .unwrap();
+
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }
+        .with_target_base_names_or_paths(vec!["base2".to_string()]);
+        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+            .write_params(&append_params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].files[0].base_id, Some(2));
     }
 
     #[rstest]

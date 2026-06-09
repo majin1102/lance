@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
@@ -12,7 +16,7 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::{Error, Result, cache::LanceCache};
+use lance_core::{Error, Result, cache::LanceCache, utils::parse::str_is_truthy};
 use log::trace;
 use tokio::task::JoinHandle;
 
@@ -34,6 +38,20 @@ use crate::{
     repdef::RepDefBuilder,
     utils::accumulation::AccumulationQueue,
 };
+
+/// When set, indirect I/O in the 2.0 list scheduler bypasses the backpressure system.
+///
+/// This can be a blunt instrument to avoid deadlocks in 2.0 scenarios
+/// Set LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE=1 to enable.
+static BYPASS_INDIRECT_IO_BACKPRESSURE: OnceLock<bool> = OnceLock::new();
+
+fn bypass_indirect_io_backpressure() -> bool {
+    *BYPASS_INDIRECT_IO_BACKPRESSURE.get_or_init(|| {
+        std::env::var("LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE")
+            .map(|val| str_is_truthy(&val))
+            .unwrap_or(false)
+    })
+}
 
 // Scheduling lists is tricky.  Imagine the following scenario:
 //
@@ -330,7 +348,7 @@ async fn indirect_schedule_task(
     // pages.  We can use a dummy receiver to match the decoder API
     offsets_decoder.wait_for_loaded(num_offsets - 1).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
-    let offsets = decode_task.task.decode()?;
+    let (offsets, _) = decode_task.task.decode()?;
 
     let (item_ranges, offsets, validity) =
         decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
@@ -454,7 +472,12 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
         let items_type = self.scheduler.items_field.data_type().clone();
-        let io = context.io().clone();
+        let base_io = context.io().clone();
+        let io = if bypass_indirect_io_backpressure() {
+            base_io.with_bypass_backpressure().unwrap_or(base_io)
+        } else {
+            base_io
+        };
         let cache = context.cache().clone();
 
         // Immediately spawn the indirect scheduling
@@ -615,13 +638,13 @@ struct ListDecodeTask {
 }
 
 impl DecodeArrayTask for ListDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let items = self
             .items
             .map(|items| {
                 // When we run the indirect I/O we wrap things in a struct array with a single field
                 // named "item".  We can unwrap that now.
-                let wrapped_items = items.decode()?;
+                let (wrapped_items, _) = items.decode()?;
                 Result::Ok(wrapped_items.as_struct().column(0).clone())
             })
             .unwrap_or_else(|| Ok(new_empty_array(self.items_field.data_type())))?;
@@ -640,33 +663,36 @@ impl DecodeArrayTask for ListDecodeTask {
         };
         let min_offset = UInt64Array::new_scalar(offsets.value(0));
         let offsets = arrow_arith::numeric::sub(&offsets, &min_offset)?;
-        match &self.offset_type {
+        let array: ArrayRef = match &self.offset_type {
             DataType::Int32 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int32)?;
                 let offsets_i32 = offsets.as_primitive::<Int32Type>();
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
-                Ok(Arc::new(ListArray::try_new(
+                Arc::new(ListArray::try_new(
                     self.items_field.clone(),
                     offsets,
                     items,
                     validity,
-                )?))
+                )?)
             }
             DataType::Int64 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int64)?;
                 let offsets_i64 = offsets.as_primitive::<Int64Type>();
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
-                Ok(Arc::new(LargeListArray::try_new(
+                Arc::new(LargeListArray::try_new(
                     self.items_field.clone(),
                     offsets,
                     items,
                     validity,
-                )?))
+                )?)
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
-        }
+        };
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((array, 0))
     }
 }
 

@@ -3,10 +3,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_select::RowAddrTreeMap;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
@@ -47,7 +48,11 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    timeout: Option<Duration>,
 }
+
+/// Default timeout applied to [`CommitBuilder::execute`] when none is set.
+pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
@@ -64,6 +69,7 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             affected_rows: None,
             transaction_properties: None,
+            timeout: Some(DEFAULT_COMMIT_TIMEOUT),
         }
     }
 
@@ -169,6 +175,25 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Set a timeout for the commit operation.
+    ///
+    /// The timeout bounds the *entire* [`Self::execute`] / [`Self::execute_batch`]
+    /// call, including all conflict retries — it is not applied per attempt.
+    /// Pass `None` to disable the timeout entirely.
+    ///
+    /// The default is 30 minutes (see [`DEFAULT_COMMIT_TIMEOUT`]).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `timeout` is `Some(Duration::ZERO)` (raised
+    ///   when [`Self::execute`] is called, not here).
+    /// - [`Error::Timeout`] if the operation does not complete within the
+    ///   timeout.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// provide Configuration key-value pairs associated with this transaction.
     /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
     /// this properties map will be persisted as a part of the transaction object
@@ -181,6 +206,32 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        let timeout = self.timeout;
+        if let Some(t) = timeout
+            && t.is_zero()
+        {
+            return Err(Error::invalid_input(
+                "CommitBuilder timeout must be non-zero; pass `None` to disable",
+            ));
+        }
+        // Box the inner future so wrapping it in `tokio::time::Timeout` does
+        // not deepen the future type — downstream `async fn`s that await
+        // `execute` otherwise hit the compiler's layout-query depth limit.
+        let fut = Box::pin(self.execute_inner(transaction));
+        match timeout {
+            Some(t) => match tokio::time::timeout(t, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(Error::timeout(format!(
+                    "Commit timed out after {:?}. Increase the timeout via \
+                     CommitBuilder::with_timeout or pass `None` to disable.",
+                    t
+                ))),
+            },
+            None => fut.await,
+        }
+    }
+
+    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -193,9 +244,10 @@ impl<'a> CommitBuilder<'a> {
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
-                let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
+                let commit_handler = if let (Some(_), Some(commit_handler)) =
+                    (&self.object_store, &self.commit_handler)
                 {
-                    self.commit_handler.as_ref().unwrap().clone()
+                    commit_handler.clone()
                 } else {
                     resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
                         .await?
@@ -403,6 +455,7 @@ impl<'a> CommitBuilder<'a> {
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
+                    base_store_params: None,
                 })
             }
         }
@@ -485,8 +538,8 @@ mod tests {
             id: 0,
             files: vec![DataFile {
                 path: "file.lance".to_string(),
-                fields: vec![0],
-                column_indices: vec![0],
+                fields: Arc::from([0]),
+                column_indices: Arc::from([0]),
                 file_major_version: major_version,
                 file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
@@ -538,7 +591,7 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
         assert_io_gt!(io_stats, write_iops, 0);
 
@@ -554,11 +607,12 @@ mod tests {
             // we shouldn't need to read anything from disk. Except we do need
             // to check for the latest version to see if we need to do conflict
             // resolution.
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 1, "check latest version, i = {} ", i);
             // Should see 2 IOPs:
             // 1. Write the transaction files
             // 2. Write (conditional put) the manifest
+            // (the version hint is only written on non-lexically-ordered stores)
             assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest, i = {}", i);
         }
 
@@ -572,7 +626,7 @@ mod tests {
         // Session should still be re-used
         // However, the dataset needs to be loaded and the read version checked out,
         // so an additional 4 IOPs are needed.
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
@@ -587,7 +641,7 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 10);
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
     }
@@ -617,7 +671,7 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store().io_stats_incremental(); // Reset the stats
+        dataset.object_store.as_ref().io_stats_incremental(); // Reset the stats
         let read_version = dataset.manifest().version;
         let new_ds = CommitBuilder::new(Arc::new(dataset))
             .execute(sample_transaction(read_version))
@@ -625,9 +679,9 @@ mod tests {
             .unwrap();
 
         // Assert io requests
-        let io_stats = new_ds.object_store().io_stats_incremental();
+        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
         // This could be zero, if we decided to be optimistic. However, that
-        // would mean two wasted write requests (txn + manifest) if there was
+        // would mean wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
         assert_io_eq!(io_stats, read_iops, 1);
         assert_io_eq!(io_stats, write_iops, 2);
@@ -683,14 +737,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         let new_ds = CommitBuilder::new(original_dataset.clone())
             .execute(sample_transaction(original_dataset.manifest().version))
             .await
             .unwrap();
 
-        let io_stats = new_ds.object_store().io_stats_incremental();
+        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
 
         // If there is a conflict with two transaction, the retry should require io requests:
         // * 1 list version
@@ -714,6 +768,163 @@ mod tests {
             assert_io_lt!(io_stats, num_stages, 6);
         }
         assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
+    }
+
+    #[test]
+    fn test_commit_timeout_default_is_thirty_minutes() {
+        let builder = CommitBuilder::new("memory://default-timeout");
+        assert_eq!(builder.timeout, Some(DEFAULT_COMMIT_TIMEOUT));
+        assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(1800));
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_zero_rejected() {
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://test")
+                .execute(vec![
+                    RecordBatch::try_new(
+                        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                            "i",
+                            DataType::Int32,
+                            false,
+                        )])),
+                        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                    )
+                    .unwrap(),
+                ])
+                .await
+                .unwrap(),
+        );
+        let res = CommitBuilder::new(dataset.clone())
+            .with_timeout(Some(Duration::ZERO))
+            .execute(sample_transaction(1))
+            .await;
+        assert!(
+            matches!(res, Err(Error::InvalidInput { .. })),
+            "got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_triggers() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(5),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let res = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(Some(Duration::from_millis(50)))
+            .execute(sample_transaction(1))
+            .await;
+        let err = res.expect_err("commit should time out");
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_applies_to_execute_batch() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(5),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://batch-timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let res = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(Some(Duration::from_millis(50)))
+            .execute_batch(vec![sample_transaction(1)])
+            .await;
+        let Err(err) = res else {
+            panic!("commit should time out");
+        };
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
+    }
+
+    /// `with_timeout(None)` must let a commit run unbounded. Uses a throttled
+    /// store so the commit takes real wall-clock time — long enough that the
+    /// 50ms timeout in `test_commit_timeout_triggers` would have fired.
+    #[tokio::test]
+    async fn test_commit_timeout_none_disables() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(200),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://no-timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let new_ds = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(None)
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(new_ds.manifest.version, 2);
     }
 
     #[tokio::test]
@@ -753,6 +964,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             read_version: 1,
             tag: None,
@@ -782,5 +994,83 @@ mod tests {
             matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
+    }
+
+    /// On non-lexically-ordered stores (e.g. S3 Express) a commit should use the
+    /// version hint (a few HEAD probes, O(k)) instead of a full O(n) listing.
+    #[tokio::test]
+    async fn test_commit_uses_version_hint_on_non_lexical_store() {
+        // Make `list` artificially slow per entry so a full listing would be
+        // obvious; HEAD/GET/PUT stay fast.
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_entry: Duration::from_millis(50),
+                wait_get_per_call: Duration::from_millis(1),
+                wait_put_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                list_is_lexically_ordered: Some(false),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let mut dataset = Arc::new(
+            InsertBuilder::new("memory://test_version_hint")
+                .with_params(&write_params)
+                .execute(vec![batch])
+                .await
+                .unwrap(),
+        );
+
+        // Build up many versions so a full listing would be expensive.
+        for _ in 0..50 {
+            dataset = Arc::new(
+                CommitBuilder::new(dataset.clone())
+                    .execute(sample_transaction(dataset.manifest().version))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(dataset.manifest().version, 51);
+
+        dataset.object_store.as_ref().io_stats_incremental();
+
+        let start = std::time::Instant::now();
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .execute(sample_transaction(dataset.manifest().version))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // A full listing of ~52 entries at 50ms each would take ~2.6s.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "commit took {elapsed:?}; the version hint path was likely not used"
+        );
+
+        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        assert!(
+            io_stats.read_iops < 10,
+            "read_iops = {}; a full listing was likely used",
+            io_stats.read_iops
+        );
     }
 }

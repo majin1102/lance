@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{MergeInsertParams, WhenNotMatchedBySource};
+use super::{MERGE_SOURCE_SENTINEL, MergeInsertParams, WhenNotMatchedBySource};
 use crate::{Result, dataset::WhenMatched};
+use datafusion::common::{
+    Column, TableReference,
+    tree_node::{Transformed, TransformedResult, TreeNode},
+};
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{Case, Expr, col};
 
@@ -50,48 +54,50 @@ impl Action {
     }
 }
 
+fn qualify_unqualified_columns(expr: Expr, relation: &'static str) -> Result<Expr> {
+    expr.transform(|expr| {
+        Ok(if let Expr::Column(column) = expr {
+            if column.relation.is_none() {
+                let qualified = Column::new_unqualified(column.name)
+                    .with_relation(TableReference::bare(relation));
+                Transformed::yes(Expr::Column(qualified))
+            } else {
+                Transformed::no(Expr::Column(column))
+            }
+        } else {
+            Transformed::no(expr)
+        })
+    })
+    .data()
+    .map_err(crate::Error::from)
+}
+
 /// Transforms merge insert parameters into a logical expression. The output
 /// is a single "action" column, that describes what to do with each row.
 pub fn merge_insert_action(
     params: &MergeInsertParams,
     schema: Option<&arrow_schema::Schema>,
 ) -> Result<Expr> {
-    // Check that at least one key column is non-null in the source
-    // This ensures we only process rows that have valid join keys
-    // Note: Column names are wrapped in double quotes to preserve case
-    // (DataFusion's col() function lowercases unquoted identifiers)
-    let source_has_key: Expr = if params.on.len() == 1 {
-        // Single key column case - check if the source key column is not null
-        // Need to qualify the column to avoid ambiguity between target.key and source.key
-        col(format!("source.\"{}\"", &params.on[0])).is_not_null()
-    } else {
-        // Multiple key columns - require that ALL key columns are non-null
-        // This is a stricter requirement than "at least one" to ensure proper joins
-        let key_conditions: Vec<Expr> = params
-            .on
-            .iter()
-            .map(|key| col(format!("source.\"{}\"", key)).is_not_null())
-            .collect();
+    // Use a sentinel column to detect whether the source side contributed a row to the
+    // join output.  This is NULL-safe: the sentinel is `true` for every source row and
+    // is NULL-filled by the outer join for target-only rows, regardless of whether any
+    // ON column contains NULL.  Using ON key columns for this purpose is incorrect
+    // because a key column that is legitimately NULL is indistinguishable from a NULL
+    // introduced by the outer join on the target side.
+    let source_has_row = col(format!("source.\"{}\"", MERGE_SOURCE_SENTINEL)).is_not_null();
 
-        // Use AND to combine all key column checks (all must be non-null)
-        key_conditions
-            .into_iter()
-            .reduce(|acc, expr| acc.and(expr))
-            .unwrap_or_else(|| datafusion_expr::lit(false))
-    };
+    let target_has_row = col("target._rowaddr").is_not_null();
+    let matched = source_has_row.clone().and(target_has_row.clone());
 
-    let row_addr_is_not_null = col("target._rowaddr").is_not_null();
-    let matched = source_has_key.clone().and(row_addr_is_not_null);
+    let source_only = source_has_row.and(col("target._rowaddr").is_null());
 
-    let row_addr_is_null = col("target._rowaddr").is_null();
-    let not_matched_in_target = source_has_key.and(row_addr_is_null);
-
-    let not_matched_in_source = col("target._rowaddr").is_null().is_not_true();
+    let target_only =
+        target_has_row.and(col(format!("source.\"{}\"", MERGE_SOURCE_SENTINEL)).is_null());
 
     let mut cases = vec![];
 
     if params.insert_not_matched {
-        cases.push((not_matched_in_target, Action::Insert.as_literal_expr()));
+        cases.push((source_only, Action::Insert.as_literal_expr()));
     }
 
     match &params.when_matched {
@@ -119,6 +125,12 @@ pub fn merge_insert_action(
                 ));
             }
         }
+        WhenMatched::UpdateIfExpr(condition) => {
+            cases.push((
+                matched.and(condition.clone()),
+                Action::UpdateAll.as_literal_expr(),
+            ));
+        }
         WhenMatched::DoNothing => {}
         WhenMatched::Fail => {
             cases.push((matched, Action::Fail.as_literal_expr()));
@@ -130,11 +142,12 @@ pub fn merge_insert_action(
 
     match &params.delete_not_matched_by_source {
         WhenNotMatchedBySource::Delete => {
-            cases.push((not_matched_in_source, Action::Delete.as_literal_expr()));
+            cases.push((target_only, Action::Delete.as_literal_expr()));
         }
         WhenNotMatchedBySource::DeleteIf(condition) => {
+            let target_condition = qualify_unqualified_columns(condition.clone(), "target")?;
             cases.push((
-                not_matched_in_source.and(condition.clone()),
+                target_only.and(target_condition),
                 Action::Delete.as_literal_expr(),
             ));
         }

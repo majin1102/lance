@@ -89,26 +89,35 @@ use std::sync::Arc;
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::transaction::{
+    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+};
 use super::utils::make_rowid_capture_stream;
-use super::{WriteMode, WriteParams, write_fragments_internal};
+use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
+use crate::index::DatasetIndexExt;
 use crate::io::commit::{commit_transaction, migrate_fragments};
+use arrow::array::AsArray;
+use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
+use arrow_array::Array;
+use arrow_array::RecordBatch;
+use arrow_array::StructArray;
+use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
+use arrow_buffer::NullBuffer;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
-use lance_core::datatypes::BlobHandling;
+use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
-use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 mod binary_copy;
 pub mod remapping;
@@ -201,6 +210,19 @@ pub struct CompactionOptions {
     /// Controls how much data is read at once when performing binary copy.
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
+    /// Maximum number of source fragments to compact in a single run. When set,
+    /// tasks are included in the plan until adding the next task would exceed
+    /// this limit. This allows for incremental compaction (e.g., compact 20
+    /// fragments at a time).
+    /// Defaults to `None` (no limit, all eligible fragments are compacted).
+    pub max_source_fragments: Option<usize>,
+    /// Transaction properties to store with this commit.
+    ///
+    /// These key-value pairs are stored in the transaction file
+    /// and can be read later to identify the source of the commit
+    /// (e.g., job_id for tracking completed compaction jobs).
+    #[serde(skip)]
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[allow(deprecated)]
@@ -220,12 +242,138 @@ impl Default for CompactionOptions {
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
+            max_source_fragments: None,
+            transaction_properties: None,
         }
     }
 }
 
+/// Config key prefix for compaction options stored in the dataset manifest.
+pub const COMPACTION_CONFIG_PREFIX: &str = "lance.compaction.";
+
 #[allow(deprecated)]
 impl CompactionOptions {
+    /// Create [`CompactionOptions`] by starting with defaults and applying any
+    /// overrides found in the dataset manifest config.
+    ///
+    /// Config keys are prefixed with `lance.compaction.` and map to fields:
+    /// - `lance.compaction.target_rows_per_fragment`
+    /// - `lance.compaction.max_rows_per_group`
+    /// - `lance.compaction.max_bytes_per_file`
+    /// - `lance.compaction.materialize_deletions`
+    /// - `lance.compaction.materialize_deletions_threshold`
+    /// - `lance.compaction.defer_index_remap`
+    /// - `lance.compaction.batch_size`
+    /// - `lance.compaction.compaction_mode`
+    /// - `lance.compaction.binary_copy_read_batch_bytes`
+    /// - `lance.compaction.max_source_fragments`
+    pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
+        let mut opts = Self::default();
+        opts.apply_dataset_config(config)?;
+        Ok(opts)
+    }
+
+    /// Apply overrides from the dataset manifest config to this options struct.
+    ///
+    /// Only fields with corresponding config keys are modified; other fields
+    /// retain their current values.
+    pub fn apply_dataset_config(&mut self, config: &HashMap<String, String>) -> Result<()> {
+        for (key, value) in config {
+            let Some(field) = key.strip_prefix(COMPACTION_CONFIG_PREFIX) else {
+                continue;
+            };
+            match field {
+                "target_rows_per_fragment" => {
+                    self.target_rows_per_fragment = value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?;
+                }
+                "max_rows_per_group" => {
+                    self.max_rows_per_group = value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?;
+                }
+                "max_bytes_per_file" => {
+                    self.max_bytes_per_file = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "materialize_deletions" => {
+                    self.materialize_deletions = match value.to_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected 'true' or 'false')",
+                                key, value
+                            )));
+                        }
+                    };
+                }
+                "materialize_deletions_threshold" => {
+                    self.materialize_deletions_threshold = value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a float between 0.0 and 1.0)",
+                            key, value
+                        ))
+                    })?;
+                }
+                "defer_index_remap" => {
+                    self.defer_index_remap = match value.to_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected 'true' or 'false')",
+                                key, value
+                            )));
+                        }
+                    };
+                }
+                "batch_size" => {
+                    self.batch_size = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "compaction_mode" => {
+                    self.compaction_mode = Some(CompactionMode::try_from(value.as_str())?);
+                }
+                "binary_copy_read_batch_bytes" => {
+                    self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_source_fragments" => {
+                    self.max_source_fragments = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                _ => {
+                    warn!("Ignoring unknown compaction config key: {}", key);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&mut self) {
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
@@ -246,6 +394,12 @@ impl CompactionOptions {
             (true, false) => CompactionMode::TryBinaryCopy,
             _ => CompactionMode::Reencode,
         }
+    }
+
+    /// Set transaction properties to store in the commit manifest.
+    pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.transaction_properties = Some(Arc::new(properties));
+        self
     }
 }
 
@@ -355,12 +509,13 @@ async fn can_use_binary_copy_impl(
 
             // check file global buffer
             let object_store = match data_file.base_id {
-                Some(base_id) => dataset.object_store_for_base(base_id).await?,
+                Some(base_id) => dataset.object_store(Some(base_id)).await?,
                 None => dataset.object_store.clone(),
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
-                .child(data_file.path.as_str());
+                .clone()
+                .join(data_file.path.as_str());
             let scan_scheduler = ScanScheduler::new(
                 object_store.clone(),
                 SchedulerConfig::max_bandwidth(&object_store),
@@ -470,7 +625,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     Err(e) => Err(e),
                 }
             })
-            .buffered(dataset.object_store().io_parallelism());
+            .buffered(dataset.object_store.as_ref().io_parallelism());
 
         let index_fragmaps = load_index_fragmaps(dataset).await?;
         let indices_containing_frag = |frag_id: u32| {
@@ -551,17 +706,31 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let final_bins = candidate_bins
+        let all_tasks: Vec<TaskData> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
-            });
+            })
+            .collect();
+
+        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
+            let mut total_frags = 0;
+            all_tasks
+                .into_iter()
+                .take_while(|task| {
+                    total_frags += task.fragments.len();
+                    total_frags <= max_frags
+                })
+                .collect()
+        } else {
+            all_tasks
+        };
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
-        compaction_plan.extend_tasks(final_bins);
+        compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
     }
@@ -697,6 +866,326 @@ impl CompactionPlan {
     }
 }
 
+/// Classification for one blob v2 row during compaction.
+///
+/// - `Null`: NULL row or Inline blob with position=0 and size=0.
+/// - `External`: External blob referenced by URI.
+/// - `DataBlob`: Inline/Packed/Dedicated blob stored in Lance files.
+enum RowClass {
+    Null,
+    External,
+    DataBlob,
+}
+
+/// Check if a row is a null Inline blob.
+///
+/// This matches `BlobV2StructuralEncoder`'s behavior of encoding null rows as
+/// Inline with position=0 and size=0, and `collect_blob_entries_v2`'s behavior
+/// of skipping them.
+fn is_inline_null_blob(
+    kind: BlobKind,
+    position_col: &arrow::array::UInt64Array,
+    size_col: &arrow::array::UInt64Array,
+    index: usize,
+) -> bool {
+    if kind != BlobKind::Inline {
+        return false;
+    }
+    let position_is_empty = position_col.is_null(index) || position_col.value(index) == 0;
+    let size_is_empty = size_col.is_null(index) || size_col.value(index) == 0;
+    position_is_empty && size_is_empty
+}
+
+/// Column views for the 5 fields in a blob v2 descriptor struct.
+struct BlobV2Descriptor<'a> {
+    kind_col: &'a arrow::array::UInt8Array,
+    position_col: &'a arrow::array::UInt64Array,
+    size_col: &'a arrow::array::UInt64Array,
+    blob_uri_col: &'a arrow::array::StringArray,
+    blob_id_col: &'a arrow::array::UInt32Array,
+}
+
+impl<'a> BlobV2Descriptor<'a> {
+    /// Extract the 5 descriptor arrays from a blob v2 descriptor struct array.
+    fn try_from_struct(struct_arr: &'a StructArray, column_name: &str) -> Result<Self> {
+        let kind_col = struct_arr
+            .column_by_name("kind")
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob v2 descriptor for column '{}' missing `kind` field",
+                    column_name
+                ))
+            })?
+            .as_primitive::<UInt8Type>();
+        let position_col = struct_arr
+            .column_by_name("position")
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob v2 descriptor for column '{}' missing `position` field",
+                    column_name
+                ))
+            })?
+            .as_primitive::<UInt64Type>();
+        let size_col = struct_arr
+            .column_by_name("size")
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob v2 descriptor for column '{}' missing `size` field",
+                    column_name
+                ))
+            })?
+            .as_primitive::<UInt64Type>();
+        let blob_uri_col = struct_arr
+            .column_by_name("blob_uri")
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob v2 descriptor for column '{}' missing `blob_uri` field",
+                    column_name
+                ))
+            })?
+            .as_string::<i32>();
+        let blob_id_col = struct_arr
+            .column_by_name("blob_id")
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob v2 descriptor for column '{}' missing `blob_id` field",
+                    column_name
+                ))
+            })?
+            .as_primitive::<UInt32Type>();
+        Ok(Self {
+            kind_col,
+            position_col,
+            size_col,
+            blob_uri_col,
+            blob_id_col,
+        })
+    }
+}
+
+/// Result of row classification for blob v2 compaction.
+struct RowClassification {
+    row_classes: Vec<RowClass>,
+    blob_read_addrs: Vec<u64>,
+}
+
+/// Classify each row of a blob v2 column as Null, External, or DataBlob.
+fn classify_rows(
+    struct_arr: &StructArray,
+    descriptor: &BlobV2Descriptor<'_>,
+    row_addrs: &arrow::array::UInt64Array,
+    column_name: &str,
+) -> Result<RowClassification> {
+    let num_rows = struct_arr.len();
+    let mut row_classes = Vec::with_capacity(num_rows);
+    let mut blob_read_addrs = Vec::with_capacity(num_rows);
+
+    for i in 0..num_rows {
+        if struct_arr.is_null(i) || descriptor.kind_col.is_null(i) {
+            row_classes.push(RowClass::Null);
+        } else {
+            let kind = BlobKind::try_from(descriptor.kind_col.value(i)).map_err(|e| {
+                Error::internal(format!(
+                    "Blob v2 column '{}' has invalid kind at row {}: {e}",
+                    column_name, i
+                ))
+            })?;
+            if kind == BlobKind::External {
+                row_classes.push(RowClass::External);
+            } else if is_inline_null_blob(kind, descriptor.position_col, descriptor.size_col, i) {
+                row_classes.push(RowClass::Null);
+            } else {
+                row_classes.push(RowClass::DataBlob);
+                blob_read_addrs.push(row_addrs.value(i));
+            }
+        }
+    }
+
+    Ok(RowClassification {
+        row_classes,
+        blob_read_addrs,
+    })
+}
+
+/// Build a blob v2 user-view struct array from classification and descriptor.
+///
+/// Reads blob data lazily using row addresses to avoid materializing all blob
+/// payloads in memory at once.
+async fn build_user_view_struct(
+    dataset: &Arc<Dataset>,
+    descriptor: &BlobV2Descriptor<'_>,
+    classification: &RowClassification,
+    column_name: &str,
+    num_rows: usize,
+    null_buffer: Option<NullBuffer>,
+) -> Result<StructArray> {
+    let blob_files = if classification.blob_read_addrs.is_empty() {
+        Vec::new()
+    } else {
+        super::blob::take_blobs_by_addresses(dataset, &classification.blob_read_addrs, column_name)
+            .await?
+    };
+
+    let mut data_builder = LargeBinaryBuilder::with_capacity(num_rows, 0);
+    let mut uri_builder = StringBuilder::with_capacity(num_rows, 0);
+    let mut out_position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
+    let mut out_size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
+
+    let mut blob_file_idx = 0;
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..num_rows {
+        match classification.row_classes[i] {
+            RowClass::Null => {
+                data_builder.append_null();
+                uri_builder.append_null();
+                out_position_builder.append_null();
+                out_size_builder.append_null();
+            }
+            RowClass::External => {
+                data_builder.append_null();
+                let base_id = descriptor.blob_id_col.value(i);
+                let uri_val = descriptor.blob_uri_col.value(i);
+                if base_id == 0 {
+                    uri_builder.append_value(uri_val);
+                } else {
+                    let base = dataset.manifest().base_paths.get(&base_id).ok_or_else(|| {
+                        Error::internal(format!(
+                            "External blob in column '{}' references unknown base_id {}",
+                            column_name, base_id
+                        ))
+                    })?;
+                    let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
+                    uri_builder.append_value(&absolute_uri);
+                }
+                if descriptor.position_col.is_null(i) {
+                    out_position_builder.append_null();
+                } else {
+                    out_position_builder.append_value(descriptor.position_col.value(i));
+                }
+                if descriptor.size_col.is_null(i) {
+                    out_size_builder.append_null();
+                } else {
+                    out_size_builder.append_value(descriptor.size_col.value(i));
+                }
+            }
+            RowClass::DataBlob => {
+                let data = blob_files[blob_file_idx].read().await?;
+                blob_file_idx += 1;
+                data_builder.append_value(data.as_ref());
+                uri_builder.append_null();
+                out_position_builder.append_null();
+                out_size_builder.append_null();
+            }
+        }
+    }
+
+    Ok(StructArray::try_new(
+        lance_core::datatypes::BLOB_V2_USER_FIELDS.clone(),
+        vec![
+            Arc::new(data_builder.finish()),
+            Arc::new(uri_builder.finish()),
+            Arc::new(out_position_builder.finish()),
+            Arc::new(out_size_builder.finish()),
+        ],
+        null_buffer,
+    )?)
+}
+
+async fn transform_blob_v2_batch(
+    dataset: &Arc<Dataset>,
+    schema: &lance_core::datatypes::Schema,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    let row_addr_idx = batch
+        .schema()
+        .column_with_name(lance_core::ROW_ADDR)
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "_rowaddr column missing from batch for blob v2 compaction, columns: {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>()
+            ))
+        })?
+        .0;
+    let row_addrs = batch.column(row_addr_idx).as_primitive::<UInt64Type>();
+
+    let mut new_columns: Vec<Arc<dyn Array>> = Vec::new();
+    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
+
+    let batch_schema = batch.schema();
+    for (col_idx, field) in batch_schema.fields().iter().enumerate() {
+        if field.name() == lance_core::ROW_ADDR {
+            continue;
+        }
+
+        let lance_field = schema.field(field.name());
+        let is_blob_v2 = lance_field.is_some_and(|f| f.is_blob_v2());
+
+        if !is_blob_v2 {
+            new_columns.push(batch.column(col_idx).clone());
+            new_fields.push(field.clone());
+            continue;
+        }
+
+        let struct_arr = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob v2 column '{}' expected StructArray, got {:?}",
+                    field.name(),
+                    batch.column(col_idx).data_type()
+                ))
+            })?;
+
+        let column_name = field.name();
+        let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, column_name)?;
+        let classification = classify_rows(struct_arr, &descriptor, row_addrs, column_name)?;
+        let num_rows = struct_arr.len();
+
+        let new_struct = build_user_view_struct(
+            dataset,
+            &descriptor,
+            &classification,
+            column_name,
+            num_rows,
+            struct_arr.nulls().cloned(),
+        )
+        .await?;
+
+        new_columns.push(Arc::new(new_struct));
+        let logical_field = arrow_schema::Field::from(lance_field.ok_or_else(|| {
+            Error::internal(format!(
+                "Blob v2 column '{}' missing from dataset schema during compaction",
+                field.name()
+            ))
+        })?);
+        new_fields.push(Arc::new(
+            arrow_schema::Field::new(
+                field.name(),
+                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                field.is_nullable(),
+            )
+            .with_metadata(logical_field.metadata().clone()),
+        ));
+    }
+
+    let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        new_fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+        batch_schema.metadata().clone(),
+    ));
+
+    Ok(RecordBatch::try_new(new_schema, new_columns)?)
+}
+
 /// Build a scan reader for rewrite and optionally capture row IDs.
 ///
 /// Parameters:
@@ -715,6 +1204,7 @@ impl CompactionPlan {
 ///   to feed the rewrite path.
 /// - `Option<Receiver<CapturedRowIds>>`: A receiver to obtain captured row IDs after the
 ///   stream completes; `None` if not capturing.
+/// - `bool`: Whether the dataset has blob v2 columns and the stream includes `_rowaddr`.
 async fn prepare_reader(
     dataset: &Dataset,
     fragments: &[Fragment],
@@ -724,14 +1214,22 @@ async fn prepare_reader(
 ) -> Result<(
     SendableRecordBatchStream,
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
+    bool,
 )> {
     let mut scanner = dataset.scan();
-    let has_blob_columns = dataset
+    let has_legacy_blob_columns = dataset
         .schema()
         .fields_pre_order()
-        .any(|field| field.is_blob());
-    if has_blob_columns {
+        .any(|field| field.is_blob() && !field.is_blob_v2());
+    if has_legacy_blob_columns {
         scanner.blob_handling(BlobHandling::AllBinary);
+    }
+    let has_blob_v2_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob_v2());
+    if has_blob_v2_columns {
+        scanner.with_row_address();
     }
     if let Some(bs) = batch_size {
         scanner.batch_size(bs);
@@ -746,11 +1244,12 @@ async fn prepare_reader(
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let (data_no_row_ids, rx) =
             make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
-        Ok((data_no_row_ids, Some(rx)))
+        Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
     } else {
         Ok((
             SendableRecordBatchStream::from(scanner.try_into_stream().await?),
             None,
+            has_blob_v2_columns,
         ))
     }
 }
@@ -935,7 +1434,7 @@ async fn reserve_fragment_ids(
 
     let (manifest, _) = commit_transaction(
         dataset,
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
@@ -1012,7 +1511,7 @@ async fn rewrite_files(
     let mut reader: Option<SendableRecordBatchStream> = None;
 
     if !can_binary_copy {
-        let (prepared_reader, rx_initial) = prepare_reader(
+        let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
             &fragments,
             options.batch_size,
@@ -1033,16 +1532,69 @@ async fn rewrite_files(
                 num_rows,
             );
         });
-        reader = Some(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            reader_with_progress,
-        )));
+
+        if has_blob_v2_columns {
+            let dataset_arc = Arc::new(dataset.as_ref().clone());
+            let dataset_schema = dataset.schema().clone();
+            let transformed = reader_with_progress.then(move |batch_result| {
+                let dataset = dataset_arc.clone();
+                let schema = dataset_schema.clone();
+                async move {
+                    let batch = batch_result?;
+                    transform_blob_v2_batch(&dataset, &schema, batch)
+                        .await
+                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+                }
+            });
+            let transformed_schema = {
+                let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
+                for field in schema.fields().iter() {
+                    if field.name() == lance_core::ROW_ADDR {
+                        continue;
+                    }
+                    let lance_field = dataset.schema().field(field.name());
+                    if let Some(lance_field) = lance_field.filter(|f| f.is_blob_v2()) {
+                        let logical_field = arrow_schema::Field::from(lance_field);
+                        fields.push(Arc::new(
+                            arrow_schema::Field::new(
+                                field.name(),
+                                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                                field.is_nullable(),
+                            )
+                            .with_metadata(logical_field.metadata().clone()),
+                        ));
+                    } else {
+                        fields.push(field.clone());
+                    }
+                }
+                Arc::new(arrow_schema::Schema::new_with_metadata(
+                    fields
+                        .iter()
+                        .map(|f| f.as_ref().clone())
+                        .collect::<Vec<_>>(),
+                    schema.metadata().clone(),
+                ))
+            };
+            reader = Some(Box::pin(RecordBatchStreamAdapter::new(
+                transformed_schema,
+                transformed,
+            )));
+        } else {
+            reader = Some(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                reader_with_progress,
+            )));
+        }
     }
 
     let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
+        // External blobs may reference URIs outside the dataset's base_paths
+        // (e.g. absolute file:// URIs with base_id == 0). Without this flag
+        // the writer would reject such blobs.
+        allow_external_blob_outside_bases: true,
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -1102,26 +1654,39 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let row_addrs = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx
-            .try_recv()
-            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-        let row_addrs = captured_ids.row_addrs(None).into_owned();
-        let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
-        row_addrs.serialize_into(&mut serialized)?;
-        Some(serialized)
-    } else {
-        if dataset.manifest.uses_stable_row_ids() {
-            log::info!("Compaction task {}: rechunking stable row ids", task_id);
-            rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-            recalc_versions_for_rewritten_fragments(
-                dataset.as_ref(),
-                &mut new_fragments,
-                &fragments,
-            )
-            .await?;
+    // Wrap in an async block so `?` returns into `row_addrs_result` and we can
+    // run cleanup before propagating the error.
+    let row_addrs_result: Result<Option<Vec<u8>>> = async {
+        if let Some(row_ids_rx) = row_ids_rx {
+            let captured_ids = row_ids_rx
+                .try_recv()
+                .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
+            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut serialized)?;
+            Ok(Some(serialized))
+        } else {
+            if dataset.manifest.uses_stable_row_ids() {
+                log::info!("Compaction task {}: rechunking stable row ids", task_id);
+                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+                recalc_versions_for_rewritten_fragments(
+                    dataset.as_ref(),
+                    &mut new_fragments,
+                    &fragments,
+                )
+                .await?;
+            }
+            Ok(None)
         }
-        None
+    }
+    .await;
+
+    let row_addrs = match row_addrs_result {
+        Ok(v) => v,
+        Err(e) => {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, &new_fragments).await;
+            return Err(e);
+        }
     };
 
     metrics.files_removed = task
@@ -1327,6 +1892,25 @@ pub async fn commit_compaction(
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
 
+    // Determine the earliest version at which compaction tasks were planned/executed.
+    //
+    // In distributed mode (e.g. Spark) the caller opens *two separate* Dataset
+    // handles: one for `plan_compaction` (at version V) and a fresh one for
+    // `commit_compaction` (at the latest version V+N).  Using `dataset.manifest.version`
+    // (= V+N) as the transaction's `read_version` would cause the conflict checker to
+    // scan only versions after V+N — finding nothing — and therefore silently skip any
+    // concurrent DELETE/UPDATE that landed between V and V+N, resurrecting deleted rows.
+    //
+    // By anchoring `read_version` to the minimum version carried in the RewriteResults
+    // we ensure the conflict checker covers the full range [V, V+N] and will reject the
+    // commit with a retryable conflict error if a concurrent write touched the same
+    // fragments.
+    let tasks_read_version = completed_tasks
+        .iter()
+        .map(|t| t.read_version)
+        .min()
+        .unwrap_or(dataset.manifest.version);
+
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
@@ -1401,6 +1985,7 @@ pub async fn commit_compaction(
                 new_id: rewritten.new_id,
                 new_index_details: rewritten.index_details,
                 new_index_version: rewritten.index_version,
+                new_index_files: rewritten.files,
             })
             .collect()
     } else if !options.defer_index_remap && !has_address_style {
@@ -1423,19 +2008,38 @@ pub async fn commit_compaction(
         None
     };
 
-    let transaction = Transaction::new(
-        dataset.manifest.version,
+    // Collect new fragment paths before moving rewrite_groups into the transaction,
+    // so we can clean them up if the commit fails.
+    let all_new_fragments: Vec<Fragment> = rewrite_groups
+        .iter()
+        .flat_map(|g| g.new_fragments.iter().cloned())
+        .collect();
+
+    let transaction = TransactionBuilder::new(
+        // Use the version at which the compaction tasks were *planned*, not the
+        // version of the dataset handle passed to this function.  In distributed
+        // mode the caller may open a fresh dataset at a later version (V+N), but
+        // the tasks were executed against an older snapshot (V).  Anchoring the
+        // transaction to V ensures the OCC conflict checker scans all writes that
+        // landed between V and the commit point, detecting concurrent DELETE
+        // transactions that would otherwise cause deleted rows to reappear.
+        tasks_read_version,
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
         },
-        None,
-    );
+    )
+    .transaction_properties(options.transaction_properties.clone())
+    .build();
 
-    dataset
+    if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await?;
+        .await
+    {
+        cleanup_data_fragments(&dataset.object_store, &dataset.base, &all_new_fragments).await;
+        return Err(e);
+    }
 
     Ok(metrics)
 }
@@ -1462,6 +2066,7 @@ mod tests {
     use async_trait::async_trait;
     use lance_arrow::BLOB_META_KEY;
     use lance_core::Error;
+    use lance_core::ROW_ID;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
@@ -2289,6 +2894,71 @@ mod tests {
 
         let after_scalar_result = scalar_query(&dataset).await;
         assert_eq!(before_scalar_result, after_scalar_result);
+    }
+
+    // Regression test for https://github.com/lancedb/lance/issues/6161
+    // When FragReuseIndexDetails exceeds 204800 bytes it is written to an external
+    // file. Previously the file was silently dropped (temp file deleted) because
+    // tokio::io::AsyncWriteExt::shutdown was called instead of
+    // lance_io::traits::Writer::shutdown, which persists the temp file.
+    #[tokio::test]
+    async fn test_defer_index_remap_large_external_file() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Create ~150 fragments × 1000 rows to produce a FragReuseIndexDetails
+        // that exceeds the 204800-byte inline threshold (~302 KB serialized).
+        let num_fragments = 150usize;
+        let rows_per_fragment = 1000usize;
+        let total_rows = num_fragments * rows_per_fragment;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..total_rows as i32)) as ArrayRef],
+                )
+                .unwrap())],
+                schema.clone(),
+            ),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), num_fragments);
+
+        // Delete a few rows from each fragment so compaction has something to do.
+        dataset.delete("i % 1000 = 0").await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Loading the FragReuseIndex details must succeed even when the details
+        // were written to an external file.
+        let frag_reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("fragment reuse index must exist after compaction");
+
+        load_frag_reuse_index_details(&dataset, &frag_reuse_meta)
+            .await
+            .expect("loading large frag reuse index details must not fail");
     }
 
     #[tokio::test]
@@ -3320,7 +3990,7 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx"),
+            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx(Bitmap)"),
             "Expected index query in plan: {}",
             plan
         );
@@ -3414,7 +4084,7 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx"),
+            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx(BTree)"),
             "Expected scalar index query in plan: {}",
             plan
         );
@@ -3776,7 +4446,9 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx"),
+            plan.contains(
+                "ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx(LabelList)",
+            ),
             "Expected scalar index query in plan: {}",
             plan
         );
@@ -3862,6 +4534,8 @@ mod tests {
                         }),
                     ],
                     version: crate::index::vector::IndexFileVersion::V3,
+                    skip_transpose: false,
+                    runtime_hints: Default::default(),
                 },
                 false,
             )
@@ -3976,5 +4650,1801 @@ mod tests {
         assert_eq!(plan.read_version, dataset.manifest.version);
         // make sure options.validate() worked
         assert!(!plan.options.materialize_deletions);
+    }
+
+    #[test]
+    fn test_from_dataset_config() {
+        let config = HashMap::from([
+            (
+                "lance.compaction.target_rows_per_fragment".to_string(),
+                "500000".to_string(),
+            ),
+            (
+                "lance.compaction.max_rows_per_group".to_string(),
+                "2048".to_string(),
+            ),
+            (
+                "lance.compaction.max_bytes_per_file".to_string(),
+                "1000000".to_string(),
+            ),
+            (
+                "lance.compaction.materialize_deletions".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "lance.compaction.materialize_deletions_threshold".to_string(),
+                "0.25".to_string(),
+            ),
+            (
+                "lance.compaction.defer_index_remap".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "lance.compaction.batch_size".to_string(),
+                "4096".to_string(),
+            ),
+            (
+                "lance.compaction.compaction_mode".to_string(),
+                "try_binary_copy".to_string(),
+            ),
+            (
+                "lance.compaction.binary_copy_read_batch_bytes".to_string(),
+                "8388608".to_string(),
+            ),
+        ]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+        assert_eq!(opts.max_rows_per_group, 2048);
+        assert_eq!(opts.max_bytes_per_file, Some(1_000_000));
+        assert!(!opts.materialize_deletions);
+        assert!((opts.materialize_deletions_threshold - 0.25).abs() < f32::EPSILON);
+        assert!(opts.defer_index_remap);
+        assert_eq!(opts.batch_size, Some(4096));
+        assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
+        assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
+    }
+
+    #[test]
+    fn test_from_dataset_config_empty() {
+        let config = HashMap::new();
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        let defaults = CompactionOptions::default();
+        assert_eq!(
+            opts.target_rows_per_fragment,
+            defaults.target_rows_per_fragment
+        );
+        assert_eq!(opts.max_rows_per_group, defaults.max_rows_per_group);
+        assert_eq!(opts.max_bytes_per_file, defaults.max_bytes_per_file);
+        assert_eq!(opts.materialize_deletions, defaults.materialize_deletions);
+        assert_eq!(
+            opts.materialize_deletions_threshold,
+            defaults.materialize_deletions_threshold
+        );
+        assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
+        assert_eq!(opts.batch_size, defaults.batch_size);
+        assert_eq!(opts.compaction_mode, defaults.compaction_mode);
+        assert_eq!(
+            opts.binary_copy_read_batch_bytes,
+            defaults.binary_copy_read_batch_bytes
+        );
+    }
+
+    #[test]
+    fn test_from_dataset_config_partial() {
+        let config = HashMap::from([(
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "500000".to_string(),
+        )]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+        // Other fields should remain at defaults
+        let defaults = CompactionOptions::default();
+        assert_eq!(opts.max_rows_per_group, defaults.max_rows_per_group);
+        assert_eq!(opts.max_bytes_per_file, defaults.max_bytes_per_file);
+        assert_eq!(opts.materialize_deletions, defaults.materialize_deletions);
+        assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
+        assert_eq!(opts.batch_size, defaults.batch_size);
+        assert_eq!(opts.compaction_mode, defaults.compaction_mode);
+        assert_eq!(
+            opts.binary_copy_read_batch_bytes,
+            defaults.binary_copy_read_batch_bytes
+        );
+    }
+
+    #[test]
+    fn test_from_dataset_config_ignores_other_keys() {
+        let config = HashMap::from([
+            (
+                "lance.compaction.target_rows_per_fragment".to_string(),
+                "500000".to_string(),
+            ),
+            (
+                "lance.auto_cleanup.interval".to_string(),
+                "3600".to_string(),
+            ),
+            ("some.other.key".to_string(), "value".to_string()),
+        ]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_value() {
+        let config = HashMap::from([(
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "not_a_number".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("target_rows_per_fragment"));
+        assert!(err_msg.contains("not_a_number"));
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_bool() {
+        let config = HashMap::from([(
+            "lance.compaction.materialize_deletions".to_string(),
+            "yes".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("materialize_deletions"));
+        assert!(err_msg.contains("yes"));
+    }
+
+    #[test]
+    fn test_from_dataset_config_unknown_compaction_key() {
+        // Unknown keys should be ignored (with a warning) for forwards compatibility
+        let config = HashMap::from([(
+            "lance.compaction.unknown_key".to_string(),
+            "value".to_string(),
+        )]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        // Should return defaults since the unknown key is skipped
+        let defaults = CompactionOptions::default();
+        assert_eq!(
+            opts.target_rows_per_fragment,
+            defaults.target_rows_per_fragment
+        );
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_compaction_mode() {
+        let config = HashMap::from([(
+            "lance.compaction.compaction_mode".to_string(),
+            "invalid_mode".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid_mode"));
+    }
+
+    #[test]
+    fn test_apply_dataset_config_overrides() {
+        let config = HashMap::from([(
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "500000".to_string(),
+        )]);
+
+        let mut opts = CompactionOptions {
+            max_rows_per_group: 4096,
+            ..Default::default()
+        };
+        opts.apply_dataset_config(&config).unwrap();
+
+        // Config value should be applied
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+        // Explicitly set value should be preserved (config didn't have this key)
+        assert_eq!(opts.max_rows_per_group, 4096);
+    }
+
+    #[test]
+    fn test_apply_dataset_config_overwrites_matching_field() {
+        let config = HashMap::from([(
+            "lance.compaction.max_rows_per_group".to_string(),
+            "2048".to_string(),
+        )]);
+
+        let mut opts = CompactionOptions {
+            max_rows_per_group: 4096,
+            ..Default::default()
+        };
+        opts.apply_dataset_config(&config).unwrap();
+
+        // Config value should overwrite the pre-set value
+        assert_eq!(opts.max_rows_per_group, 2048);
+    }
+
+    #[tokio::test]
+    async fn test_max_source_fragments() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let schema = data.schema();
+
+        // Create 10 small fragments (100 rows each) via 10 appends
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        for i in 1..10 {
+            let mut append_params = write_params.clone();
+            append_params.mode = WriteMode::Append;
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
+                test_uri,
+                Some(append_params),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+
+        // Plan without limit - all 10 fragments should be candidates.
+        // Use a target that splits the 10 fragments into multiple tasks.
+        let opts_no_limit = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan_all = plan_compaction(&dataset, &opts_no_limit).await.unwrap();
+        let total_source_frags: usize = plan_all.tasks().iter().map(|t| t.fragments.len()).sum();
+        assert_eq!(total_source_frags, 10);
+        assert!(
+            plan_all.num_tasks() > 2,
+            "need multiple tasks to test bounding, got {}",
+            plan_all.num_tasks()
+        );
+
+        // Plan with max_source_fragments=4 should include tasks covering <= 4
+        // source fragments
+        let opts_bounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(4),
+            ..Default::default()
+        };
+        let plan_bounded = plan_compaction(&dataset, &opts_bounded).await.unwrap();
+        let bounded_source_frags: usize =
+            plan_bounded.tasks().iter().map(|t| t.fragments.len()).sum();
+        assert!(
+            bounded_source_frags <= 4,
+            "expected at most 4 source fragments, got {bounded_source_frags}"
+        );
+        assert!(
+            bounded_source_frags > 0,
+            "expected at least 1 source fragment in bounded plan"
+        );
+        assert!(
+            plan_bounded.num_tasks() < plan_all.num_tasks(),
+            "bounded plan ({}) should have fewer tasks than unbounded ({})",
+            plan_bounded.num_tasks(),
+            plan_all.num_tasks()
+        );
+
+        // Execute bounded compaction incrementally
+        let mut dataset = dataset;
+        compact_files(&mut dataset, opts_bounded, None)
+            .await
+            .unwrap();
+        let after_first = dataset.get_fragments().len();
+        assert!(
+            after_first < 10,
+            "expected fewer than 10 fragments after first compaction, got {after_first}"
+        );
+        assert!(
+            after_first > 1,
+            "expected partial compaction (not fully compacted), got {after_first}"
+        );
+
+        // Run again to make more progress
+        let opts_bounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(4),
+            ..Default::default()
+        };
+        compact_files(&mut dataset, opts_bounded, None)
+            .await
+            .unwrap();
+        let after_second = dataset.get_fragments().len();
+        assert!(
+            after_second <= after_first,
+            "expected progress: {after_second} should be <= {after_first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_uses_manifest_config() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let schema = data.schema();
+
+        // Create dataset with small fragments
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 2000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 5);
+
+        // Set compaction config in manifest
+        dataset
+            .update_config([
+                ("lance.compaction.target_rows_per_fragment", "5000"),
+                ("lance.compaction.materialize_deletions_threshold", "2.0"),
+            ])
+            .await
+            .unwrap();
+
+        // Build options from the dataset config (as the bindings do)
+        let opts = CompactionOptions::from_dataset_config(&dataset.manifest.config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 5000);
+        assert!((opts.materialize_deletions_threshold - 2.0).abs() < f32::EPSILON);
+
+        // Verify the config flows through plan_compaction
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        assert_eq!(plan.options.target_rows_per_fragment, 5000);
+        // validate() should have turned off materialize_deletions since threshold >= 1.0
+        assert!(!plan.options.materialize_deletions);
+    }
+
+    // check_rewrite_txn takes the (None, Some(_)) branch when a Rewrite with
+    // defer_index_remap=true is committed against a previously committed
+    // CreateIndex, declaring COMPATIBLE without verifying that the Rewrite's
+    // FRI groups don't straddle the CreateIndex's fragment bitmap. When a
+    // group mixes indexed and unindexed fragments, commit succeeds and later
+    // queries fail at load_indices with "split of indexed and non-indexed
+    // data".
+    #[tokio::test]
+    async fn test_rewrite_fri_vs_create_index_conflict() {
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use futures::TryStreamExt;
+        use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+
+        async fn append_fragment(uri: &str, rows: u64) -> Dataset {
+            let reader = gen_batch()
+                .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+                .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
+            let params = WriteParams {
+                max_rows_per_file: rows as usize,
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            Dataset::write(reader, uri, Some(params)).await.unwrap()
+        }
+
+        let tmpdir = TempStrDir::default();
+        let uri = format!("file://{}", tmpdir.as_str());
+
+        // frag0 (256 rows) with a base IVF index.
+        let reader = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 256,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, true)
+            .await
+            .unwrap();
+
+        // Append frag1 (unindexed), snapshot a stale handle pointing here,
+        // then append frag2 (also unindexed).
+        dataset = append_fragment(&uri, 64).await;
+        let mut stale = dataset.clone();
+        dataset = append_fragment(&uri, 64).await;
+
+        // Plan + execute compaction of frag1+frag2 with deferred remap.
+        let options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        let snapshot = dataset.clone();
+        let completed: Vec<RewriteResult> = futures::stream::iter(plan.tasks.into_iter())
+            .map(|task| rewrite_files(Cow::Borrowed(&snapshot), task, &options))
+            .buffer_unordered(1)
+            .try_collect()
+            .await
+            .unwrap();
+
+        // optimize_indices on the stale handle indexes frag1 only (frag2
+        // didn't exist at that version), commits as CreateIndex. `dataset`
+        // stays at its pre-optimize version so the Rewrite commit has to
+        // conflict-check against this CreateIndex.
+        stale
+            .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        // Commit the pre-executed Rewrite. The FRI group [frag1, frag2]
+        // straddles the new CreateIndex bitmap (frag1 indexed, frag2 not), so
+        // check_rewrite_txn must reject this as a retryable conflict rather
+        // than letting it commit into a broken state that fails queries.
+        let err = commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("commit should fail with retryable conflict");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Reproduce the distributed-compaction concurrent-delete data-resurrection bug.
+    ///
+    /// In the distributed (Spark) path the caller opens **two separate** `Dataset` handles:
+    ///
+    /// 1. dataset_plan  — used for `plan_compaction` (version = V)
+    /// 2. dataset_commit — opened **fresh** for `commit_compaction` (version = V+N)
+    ///
+    /// Because `commit_compaction` builds the `Rewrite` transaction with
+    /// `dataset.manifest.version` (= V+N), `load_and_sort_new_transactions` only
+    /// scans versions after V+N and finds nothing.  Any concurrent DELETE that
+    /// happened between V and V+N is silently ignored, causing the deleted rows to
+    /// reappear in the compacted fragment.
+    ///
+    /// After the fix, `commit_compaction` uses `min(tasks.read_version)` (= V) as
+    /// the transaction `read_version`, so the conflict checker correctly loads and
+    /// rejects the DELETE, returning a retryable conflict error instead of silently
+    /// resurrecting data.
+    #[tokio::test]
+    async fn test_distributed_compact_concurrent_delete_no_resurrection() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Write 4 fragments × 1 000 rows each (a=0..4000).
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..4_000))],
+        )
+        .unwrap();
+        let mut dataset_plan = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset_plan.manifest.version, 1);
+        assert_eq!(dataset_plan.get_fragments().len(), 4);
+
+        // ── Step 1: plan compaction at version V=1 ───────────────────────────────
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset_plan, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1, "expected one compaction task");
+
+        // ── Step 2: execute tasks (simulating distributed executors at V=1) ──────
+        // Clone dataset_plan so the closure can own its copy while the original
+        // remains available for the concurrent DELETE in Step 3.
+        let dataset_for_tasks = dataset_plan.clone();
+        let results: Vec<RewriteResult> = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| {
+                let ds = dataset_for_tasks.clone();
+                async move {
+                    // Executors open the dataset at the planned read_version
+                    task.execute(&ds).await.unwrap()
+                }
+            })
+            .collect()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].read_version, 1,
+            "tasks must carry read_version=1"
+        );
+
+        // ── Step 3: concurrent DELETE commits at V=2 ─────────────────────────────
+        // Delete rows where a < 1000 (the first 1 000 rows in fragment 0).
+        dataset_plan.delete("a < 1000").await.unwrap();
+        assert_eq!(dataset_plan.manifest.version, 2);
+
+        // ── Step 4: the Spark driver opens a *fresh* dataset (latest = V=2) ──────
+        // This is exactly what OptimizeExec.scala does for commitCompaction.
+        let mut dataset_commit = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(
+            dataset_commit.manifest.version, 2,
+            "fresh dataset must be at the post-delete version"
+        );
+
+        // ── Step 5: commit_compaction with the stale results ─────────────────────
+        let commit_result = commit_compaction(
+            &mut dataset_commit,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await;
+
+        // ── Step 6: assert correct behaviour ─────────────────────────────────────
+        // BEFORE fix: commit_result is Ok(…) and the deleted rows are resurrected.
+        // AFTER  fix: commit_result is Err(retryable conflict), protecting data integrity.
+        assert!(
+            commit_result.is_err(),
+            "commit_compaction must fail with a conflict error when a concurrent \
+             DELETE touched the same fragments; got Ok instead — deleted rows were \
+             silently resurrected"
+        );
+        let err_msg = commit_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("retryable")
+                || err_msg.contains("conflict")
+                || err_msg.contains("preempted"),
+            "expected a retryable conflict error, got: {err_msg}"
+        );
+
+        // The on-disk table must still reflect the DELETE (a < 1000 remains absent).
+        let latest = Dataset::open(test_uri).await.unwrap();
+        let row_count = latest
+            .count_rows(Some("a < 1000".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            row_count, 0,
+            "rows deleted before compaction must not be resurrected; found {row_count}"
+        );
+    }
+
+    fn count_all_files_in(dir: &std::path::Path) -> std::io::Result<usize> {
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                count += count_all_files_in(&path)?;
+            } else if path.is_file() {
+                // Ignore macOS system files if any
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|file_name| !file_name.starts_with('.'))
+                {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn count_data_files_in(base_dir: &str) -> usize {
+        let data_dir = std::path::Path::new(base_dir).join("data");
+        count_all_files_in(&data_dir).unwrap_or(0)
+    }
+
+    /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
+    /// after `rewrite_files` has already written new data files, those files
+    /// must be cleaned up. We force the commit failure by injecting an error on
+    /// writes to the `_transactions/` directory.
+    #[tokio::test]
+    async fn test_commit_compaction_cleans_up_data_on_commit_failure() {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 200))], data.schema());
+        Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                // Stable row IDs lets `commit_compaction` skip the
+                // `reserve_fragment_ids` pre-commit (which would otherwise fail
+                // *before* the new data files exist), isolating the failure to
+                // the `apply_commit` call we want to test.
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let baseline_files = count_data_files_in(test_uri);
+
+        let failing = Arc::new(FailingProxyStore::new());
+        // `commit_compaction` first calls `reserve_fragment_ids` (which writes a
+        // ReserveFragments transaction) and then calls `apply_commit` for the
+        // rewrite itself. Skip the first transaction write so the reserve
+        // succeeds, and fail the second so `apply_commit` errors out — that's
+        // the branch we want to exercise cleanup for.
+        failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
+        failing.fail_after_n(
+            "put_multipart",
+            "_transactions",
+            1,
+            "injected commit failure",
+        );
+
+        let mut dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(crate::dataset::ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            ..Default::default()
+        };
+        let result = compact_files(&mut dataset, options, None).await;
+        assert!(
+            result.is_err(),
+            "Compaction should fail when transaction commit fails"
+        );
+
+        assert_eq!(
+            count_data_files_in(test_uri),
+            baseline_files,
+            "Compaction data files should be cleaned up when commit fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
+        use crate::BlobArrayBuilder;
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let id_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        // Use one packed blob and one dedicated blob to verify both sidecar layouts.
+        let packed_data = vec![0u8; 100 * 1024];
+        let dedicated_data = vec![1u8; 5 * 1024 * 1024];
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(&packed_data).unwrap();
+        blob_builder.push_bytes(&dedicated_data).unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1, // Create 2 fragments
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let baseline_files = count_data_files_in(test_uri);
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
+        failing.fail_after_n(
+            "put_multipart",
+            "_transactions",
+            1,
+            "injected commit failure",
+        );
+
+        let mut dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(crate::dataset::ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            ..Default::default()
+        };
+        let result = compact_files(&mut dataset, options, None).await;
+        assert!(
+            result.is_err(),
+            "Compaction should fail when transaction commit fails"
+        );
+
+        assert_eq!(
+            count_data_files_in(test_uri),
+            baseline_files,
+            "Blob v2 sidecars should be cleaned up when commit fails"
+        );
+    }
+
+    async fn read_blob_bytes_by_index(
+        dataset: &Arc<Dataset>,
+        column: &str,
+    ) -> Vec<(i32, Option<Vec<u8>>)> {
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        let batch = scanner
+            .project(&["id", column])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+
+        let mut result = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            let row_id = row_ids.value(i);
+            let id = ids.value(i);
+            let blobs = dataset.take_blobs(&[row_id], column).await.unwrap();
+            if blobs.is_empty() {
+                result.push((id, None));
+            } else {
+                let data = blobs[0].read().await.unwrap();
+                result.push((id, Some(data.to_vec())));
+            }
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_preserves_external_references() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"external-data").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let base_uri = format!("file://{}", external_dir.std_path().display());
+
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        blob_builder.push_bytes(b"inline-data").unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: base_uri,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        for frag in dataset.get_fragments() {
+            let rows = frag.physical_rows().await.unwrap();
+            assert!(rows > 0, "fragment {} should have rows", frag.id());
+        }
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1024 * 1024,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(
+            !plan.tasks().is_empty(),
+            "compaction plan should have tasks, got {} tasks",
+            plan.tasks().len()
+        );
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let scan_result = dataset
+            .scan()
+            .project(&["id", "blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(scan_result.num_rows(), 2);
+
+        let ids = scan_result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let mut id_values: Vec<i32> = ids.iter().map(|v| v.unwrap()).collect();
+        id_values.sort();
+        assert_eq!(id_values, vec![0, 1]);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(b"external-data".to_vec())),
+                (1, Some(b"inline-data".to_vec()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_packed_and_dedicated() {
+        use crate::BlobArrayBuilder;
+        use lance_arrow::BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let inline_data = b"small-inline-blob".as_slice();
+        let packed_data: Vec<u8> = (0..64 * 1024 + 1024).map(|i| (i % 256) as u8).collect();
+        let dedicated_data: Vec<u8> = (0..4 * 1024 * 1024 + 512)
+            .map(|i| ((i + 97) % 256) as u8)
+            .collect();
+
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder.push_bytes(inline_data).unwrap();
+        blob_builder.push_bytes(&packed_data).unwrap();
+        blob_builder.push_bytes(&dedicated_data).unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2]));
+        let mut blob_field = crate::blob_field("blob", true);
+        {
+            let metadata = blob_field.metadata().clone();
+            let mut new_metadata = metadata;
+            new_metadata.insert(
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                (4 * 1024 * 1024).to_string(),
+            );
+            blob_field = blob_field.with_metadata(new_metadata);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field,
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let scan_result = dataset
+            .scan()
+            .project(&["id", "blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(scan_result.num_rows(), 3);
+
+        let ids = scan_result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let id_values: Vec<i32> = ids.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(id_values, vec![0, 1, 2]);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(inline_data.to_vec())),
+                (1, Some(packed_data)),
+                (2, Some(dedicated_data))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_with_null_rows() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_bytes(b"inline-0").unwrap();
+        blob_builder.push_null().unwrap();
+        blob_builder.push_bytes(b"inline-2").unwrap();
+        blob_builder.push_null().unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(0), Some(1), Some(2), Some(3)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let scan_result = dataset
+            .scan()
+            .project(&["id", "blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(scan_result.num_rows(), 4);
+
+        let ids = scan_result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let id_values: Vec<i32> = ids.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(id_values, vec![0, 1, 2, 3]);
+
+        let blob_col = scan_result.column_by_name("blob").unwrap();
+        assert!(
+            matches!(blob_col.data_type(), DataType::Struct(_)),
+            "blob column should be a struct after compaction"
+        );
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(b"inline-0".to_vec())),
+                (1, None),
+                (2, Some(b"inline-2".to_vec())),
+                (3, None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_deleted_rows_not_resurrected() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_bytes(b"blob-0").unwrap();
+        blob_builder.push_bytes(b"blob-1").unwrap();
+        blob_builder.push_bytes(b"blob-2").unwrap();
+        blob_builder.push_bytes(b"blob-3").unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        dataset.delete("id = 1").await.unwrap();
+        dataset.delete("id = 2").await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scan_result = dataset
+            .scan()
+            .project(&["id", "blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(scan_result.num_rows(), 2);
+
+        let ids = scan_result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let mut id_values: Vec<i32> = ids.iter().map(|v| v.unwrap()).collect();
+        id_values.sort();
+        assert_eq!(id_values, vec![0, 3]);
+
+        let blob_col = scan_result.column_by_name("blob").unwrap();
+        let struct_arr = blob_col.as_any().downcast_ref::<StructArray>().unwrap();
+        let kind_col = struct_arr
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>();
+
+        for i in 0..kind_col.len() {
+            assert!(
+                !kind_col.is_null(i),
+                "row {} should have a non-null kind after compaction of deleted rows",
+                i
+            );
+        }
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![(0, Some(b"blob-0".to_vec())), (3, Some(b"blob-3".to_vec()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_external_and_data_blob_mixed() {
+        use crate::BlobArrayBuilder;
+        use lance_arrow::BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"external-payload").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let base_uri = format!("file://{}", external_dir.std_path().display());
+
+        let packed_data: Vec<u8> = (0..64 * 1024 + 512).map(|i| (i % 256) as u8).collect();
+
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        blob_builder.push_bytes(&packed_data).unwrap();
+        blob_builder.push_bytes(b"inline-small").unwrap();
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+        let mut blob_field = crate::blob_field("blob", true);
+        {
+            let mut new_metadata = blob_field.metadata().clone();
+            new_metadata.insert(
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                (4 * 1024 * 1024).to_string(),
+            );
+            blob_field = blob_field.with_metadata(new_metadata);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field,
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: base_uri,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(b"external-payload".to_vec())),
+                (1, Some(packed_data)),
+                (2, Some(b"inline-small".to_vec())),
+                (3, Some(b"external-payload".to_vec()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_multiple_blob_columns() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let mut image_builder = BlobArrayBuilder::new(3);
+        image_builder.push_bytes(b"image-0").unwrap();
+        image_builder.push_bytes(b"image-1").unwrap();
+        image_builder.push_bytes(b"image-2").unwrap();
+        let image_array: ArrayRef = image_builder.finish().unwrap();
+
+        let mut thumb_builder = BlobArrayBuilder::new(3);
+        thumb_builder.push_bytes(b"thumb-0").unwrap();
+        thumb_builder.push_null().unwrap();
+        thumb_builder.push_bytes(b"thumb-2").unwrap();
+        let thumb_array: ArrayRef = thumb_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("image", true),
+            crate::blob_field("thumbnail", true),
+        ]));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![id_array, image_array, thumb_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut image_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "image").await;
+        image_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            image_values,
+            vec![
+                (0, Some(b"image-0".to_vec())),
+                (1, Some(b"image-1".to_vec())),
+                (2, Some(b"image-2".to_vec()))
+            ]
+        );
+
+        let mut thumb_values =
+            read_blob_bytes_by_index(&Arc::new(dataset.clone()), "thumbnail").await;
+        thumb_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            thumb_values,
+            vec![
+                (0, Some(b"thumb-0".to_vec())),
+                (1, None),
+                (2, Some(b"thumb-2".to_vec()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_external_and_null_mixed() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("mixed-external.bin");
+        std::fs::write(&external_path, b"external-mixed-data").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let base_uri = format!("file://{}", external_dir.std_path().display());
+
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        blob_builder.push_null().unwrap();
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        blob_builder.push_null().unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: base_uri,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(b"external-mixed-data".to_vec())),
+                (1, None),
+                (2, Some(b"external-mixed-data".to_vec())),
+                (3, None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_all_null_and_all_external_fragments() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("all-ext.bin");
+        std::fs::write(&external_path, b"all-external-data").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let base_uri = format!("file://{}", external_dir.std_path().display());
+
+        let mut null_builder = BlobArrayBuilder::new(2);
+        null_builder.push_null().unwrap();
+        null_builder.push_null().unwrap();
+        let null_array: ArrayRef = null_builder.finish().unwrap();
+
+        let mut ext_builder = BlobArrayBuilder::new(2);
+        ext_builder.push_uri(external_uri.clone()).unwrap();
+        ext_builder.push_uri(external_uri.clone()).unwrap();
+        let ext_array: ArrayRef = ext_builder.finish().unwrap();
+
+        let id_null_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let null_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let null_batch =
+            RecordBatch::try_new(null_schema.clone(), vec![id_null_array, null_array]).unwrap();
+
+        let id_ext_array: ArrayRef = Arc::new(Int32Array::from(vec![2, 3]));
+        let ext_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let ext_batch =
+            RecordBatch::try_new(ext_schema.clone(), vec![id_ext_array, ext_array]).unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![null_batch, ext_batch].into_iter().map(Ok),
+                null_schema.clone(),
+            ),
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: base_uri,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, None),
+                (1, None),
+                (2, Some(b"all-external-data".to_vec())),
+                (3, Some(b"all-external-data".to_vec()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_external_with_multiple_base_ids() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let base_a_dir = TempDir::default();
+        let base_b_dir = TempDir::default();
+
+        let path_a = base_a_dir.std_path().join("data-a.bin");
+        std::fs::write(&path_a, b"from-base-a").unwrap();
+        let uri_a = format!("file://{}", path_a.display());
+        let base_uri_a = format!("file://{}", base_a_dir.std_path().display());
+
+        let path_b = base_b_dir.std_path().join("data-b.bin");
+        std::fs::write(&path_b, b"from-base-b").unwrap();
+        let uri_b = format!("file://{}", path_b.display());
+        let base_uri_b = format!("file://{}", base_b_dir.std_path().display());
+
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_uri(uri_a.clone()).unwrap();
+        blob_builder.push_uri(uri_b).unwrap();
+        blob_builder.push_bytes(b"inline-data").unwrap();
+        blob_builder.push_uri(uri_a).unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base_a".to_string()),
+                        path: base_uri_a,
+                        is_dataset_root: false,
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base_b".to_string()),
+                        path: base_uri_b,
+                        is_dataset_root: false,
+                    },
+                ]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(b"from-base-a".to_vec())),
+                (1, Some(b"from-base-b".to_vec())),
+                (2, Some(b"inline-data".to_vec())),
+                (3, Some(b"from-base-a".to_vec()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_large_blobs() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let large_blob_a: Vec<u8> = (0..512 * 1024).map(|i| (i % 256) as u8).collect();
+        let large_blob_b: Vec<u8> = (0..256 * 1024).map(|i| ((i + 42) % 256) as u8).collect();
+
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder.push_bytes(&large_blob_a).unwrap();
+        blob_builder.push_bytes(&large_blob_b).unwrap();
+        blob_builder.push_bytes(b"small-blob").unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(large_blob_a)),
+                (1, Some(large_blob_b)),
+                (2, Some(b"small-blob".to_vec()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_blob_kind_reclassification() {
+        use crate::BlobArrayBuilder;
+        use lance_arrow::BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let medium_data: Vec<u8> = (0..32 * 1024).map(|i| (i % 256) as u8).collect();
+
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(&medium_data).unwrap();
+        blob_builder.push_bytes(&medium_data).unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let mut blob_field = crate::blob_field("blob", true);
+        {
+            let mut new_metadata = blob_field.metadata().clone();
+            new_metadata.insert(
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                (16 * 1024).to_string(),
+            );
+            blob_field = blob_field.with_metadata(new_metadata);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field,
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(medium_data.clone())),
+                (1, Some(medium_data.clone()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_multi_batch() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(6);
+        blob_builder.push_bytes(b"batch-0-row-0").unwrap();
+        blob_builder.push_bytes(b"batch-0-row-1").unwrap();
+        blob_builder.push_bytes(b"batch-1-row-0").unwrap();
+        blob_builder.push_null().unwrap();
+        blob_builder.push_bytes(b"batch-1-row-2").unwrap();
+        blob_builder.push_bytes(b"batch-1-row-3").unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                batch_size: Some(2),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut blob_values = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        blob_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            blob_values,
+            vec![
+                (0, Some(b"batch-0-row-0".to_vec())),
+                (1, Some(b"batch-0-row-1".to_vec())),
+                (2, Some(b"batch-1-row-0".to_vec())),
+                (3, None),
+                (4, Some(b"batch-1-row-2".to_vec())),
+                (5, Some(b"batch-1-row-3".to_vec()))
+            ]
+        );
     }
 }

@@ -24,14 +24,19 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "goosefs")]
+pub mod goosefs;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
 pub mod memory;
 #[cfg(feature = "oss")]
 pub mod oss;
+pub mod shared_memory;
 #[cfg(feature = "tencent")]
 pub mod tencent;
+#[cfg(feature = "tos")]
+pub mod tos;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -89,10 +94,12 @@ pub struct ObjectStoreRegistryStats {
 /// - `file`: A local file object store, with optimized code paths.
 /// - `file-object-store`: A local file object store that uses the ObjectStore API,
 ///   for all operations. Used for testing with ObjectStore wrappers.
+/// - `file+uring`: A local file object store using io_uring (Linux only).
 /// - `s3`: An S3 object store.
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
 /// - `gs`: A Google Cloud Storage object store.
+/// - `tos`: A Volcengine TOS object store.
 ///
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
 ///
@@ -291,6 +298,10 @@ impl Default for ObjectStoreRegistry {
         let mut providers: HashMap<String, Arc<dyn ObjectStoreProvider>> = HashMap::new();
 
         providers.insert("memory".into(), Arc::new(memory::MemoryStoreProvider));
+        providers.insert(
+            "shared-memory".into(),
+            Arc::new(shared_memory::SharedMemoryStoreProvider::default()),
+        );
         providers.insert("file".into(), Arc::new(local::FileStoreProvider));
         // The "file" scheme has special optimized code paths that bypass
         // the ObjectStore API for better performance. However, this can make it
@@ -301,6 +312,8 @@ impl Default for ObjectStoreRegistry {
             "file-object-store".into(),
             Arc::new(local::FileStoreProvider),
         );
+        #[cfg(target_os = "linux")]
+        providers.insert("file+uring".into(), Arc::new(local::FileStoreProvider));
 
         #[cfg(feature = "aws")]
         {
@@ -309,15 +322,23 @@ impl Default for ObjectStoreRegistry {
             providers.insert("s3+ddb".into(), aws);
         }
         #[cfg(feature = "azure")]
-        providers.insert("az".into(), Arc::new(azure::AzureBlobStoreProvider));
+        {
+            let azure = Arc::new(azure::AzureBlobStoreProvider);
+            providers.insert("az".into(), azure.clone());
+            providers.insert("abfss".into(), azure);
+        }
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
+        #[cfg(feature = "goosefs")]
+        providers.insert("goosefs".into(), Arc::new(goosefs::GooseFsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
         #[cfg(feature = "tencent")]
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
+        #[cfg(feature = "tos")]
+        providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::namespace::extract_namespace_arc;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
@@ -28,14 +29,14 @@ use lance_file::reader::{
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_file::{LanceEncodingsIo, version::LanceFileVersion};
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStoreParams};
 use lance_io::{
     ReadBatchParams,
     scheduler::{ScanScheduler, SchedulerConfig},
     traits::Writer,
     utils::CachedFileSize,
 };
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyRuntimeError},
@@ -47,7 +48,7 @@ use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceBufferDescriptor {
     /// The byte offset of the buffer in the file
@@ -69,7 +70,7 @@ impl LanceBufferDescriptor {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LancePageMetadata {
     /// The buffers in the page
@@ -93,7 +94,7 @@ impl LancePageMetadata {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnMetadata {
     /// The column-wide buffers
@@ -118,7 +119,7 @@ impl LanceColumnMetadata {
 }
 
 /// Statistics summarize some of the file metadata for quick summary info
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileStatistics {
     /// Statistics about each of the columns in the file
@@ -134,7 +135,7 @@ impl LanceFileStatistics {
 }
 
 /// Summary information describing a column
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnStatistics {
     /// The number of pages in the column
@@ -169,7 +170,7 @@ impl LanceFileStatistics {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileMetadata {
     /// The schema of the file
@@ -298,7 +299,7 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, storage_options_provider=None, keep_original_array=None, max_page_bytes=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, namespace_client=None, table_id=None, keep_original_array=None, max_page_bytes=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: String,
@@ -306,14 +307,22 @@ impl LanceFileWriter {
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        // Convert Python StorageOptionsProvider to Rust trait object
-        let provider = storage_options_provider
-            .map(crate::storage_options::py_object_to_storage_options_provider)
-            .transpose()?;
+        // Create storage options provider from namespace_client and table_id if both are provided
+        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                ns_client,
+                tid.clone(),
+            ))
+                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+        } else {
+            None
+        };
 
         rt().block_on(
             None,
@@ -338,8 +347,10 @@ impl LanceFileWriter {
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async { self.inner.lock().await.finish().await })?
-            .infer_error()
+        rt().block_on(None, async {
+            self.inner.lock().await.finish().await.map(|s| s.num_rows)
+        })?
+        .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
@@ -447,15 +458,24 @@ impl LanceFileSession {
 #[pymethods]
 impl LanceFileSession {
     #[new]
-    #[pyo3(signature=(uri_or_path, storage_options=None, storage_options_provider=None))]
+    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None))]
     pub fn new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let provider = storage_options_provider
-            .map(crate::storage_options::py_object_to_storage_options_provider)
-            .transpose()?;
+        // Create storage options provider from namespace_client and table_id if both are provided
+        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                ns_client,
+                tid.clone(),
+            ))
+                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+        } else {
+            None
+        };
         rt().block_on(None, Self::try_new(uri_or_path, storage_options, provider))?
     }
 
@@ -716,8 +736,6 @@ impl LanceFileReader {
         batch_size: u32,
         batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        // read_stream is a synchronous method but it launches tasks and needs to be
-        // run in the context of a tokio runtime
         let inner = self.inner.clone();
         let stream = rt().block_on(None, async move {
             inner
@@ -727,6 +745,7 @@ impl LanceFileReader {
                     batch_readahead,
                     FilterExpression::no_filter(),
                 )
+                .await
                 .infer_error()
         })??;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
@@ -736,16 +755,25 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None, storage_options_provider=None, columns=None))]
+    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, columns=None))]
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let provider = storage_options_provider
-            .map(crate::storage_options::py_object_to_storage_options_provider)
-            .transpose()?;
+        // Create storage options provider from namespace_client and table_id if both are provided
+        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                ns_client,
+                tid.clone(),
+            ))
+                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+        } else {
+            None
+        };
         rt().block_on(None, Self::open(path, storage_options, provider, columns))?
     }
 

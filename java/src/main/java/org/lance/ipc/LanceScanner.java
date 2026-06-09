@@ -69,12 +69,18 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.getOffset(),
             options.getNearest(),
             options.getFullTextQuery(),
+            options.isPrefilter(),
             options.isWithRowId(),
             options.isWithRowAddress(),
             options.getBatchReadahead(),
             options.getColumnOrderings(),
             options.isUseScalarIndex(),
-            options.getSubstraitAggregate());
+            options.isFastSearch(),
+            options.getSubstraitAggregate(),
+            options.isCollectStats(),
+            options.isIncludeDeletedRows(),
+            options.isStrictBatchSize(),
+            options.isDisableScoringAutoprojection());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
     scanner.options = options;
@@ -92,12 +98,18 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Optional<Long> offset,
       Optional<Query> query,
       Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<ByteBuffer> substraitAggregate);
+      boolean fastSearch,
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection);
 
   /**
    * Closes this scanner and releases any system resources associated with it. If the scanner is
@@ -166,6 +178,24 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       return nativeCountRows();
     }
   }
+
+  /**
+   * Get scan execution statistics for the most recently executed scan.
+   *
+   * <p>Statistics are only collected when {@link ScanOptions.Builder#collectStats(boolean)} is set
+   * to true. The values are populated when the scan stream is fully consumed and closed.
+   *
+   * <p>If statistics collection is disabled, or the scan has not finished yet, this method returns
+   * {@link Optional#empty()}.
+   */
+  public Optional<ScanStats> getStats() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      return Optional.ofNullable(nativeGetStats());
+    }
+  }
+
+  private native ScanStats nativeGetStats();
 
   private native long nativeCountRows();
 }

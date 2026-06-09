@@ -130,6 +130,7 @@ impl ScalarIndex for JsonIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -137,11 +138,11 @@ impl ScalarIndex for JsonIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let target_created = self
             .target_index
-            .update(new_data, dest_store, valid_old_fragments)
+            .update(new_data, dest_store, old_data_filter)
             .await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
@@ -151,6 +152,7 @@ impl ScalarIndex for JsonIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -234,13 +236,17 @@ impl JsonQueryParser {
                 ScalarIndexExpr::Query(ScalarIndexSearch {
                     column,
                     index_name,
+                    index_type,
                     query,
                     needs_recheck,
+                    fragment_bitmap,
                 }) => ScalarIndexExpr::Query(ScalarIndexSearch {
                     column,
                     index_name,
+                    index_type,
                     query: Arc::new(JsonQuery::new(query, self.path.clone())),
                     needs_recheck,
+                    fragment_bitmap,
                 }),
                 // This code path should only be hit on leaf expr
                 _ => unreachable!(),
@@ -779,6 +785,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
             index_version: JSON_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 

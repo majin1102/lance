@@ -38,8 +38,8 @@ These options apply to all object stores.
 | `proxy_url`                  | URL of a proxy server to use for requests. Default, `None`.                                                                                                                                                                                                                                             |
 | `proxy_ca_certificate`       | PEM-formatted CA certificate for proxy connections                                                                                                                                                                                                                                                      |
 | `proxy_excludes`             | List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, `example.com, 192.168.1.0/24` would bypass `https://api.example.com`, `https://www.example.com`, and any IP in the range `192.168.1.0/24`. |
-| `client_max_retries`         | Number of times for a s3 client to retry the request. Default, `10`.                                                                                                                                                                                                                                    |
-| `client_retry_timeout`       | Timeout for a s3 client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                                |
+| `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
+| `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 
 ## S3 Configuration
 
@@ -190,3 +190,61 @@ These keys can be used as both environment variables or keys in the `storage_opt
 | `azure_federated_token_file` / `federated_token_file` | File containing token for Azure AD workload identity federation. |
 | `azure_use_azure_cli` / `use_azure_cli` | Use azure cli for acquiring access token. |
 | `azure_disable_tagging` / `disable_tagging` | Disables tagging objects. This can be desirable if not supported by the backing store. | 
+
+## AliCloud Object Storage Service Configuration
+
+OSS credentials can be set in the environment variables `OSS_ACCESS_KEY_ID`,
+`OSS_ACCESS_KEY_SECRET`, `OSS_REGION`, and `OSS_SECURITY_TOKEN`. Alternatively, they can be
+passed as parameters to the `storage_options` parameter:
+
+```python
+import lance
+ds = lance.dataset(
+    "oss://bucket/path",
+    storage_options={
+        "oss_region": "oss-region",
+        "oss_endpoint": "oss-endpoint",
+        "oss_access_key_id": "my-access-key",
+        "oss_secret_access_key": "my-secret-key",
+        "oss_security_token": "my-session-token",
+    }
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `oss_endpoint` | OSS endpoint. Required (for example, `https://oss-cn-hangzhou.aliyuncs.com`). |
+| `oss_access_key_id` | Access key ID used for OSS authentication. Optional if credentials are provided by environment. |
+| `oss_secret_access_key` | Access key secret used for OSS authentication. Optional if credentials are provided by environment. |
+| `oss_region` | OSS region (for example, `cn-hangzhou`). Optional. |
+| `oss_security_token` | Security token for temporary credentials (STS). Optional. |
+
+## Volcengine TOS Configuration
+
+TOS credentials can be set in the environment variables `TOS_ACCESS_KEY_ID`,
+`TOS_SECRET_ACCESS_KEY`, `TOS_ENDPOINT`, `TOS_REGION`, and `TOS_SECURITY_TOKEN`.
+Lance also accepts the corresponding `VOLCENGINE_` environment variable prefix.
+Alternatively, credentials can be passed as parameters to the `storage_options`
+parameter; explicit `storage_options` override environment variables:
+
+```python
+import lance
+ds = lance.dataset(
+    "tos://bucket/path",
+    storage_options={
+        "tos_endpoint": "https://tos-cn-beijing.volces.com",
+        "tos_region": "cn-beijing",
+        "tos_access_key_id": "my-access-key",
+        "tos_secret_access_key": "my-secret-key",
+        "tos_security_token": "my-session-token",
+    }
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `tos_endpoint` | TOS endpoint. Required (for example, `https://tos-cn-beijing.volces.com`). |
+| `tos_region` | TOS signing region (for example, `cn-beijing`). Optional. |
+| `tos_access_key_id` | Access key ID used for TOS authentication. Optional if credentials are provided by environment. |
+| `tos_secret_access_key` | Secret access key used for TOS authentication. Optional if credentials are provided by environment. |
+| `tos_security_token` | Security token for temporary credentials. Optional. |

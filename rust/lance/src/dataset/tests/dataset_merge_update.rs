@@ -9,11 +9,14 @@ use crate::dataset::WriteDestination;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest};
+use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::ROW_ADDR;
+use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use mock_instant::thread_local::MockClock;
 
 use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
@@ -375,7 +378,7 @@ async fn test_insert_subschema() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
 
     // When reading back, columns that are missing are null
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -423,7 +426,7 @@ async fn test_insert_subschema() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 1]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0, 1]);
 
     // Can scan and get expected data.
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -479,8 +482,11 @@ async fn test_insert_nested_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 2, 1]);
-    assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1, 2]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[2, 1]);
+    assert_eq!(
+        fragments[0].metadata.files[0].column_indices.as_ref(),
+        &[0, 1]
+    );
 
     // Can insert c, b
     let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -507,8 +513,11 @@ async fn test_insert_nested_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(&fragments[1].metadata.files[0].fields, &[0, 3, 2]);
-    assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1, 2]);
+    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[3, 2]);
+    assert_eq!(
+        fragments[1].metadata.files[0].column_indices.as_ref(),
+        &[0, 1]
+    );
 
     // Can't insert a, c (b is non-nullable)
     let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -611,7 +620,7 @@ async fn test_insert_balanced_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
 
     // Insert right side
     let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
@@ -627,7 +636,7 @@ async fn test_insert_balanced_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(&fragments[1].metadata.files[0].fields, &[1]);
+    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[1]);
 
     let data = dataset
         .take(
@@ -859,9 +868,9 @@ async fn test_datafile_partial_replacement() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the second column in the dataset
-        fields: vec![1],
+        fields: Arc::from([1]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
@@ -885,8 +894,14 @@ async fn test_datafile_partial_replacement() {
     assert_eq!(dataset.version().version, 4);
     assert_eq!(dataset.get_fragments().len(), 1);
     assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
-    assert_eq!(dataset.get_fragments()[0].metadata.files[0].fields, vec![0]);
-    assert_eq!(dataset.get_fragments()[0].metadata.files[1].fields, vec![1]);
+    assert_eq!(
+        dataset.get_fragments()[0].metadata.files[0].fields.as_ref(),
+        &[0]
+    );
+    assert_eq!(
+        dataset.get_fragments()[0].metadata.files[1].fields.as_ref(),
+        &[1]
+    );
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -914,9 +929,9 @@ async fn test_datafile_partial_replacement() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the first column in the dataset
-        fields: vec![0],
+        fields: Arc::from([0]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
@@ -1013,9 +1028,9 @@ async fn test_datafile_replacement_error() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the second column in the dataset
-        fields: vec![1],
+        fields: Arc::from([1]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: 2,
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
@@ -1023,7 +1038,7 @@ async fn test_datafile_replacement_error() {
     };
 
     let new_data_file = DataFile {
-        fields: vec![0, 1],
+        fields: Arc::from([0, 1]),
         ..new_data_file
     };
 
@@ -1065,7 +1080,11 @@ async fn test_replace_dataset() {
         .await
         .unwrap();
 
-    ds.object_store().remove_dir_all(test_path).await.unwrap();
+    ds.object_store
+        .as_ref()
+        .remove_dir_all(test_path)
+        .await
+        .unwrap();
 
     let ds2 = InsertBuilder::new(&test_uri)
         .execute(vec![data2.clone()])
@@ -1704,4 +1723,992 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         !effective.contains(0),
         "Fragment 0 should be removed from index bitmap after DataReplacement on indexed column"
     );
+}
+
+/// DataReplacement on an indexed column should remove the fragment from
+/// fragment_bitmap AND add it to invalidated_fragment_bitmap so that
+/// stale index entries are blocked at query time.
+#[tokio::test]
+async fn test_data_replacement_populates_invalidated_bitmap() {
+    use lance_file::writer::FileWriter;
+    use object_store::path::Path;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, true),
+    ]));
+
+    // Create dataset with one fragment
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://test_replacement_invalidated", None)
+        .await
+        .unwrap();
+
+    // Create BTree index on 'value'
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Verify initial state: fragment 0 in bitmap, no invalidated fragments
+    let indices = dataset.load_indices().await.unwrap();
+    let idx = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
+
+    // Write a replacement data file for column 'value'
+    let value_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        true,
+    )]));
+    let replacement_batch = RecordBatch::try_new(
+        value_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![40, 50, 60]))],
+    )
+    .unwrap();
+
+    let object_writer = dataset
+        .object_store
+        .create(&Path::from("data/replacement_inv.lance"))
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        value_schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    // Build replacement DataFile
+    let frag = dataset.get_fragment(0).unwrap();
+    let lance_schema: lance_core::datatypes::Schema = schema.as_ref().try_into().unwrap();
+    let value_field_id = lance_schema.field("value").unwrap().id;
+    let data_file = frag.data_file_for_field(value_field_id as u32).unwrap();
+    let mut new_data_file = data_file.clone();
+    new_data_file.path = "replacement_inv.lance".to_string();
+
+    // Commit DataReplacement
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Check: fragment 0 removed from fragment_bitmap
+    let indices = dataset.load_indices().await.unwrap();
+    let idx = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert!(
+        !idx.fragment_bitmap.as_ref().unwrap().contains(0),
+        "Fragment 0 should be removed from fragment_bitmap"
+    );
+}
+
+/// Regression test (lance-format/lance#6283): after in-place update via
+/// DataReplacement, stale FTS index entries for the replaced fragment must
+/// be blocked at query time so searches reflect the new data.
+#[tokio::test]
+async fn test_fts_stale_entries_after_data_replacement() {
+    use lance_index::scalar::{FullTextSearchQuery, inverted::InvertedIndexParams};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+
+    // Step 1: Create dataset with 2 rows in separate fragments
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![
+                "the quick brown fox",
+                "the lazy dog",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_fts_incremental_reindex",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force 2 fragments
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Step 2: Create FTS inverted index on 'text'
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Sanity check: "quick" and "lazy" should each return 1 result
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 3: Replace fragment 1's data file via DataReplacement.
+    // The fragment ID stays the same, but the text changes from
+    // "the lazy dog" to "a speedy cat". This prunes fragment 1
+    // from the FTS index's fragment_bitmap.
+    let frag1 = dataset.get_fragment(1).unwrap();
+    let old_data_file = frag1.metadata().files[0].clone();
+
+    // Write replacement data file with updated text
+    let replacement_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a speedy cat"])),
+        ],
+    )
+    .unwrap();
+    let replacement_path = dataset.data_dir().join("replacement.lance");
+    let object_writer = dataset
+        .object_store
+        .create(&replacement_path)
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let mut new_data_file = old_data_file.clone();
+    new_data_file.path = "replacement.lance".to_string();
+
+    let read_version = dataset.manifest.version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(1, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Verify the replacement worked — fragment 1 now has the new text
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 2);
+
+    // Step 4: FTS search should reflect the new data, not the old.
+    // Fragment 1 is unindexed (pruned from fragment_bitmap), so the
+    // scanner does a flat FTS scan on it and uses the index for fragment 0.
+
+    // "speedy" is in the new text for fragment 1 — found via flat scan.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("speedy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // "lazy" was in the OLD text for fragment 1. The index has stale
+    // posting entries for it, but fragment 1 was pruned from the
+    // fragment_bitmap. Flat scan of fragment 1 sees "a speedy cat"
+    // which doesn't match. So 0 results.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        0,
+        "Expected 0 results for 'lazy' (stale data, fragment 1 pruned from index)"
+    );
+
+    // "quick" is in fragment 0 which is still indexed — should still work.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+}
+
+/// Same scenario as test_fts_index_incremental_reindex_after_in_place_update
+/// but with a vector (IVF_PQ) index instead of FTS.
+#[tokio::test]
+async fn test_vector_index_after_data_replacement() {
+    use arrow_array::FixedSizeListArray;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+    use lance_testing::datagen::generate_random_array;
+
+    const DIM: usize = 32;
+    const ROWS_PER_FRAG: usize = 256;
+    const TOTAL: usize = ROWS_PER_FRAG * 2;
+
+    let fsl_field = ArrowField::new(
+        "vector",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIM as i32,
+        ),
+        true,
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        fsl_field,
+    ]));
+
+    // Step 1: Create dataset with TOTAL rows in 2 fragments.
+    let vectors = generate_random_array(TOTAL * DIM);
+    let vector_array =
+        Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+    let ids: Vec<i32> = (0..TOTAL as i32).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(ids)), vector_array.clone()],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_vec_data_replacement",
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAG,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // Step 2: Create IVF_PQ vector index
+    let ivf_params = IvfBuildParams::new(2);
+    let pq_params = PQBuildParams {
+        num_sub_vectors: 1,
+        ..Default::default()
+    };
+    let params = crate::index::vector::VectorIndexParams::with_ivf_pq_params(
+        lance_linalg::distance::MetricType::L2,
+        ivf_params,
+        pq_params,
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    // Sanity: nearest to all-zeros query with refine should return
+    // results from both fragments.
+    let query_zeros = Float32Array::from(vec![0.0_f32; DIM]);
+    let results = dataset
+        .scan()
+        .nearest("vector", &query_zeros, 10)
+        .unwrap()
+        .refine(10)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 10);
+
+    // Step 3: DataReplacement — replace fragment 1's data.
+    // Write all-999.0 vectors so they are very far from origin.
+    let frag1 = dataset.get_fragment(1).unwrap();
+    let frag1_id = frag1.id() as u64;
+    let old_data_file = frag1.metadata().files[0].clone();
+
+    let far_values: Vec<f32> = vec![999.0_f32; ROWS_PER_FRAG * DIM];
+    let far_vectors = Float32Array::from(far_values);
+    let far_vector_array =
+        FixedSizeListArray::try_new_from_values(far_vectors, DIM as i32).unwrap();
+    let replacement_ids: Vec<i32> = (ROWS_PER_FRAG as i32..(TOTAL as i32)).collect();
+    let replacement_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(replacement_ids)),
+            Arc::new(far_vector_array),
+        ],
+    )
+    .unwrap();
+
+    let replacement_path = dataset.data_dir().join("replacement.lance");
+    let object_writer = dataset
+        .object_store
+        .create(&replacement_path)
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let mut new_data_file = old_data_file.clone();
+    new_data_file.path = "replacement.lance".to_string();
+
+    let read_version = dataset.manifest.version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(frag1_id, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Step 4: Search — nearest to all-zeros WITHOUT refine.
+    // Fragment 1's vectors are now all-999.0 (very far from origin).
+    // The top-10 nearest should all come from fragment 0.
+    // If stale index entries leak through, results from fragment 1
+    // would appear with their old (closer) PQ-approximated distances.
+    let results = dataset
+        .scan()
+        .nearest("vector", &query_zeros, 10)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = results["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+    for i in 0..results.num_rows() {
+        assert!(
+            (ids.value(i) as usize) < ROWS_PER_FRAG,
+            "Result {} has id={} which is from fragment 1 (stale index entry leaked through)",
+            i,
+            ids.value(i)
+        );
+    }
+}
+
+/// Regression test: inverted (FTS) index should not carry stale data after
+/// merge_insert + compact + optimize_indices.
+///
+/// This is the FTS equivalent of test_merge_insert_with_reordered_columns_and_index.
+/// The inverted index's update() ignores the valid_old_fragments filter, so stale
+/// posting list entries from pruned fragments survive the merge and cause errors
+/// when queries try to resolve the old row addresses.
+#[tokio::test]
+async fn test_fts_index_stale_data_after_merge_insert_compact_optimize() {
+    use lance_index::scalar::{FullTextSearchQuery, inverted::InvertedIndexParams};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+
+    // Step 1: Create dataset with 2 rows in separate fragments
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![
+                "the quick brown fox",
+                "the lazy dog",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_fts_stale",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force 2 fragments
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Step 2: Create FTS inverted index on 'text'
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Sanity check: searching "quick" should return 1 result
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 3: merge_insert with reversed column order (text, id)
+    // This triggers the RewriteColumns/DataReplacement path, which prunes the
+    // index fragment bitmap for the 'text' column.
+    let reversed_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("text", DataType::Utf8, true),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source_batch = RecordBatch::try_new(
+        reversed_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "updated fox text",
+                "new entry here",
+            ])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch)],
+        reversed_schema.clone(),
+    ));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+    let mut dataset = dataset.as_ref().clone();
+
+    // Step 4: compact_files — moves rows to new fragment(s)
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    // Step 5: optimize_indices — should rebuild the FTS index without stale data.
+    // With the current bug, the inverted index ignores valid_old_fragments and
+    // merges stale posting list entries pointing at now-deleted fragments.
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Step 6: FTS search should not error and should return correct results.
+    // "quick" appeared in the original data for id=0 (never updated), so it
+    // should still be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'quick' after optimize, got {}",
+        results.num_rows()
+    );
+
+    // "lazy" was in the original text for id=1, but id=1 was updated to
+    // "updated fox text". The old posting for "lazy" should have been filtered
+    // out during the index update.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        0,
+        "Expected 0 results for 'lazy' (stale data should be filtered), got {}",
+        results.num_rows()
+    );
+
+    // "updated" should be found (new text for id=1)
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("updated".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // "entry" should be found (new row id=2)
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("entry".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 7: Another merge_insert should NOT error
+    let source_batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["final text"])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job2 = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+
+    let reader2 = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch2)],
+        schema.clone(),
+    ));
+    let (final_dataset, _) = merge_job2.execute(reader_to_stream(reader2)).await.unwrap();
+    final_dataset.validate().await.unwrap();
+}
+
+/// Regression test: when rows are updated in-place, the FTS index must
+/// invalidate old entries and allow re-indexing incrementally.
+///
+/// Sequence:
+/// 1. Write fragments 1 and 2.
+/// 2. Create FTS index covering fragments 1 and 2.
+/// 3. Update fragment 1 in-place via merge_insert (DataReplacement path).
+///    This removes fragment 1 from the index's fragment_bitmap.
+/// 4. Call optimize_indices (append) to create a new index segment covering
+///    the updated fragment 1.
+/// 5. Call optimize_indices (merge) to merge both segments. The first segment
+///    contains the old, invalidated values for fragment 1; the second segment
+///    contains the new, valid values. We must keep only the new values.
+#[tokio::test]
+async fn test_fts_index_incremental_reindex_after_in_place_update() {
+    use lance_index::scalar::{FullTextSearchQuery, inverted::InvertedIndexParams};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+
+    // Step 1: Create dataset with 2 rows in separate fragments
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![
+                "the quick brown fox",
+                "the lazy dog",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_fts_incremental_reindex",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force 2 fragments
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Step 2: Create FTS inverted index on 'text'
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Sanity check: "quick" and "lazy" should each return 1 result
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 3: merge_insert with reversed column order to trigger
+    // RewriteColumns/DataReplacement path, which prunes the index
+    // fragment bitmap for the updated fragment.
+    // Update id=1 ("the lazy dog" -> "a speedy cat")
+    let reversed_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("text", DataType::Utf8, true),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source_batch = RecordBatch::try_new(
+        reversed_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a speedy cat"])),
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch)],
+        reversed_schema.clone(),
+    ));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+    let mut dataset = dataset.as_ref().clone();
+
+    // Step 4: First optimize_indices (append) — creates a new index segment
+    // covering the updated (previously unindexed) fragment.
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    // At this point we have two index segments:
+    //  - Segment 1: original index (has old data for fragment with id=1)
+    //  - Segment 2: new delta index (has new data for the updated fragment)
+
+    // Step 5: Second optimize_indices (merge all) — merges both segments.
+    // The merge must discard old invalidated entries from segment 1 for
+    // the updated fragment and keep only the new entries from segment 2.
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Step 6: Verify search correctness after merge.
+
+    // "quick" was in the original data for id=0 (not updated), should still be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'quick' (id=0 was not updated), got {}",
+        results.num_rows()
+    );
+
+    // "lazy" was in the old text for id=1 which was updated to "a speedy cat".
+    // The old posting for "lazy" must have been filtered out during the merge.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        0,
+        "Expected 0 results for 'lazy' (stale data should be filtered), got {}",
+        results.num_rows()
+    );
+
+    // "speedy" is in the new text for id=1, should be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("speedy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'speedy' (new text for id=1), got {}",
+        results.num_rows()
+    );
+
+    // "cat" is in the new text for id=1, should be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("cat".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'cat' (new text for id=1), got {}",
+        results.num_rows()
+    );
+}
+
+/// Regression test for https://github.com/lance-format/lance/issues/6338
+/// Sub-schema merge_insert with binary columns on v2.2 causes data corruption
+/// when the binary values are >= 256 bytes.
+#[tokio::test]
+async fn test_sub_schema_merge_insert_binary_v2_2() {
+    use crate::dataset::write::merge_insert::WhenMatched;
+    use arrow_array::BinaryArray;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("a", DataType::Binary, true),
+        ArrowField::new("b", DataType::Utf8, true),
+    ]));
+
+    let test_uri = TempStrDir::default();
+
+    // Initial write: 2 rows with null binary values
+    let initial_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![0, 1])),
+            Arc::new(BinaryArray::from(vec![None::<&[u8]>, None])),
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+        ],
+    )
+    .unwrap();
+
+    let write_params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let batches = RecordBatchIterator::new(vec![initial_batch].into_iter().map(Ok), schema.clone());
+    Dataset::write(batches, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    let sub_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("a", DataType::Binary, true),
+    ]));
+
+    // Sub-schema merge_insert for row 0 (binary value >= 256 bytes)
+    let data_a: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+    {
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0])),
+                Arc::new(BinaryArray::from(vec![Some(data_a.as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![update_batch].into_iter().map(Ok),
+            sub_schema.clone(),
+        ));
+        MergeInsertBuilder::try_new(dataset.into(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+    }
+
+    // Read back and verify first merge worked
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let table = dataset
+        .scan()
+        .project(&["id", "a"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let table = concat_batches(&table[0].schema(), &table).unwrap();
+    assert_eq!(table.num_rows(), 2);
+
+    // Sub-schema merge_insert for row 1 (binary value >= 256 bytes)
+    let data_b: Vec<u8> = (0..256).map(|i| ((i + 100) % 251) as u8).collect();
+    {
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![Some(data_b.as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![update_batch].into_iter().map(Ok),
+            sub_schema.clone(),
+        ));
+        MergeInsertBuilder::try_new(dataset.into(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+    }
+
+    // Read back and verify - this is where the bug manifests
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let table = dataset
+        .scan()
+        .project(&["id", "a"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let table = concat_batches(&table[0].schema(), &table).unwrap();
+    assert_eq!(table.num_rows(), 2);
+
+    let a_col = table.column_by_name("a").unwrap();
+    let binary_arr = a_col.as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(binary_arr.value(0), data_a.as_slice());
+    assert_eq!(binary_arr.value(1), data_b.as_slice());
+}
+
+#[tokio::test]
+async fn test_fts_unfiltered_after_compaction_returns_remapped_row_ids() {
+    // After `compact_files` with `defer_index_remap = true`, queries
+    // read the old FTS index but must apply the dataset's
+    // FragReuseIndex remap. Otherwise the deferred-row_id path
+    // returns pre-compaction row_ids that no longer exist.
+    use arrow::datatypes::UInt64Type;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                "alpha first",
+                "alpha second",
+                "alpha third",
+                "alpha fourth",
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://test_fts_frag_reuse",
+        Some(WriteParams {
+            max_rows_per_file: 1, // 4 fragments -> 4 partitions
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let after = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(after.num_rows(), 4);
+    let returned: Vec<u64> = after[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+    let live: std::collections::HashSet<u64> =
+        dataset.scan().with_row_id().try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+    for id in &returned {
+        assert!(live.contains(id), "stale row_id {id}");
+    }
 }
