@@ -633,19 +633,13 @@ async fn test_main_branch_management() {
         .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
 
-    let main_branch_checkout = dataset.checkout_branch("main").await.unwrap();
-    assert_eq!(
-        main_branch_checkout.version().version,
-        dataset.version().version
-    );
-    assert_eq!(main_branch_checkout.manifest.branch, None);
+    let main_branch = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(main_branch.version().version, dataset.version().version);
+    assert_eq!(main_branch.manifest.branch, None);
 
-    let main_ref_checkout = dataset.checkout_version(("main", None)).await.unwrap();
-    assert_eq!(
-        main_ref_checkout.version().version,
-        dataset.version().version
-    );
-    assert_eq!(main_ref_checkout.manifest.branch, None);
+    let main_ref = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(main_ref.version().version, dataset.version().version);
+    assert_eq!(main_ref.manifest.branch, None);
 
     let Err(create_branch_err) = dataset.create_branch("main", ("main", None), None).await else {
         panic!("creating a branch named main should fail");
