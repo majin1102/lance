@@ -1103,6 +1103,14 @@ async fn test_versions_full_archive() {
     archive.add_entries(&entries);
     archive.flush().await.unwrap();
 
+    let version_1_manifest_path = dataset
+        .checkout_version(1)
+        .await
+        .unwrap()
+        .manifest_location
+        .path;
+    object_store.delete(&version_1_manifest_path).await.unwrap();
+
     // Open dataset and get versions
     let dataset = Dataset::open(test_uri).await.unwrap();
     let versions = dataset.versions().await.unwrap();
