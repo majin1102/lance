@@ -633,31 +633,49 @@ async fn test_main_branch_management() {
         .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
 
-    let checked_out = dataset.checkout_branch("main").await.unwrap();
-    assert_eq!(checked_out.version().version, dataset.version().version);
-    assert_eq!(checked_out.manifest.branch, None);
+    let main_branch_checkout = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(
+        main_branch_checkout.version().version,
+        dataset.version().version
+    );
+    assert_eq!(main_branch_checkout.manifest.branch, None);
 
-    let checked_out = dataset.checkout_version(("main", None)).await.unwrap();
-    assert_eq!(checked_out.version().version, dataset.version().version);
-    assert_eq!(checked_out.manifest.branch, None);
+    let main_ref_checkout = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(
+        main_ref_checkout.version().version,
+        dataset.version().version
+    );
+    assert_eq!(main_ref_checkout.manifest.branch, None);
 
-    let err = match dataset.create_branch("main", ("main", None), None).await {
-        Ok(_) => panic!("creating a branch named main should fail"),
-        Err(err) => err,
+    let Err(create_branch_err) = dataset.create_branch("main", ("main", None), None).await else {
+        panic!("creating a branch named main should fail");
     };
-    assert!(matches!(err, Error::InvalidRef { .. }));
-    assert!(err.to_string().contains("\"main\" is reserved"), "{err}");
+    assert!(matches!(create_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        create_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{create_branch_err}"
+    );
 
     assert!(!tempdir.std_path().join("tree").join("main").exists());
     assert!(dataset.list_branches().await.unwrap().is_empty());
 
-    let err = dataset.branches().get("main").await.unwrap_err();
-    assert!(matches!(err, Error::InvalidRef { .. }));
-    assert!(err.to_string().contains("\"main\" is reserved"), "{err}");
+    let get_branch_err = dataset.branches().get("main").await.unwrap_err();
+    assert!(matches!(get_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        get_branch_err.to_string().contains("\"main\" is reserved"),
+        "{get_branch_err}"
+    );
 
-    let err = dataset.delete_branch("main").await.unwrap_err();
-    assert!(matches!(err, Error::InvalidRef { .. }));
-    assert!(err.to_string().contains("\"main\" is reserved"), "{err}");
+    let delete_branch_err = dataset.delete_branch("main").await.unwrap_err();
+    assert!(matches!(delete_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        delete_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{delete_branch_err}"
+    );
 }
 
 #[tokio::test]
