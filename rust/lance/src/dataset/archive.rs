@@ -404,13 +404,12 @@ impl VersionArchive {
         let mut stream = object_store.list(Some(archive_dir.clone()));
         while let Some(meta) = stream.next().await {
             let meta = meta?;
-            if let Some(filename) = meta.location.filename() {
-                if let Some(version) = filename
+            if let Some(filename) = meta.location.filename()
+                && let Some(version) = filename
                     .strip_suffix(VERSION_ARCHIVE_FILE_SUFFIX)
                     .and_then(|s| s.parse::<u64>().ok())
-                {
-                    archives.push((version, meta.location));
-                }
+            {
+                archives.push((version, meta.location));
             }
         }
 
@@ -1019,13 +1018,12 @@ mod tests {
         let mut versions = Vec::new();
         let mut stream = fixture.archive.object_store.list(Some(archive_dir));
         while let Some(meta) = stream.next().await.transpose().unwrap() {
-            if let Some(filename) = meta.location.filename() {
-                if let Some(version) = filename
+            if let Some(filename) = meta.location.filename()
+                && let Some(version) = filename
                     .strip_suffix(VERSION_ARCHIVE_FILE_SUFFIX)
                     .and_then(|s| s.parse::<u64>().ok())
-                {
-                    versions.push(version);
-                }
+            {
+                versions.push(version);
             }
         }
 
