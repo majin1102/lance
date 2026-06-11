@@ -19,7 +19,7 @@ Branch names must follow these validation rules:
 6. Cannot end with `.lock`
 7. Cannot be named `main` (reserved for the default branch)
 
-`main` is a virtual name for the default branch. It may appear in API reference contexts as an alias for the default branch, but no branch metadata file named `main.json` is created.
+Branch names are case-sensitive, matching Git/GitHub ref semantics. The exact name `main` is a virtual name for the default branch. It may appear in API reference contexts as an alias for the default branch, but no branch metadata file named `main.json` is created.
 
 ### Branch Metadata Path
 
