@@ -430,7 +430,10 @@ impl Dataset {
         DatasetBuilder::from_uri(uri).load().await
     }
 
-    /// Check out a dataset version with a ref
+    /// Check out a dataset version with a ref.
+    ///
+    /// In reference contexts, `"main"` is an alias for the default branch and
+    /// is equivalent to `None`.
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let reference: refs::Ref = version.into();
         match reference {
@@ -473,7 +476,9 @@ impl Dataset {
         Ok(())
     }
 
-    /// Check out the latest version of the branch
+    /// Check out the latest version of the branch.
+    ///
+    /// Use `"main"` to check out the latest version of the default branch.
     pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
         self.checkout_by_ref(None, Some(branch)).await
     }
@@ -493,6 +498,8 @@ impl Dataset {
     /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
     /// failure if we use the same name to `create_branch`. In that case, you need to call
     /// `force_delete_branch` to interactively clean up the zombie dataset.
+    ///
+    /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     pub async fn create_branch(
         &mut self,
         branch: &str,

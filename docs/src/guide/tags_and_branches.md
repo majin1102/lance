@@ -15,8 +15,8 @@ The `reference` parameter (used in `create`, `update`, and `checkout_version`) a
 - An **integer**: version number in the **current branch** (e.g., `1`)
 - A **string**: tag name (e.g., `"stable"`)
 - A **tuple** `(branch_name, version)`: a specific version in a named branch
-  - `(None, 2)` means version 2 on the main branch
-  - `("main", 2)` means version 2 on the main branch (explicit)
+  - `(None, 2)` means version 2 on the default branch
+  - `("main", 2)` means version 2 on the default branch (explicit)
   - `("experiment", 3)` means version 3 on the experiment branch
   - `("branch-name", None)` means the latest version on that branch
 

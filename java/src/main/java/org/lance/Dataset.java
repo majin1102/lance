@@ -1690,10 +1690,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @return a new Dataset of the branch
    */
   public Dataset createBranch(String branch, Ref ref) {
@@ -1703,10 +1705,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @param storageOptions the storage options to create branch with
    * @return a new Dataset of the branch
    */
@@ -1727,8 +1731,9 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
-   * specified (branch_name, version_number).
+   * Checkout using a unified {@link Ref} which can be a tag, the latest version on the default
+   * branch or a named branch, or a specified (branch_name, version_number). In reference contexts,
+   * {@code "main"} is an alias for the default branch.
    *
    * @param ref the checkout reference
    * @return a new Dataset instance checked out to the specified reference
@@ -1765,7 +1770,7 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag on main branch. This is left for compatibility. We should use {@link
+     * Create a new tag on the default branch. This is left for compatibility. We should use {@link
      * #create(String, Ref)} instead.
      *
      * @param tag the tag name
@@ -1780,7 +1785,8 @@ public class Dataset implements Closeable {
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void create(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "Tag name cannot be null");
@@ -1797,6 +1803,8 @@ public class Dataset implements Closeable {
      *
      * @param tag the name of the tag to create
      * @param versionNumber the version number (or commit reference) to associate with the tag
+     * @param targetBranch the branch to tag. In reference contexts, {@code "main"} is an alias for
+     *     the default branch.
      */
     @Deprecated
     public void create(String tag, long versionNumber, String targetBranch) {
@@ -1816,11 +1824,11 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version_number on main. This is left for compatibility. We should use
-     * {@link #update(String, Ref)} instead.
+     * Update a tag to a new version_number on the default branch. This is left for compatibility.
+     * We should use {@link #update(String, Ref)} instead.
      *
      * @param tag the tag name
-     * @param versionNumber the versionNumber on main.
+     * @param versionNumber the versionNumber on the default branch.
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
@@ -1831,7 +1839,8 @@ public class Dataset implements Closeable {
      * Update a tag to a new reference.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void update(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "tag cannot be null");
@@ -1883,7 +1892,8 @@ public class Dataset implements Closeable {
     /**
      * Delete a branch and its metadata.
      *
-     * @param branchName the branch to delete
+     * @param branchName the branch to delete. {@code "main"} is reserved for the default branch and
+     *     cannot be deleted as a named branch.
      */
     public void delete(String branchName) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
