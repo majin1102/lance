@@ -1626,6 +1626,63 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
     final_dataset.validate().await.unwrap();
 }
 
+#[tokio::test]
+async fn test_btree_merge_deduplicates_row_addrs() {
+    // This public table flow creates an old BTree segment and a delta segment
+    // for the same row address. Merging them should not leave duplicate row
+    // addresses in the final flat page.
+    let batch = arrow_array::record_batch!(("id", Int32, [1]), ("payload", Int32, [10])).unwrap();
+    let test_uri = TempStrDir::default();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let source_batch =
+        arrow_array::record_batch!(("payload", Int32, [100]), ("id", Int32, [1])).unwrap();
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch.clone())],
+        source_batch.schema(),
+    ));
+    let (updated_dataset, _) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+    let mut dataset = updated_dataset.as_ref().clone();
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+
+    let actual = dataset
+        .scan()
+        .filter("id = 1")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(actual.num_rows(), 1);
+    assert_eq!(actual["id"].as_primitive::<Int32Type>().value(0), 1);
+    assert_eq!(actual["payload"].as_primitive::<Int32Type>().value(0), 100);
+}
+
 /// DataReplacement should invalidate index fragment bitmaps for replaced fields.
 #[tokio::test]
 async fn test_data_replacement_invalidates_index_bitmap() {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::{ops::Bound, sync::Arc};
 
@@ -9,21 +10,21 @@ use arrow_array::{
     ArrayRef, BooleanArray, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type,
 };
 
-use datafusion_common::DFSchema;
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream};
-use lance_core::Result;
 use lance_core::cache::CacheCodecImpl;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
 use crate::metrics::MetricsCollector;
-use crate::scalar::btree::BTREE_VALUES_COLUMN;
+use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
 
 const VALUES_COL_IDX: usize = 0;
@@ -51,8 +52,7 @@ impl DeepSizeOf for FlatIndex {
 impl FlatIndex {
     #[instrument(name = "FlatIndex::try_new", level = "debug", skip_all)]
     pub fn try_new(data: RecordBatch) -> Result<Self> {
-        // Sort by row id to make bitmap construction more efficient
-        let data = data.sort_by_column(IDS_COL_IDX, None)?;
+        let data = Self::normalize_batch(data)?;
 
         let has_nulls = data.column(VALUES_COL_IDX).null_count() > 0;
         let all_addrs_map = RowAddrTreeMap::from_sorted_iter(
@@ -123,6 +123,59 @@ impl FlatIndex {
             batch.schema(),
             vec![new_vals, new_ids],
         )?)
+    }
+
+    fn normalize_batch(data: RecordBatch) -> Result<RecordBatch> {
+        // Sort by row id to make bitmap construction more efficient.
+        let data = data.sort_by_column(IDS_COL_IDX, None)?;
+        let row_ids = data.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
+
+        if data.num_rows() <= 1 {
+            return Ok(data);
+        }
+
+        let mut keep_indices = Vec::with_capacity(data.num_rows());
+        keep_indices.push(0);
+
+        for idx in 1..data.num_rows() {
+            let row_id = row_ids.value(idx);
+            let last_kept_idx = *keep_indices.last().unwrap();
+            let last_kept_row_id = row_ids.value(last_kept_idx);
+
+            if row_id != last_kept_row_id {
+                keep_indices.push(idx);
+                continue;
+            }
+
+            if !Self::values_equal(data.column(VALUES_COL_IDX), idx, last_kept_idx)? {
+                let value = ScalarValue::try_from_array(data.column(VALUES_COL_IDX), idx)?;
+                let last_kept_value =
+                    ScalarValue::try_from_array(data.column(VALUES_COL_IDX), last_kept_idx)?;
+                return Err(Error::internal(format!(
+                    "BTree flat index contains duplicate row id with conflicting values: \
+                     row_id={row_id}, existing_value={last_kept_value}, duplicate_value={value}"
+                )));
+            }
+        }
+
+        if keep_indices.len() == data.num_rows() {
+            return Ok(data);
+        }
+
+        let keep_indices =
+            UInt64Array::from_iter_values(keep_indices.into_iter().map(|idx| idx as u64));
+        let columns = data
+            .columns()
+            .iter()
+            .map(|column| arrow_select::take::take(column, &keep_indices, None))
+            .collect::<std::result::Result<Vec<_>, arrow_schema::ArrowError>>()?;
+        Ok(RecordBatch::try_new(data.schema(), columns)?)
+    }
+
+    fn values_equal(values: &ArrayRef, left_idx: usize, right_idx: usize) -> Result<bool> {
+        let left = OrderableScalarValue(ScalarValue::try_from_array(values, left_idx)?);
+        let right = OrderableScalarValue(ScalarValue::try_from_array(values, right_idx)?);
+        Ok(left.cmp(&right) == Ordering::Equal)
     }
 
     fn get_null_addrs(sorted_batch: &RecordBatch) -> Result<RowAddrTreeMap> {
@@ -333,6 +386,40 @@ mod tests {
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());
         assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
+    }
+
+    #[test]
+    fn test_load_deduplicates_same_row_addr() {
+        // Loading should collapse redundant copies of the same value/row pair
+        // before building row-address maps.
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, Int32, [Some(10), Some(10), Some(11)]),
+            (BTREE_IDS_COLUMN, UInt64, [10, 10, 11])
+        )
+        .unwrap();
+
+        let index = FlatIndex::try_new(batch).unwrap();
+
+        assert_eq!(index.data.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_rejects_row_addr_with_different_values() {
+        // The same row address under different indexed values is not redundant;
+        // it would allow stale values to return the row.
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, Int32, [Some(10), Some(20)]),
+            (BTREE_IDS_COLUMN, UInt64, [10, 10])
+        )
+        .unwrap();
+
+        let err = FlatIndex::try_new(batch).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("BTree flat index contains duplicate row id with conflicting values"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
