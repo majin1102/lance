@@ -29,7 +29,8 @@ use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
 use arrow_array::{
-    Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
+    Array, ArrayAccessor, ArrowNativeTypeOp, BooleanArray, PrimitiveArray, RecordBatch,
+    UInt32Array,
     cast::AsArray,
     new_empty_array,
     types::{
@@ -1856,7 +1857,8 @@ impl BTreeIndex {
                 ..Default::default()
             },
         )?;
-        let merged_stream = chunk_concat_stream(unchunked, first.batch_size as usize);
+        let deduplicated = deduplicate_value_ordered_btree_rows(unchunked);
+        let merged_stream = chunk_concat_stream(deduplicated, first.batch_size as usize);
 
         let files =
             train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
@@ -1887,6 +1889,51 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+fn deduplicate_value_ordered_btree_rows(
+    stream: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let deduplicated = stream::try_unfold(
+        (stream, None::<ScalarValue>, HashSet::<u64>::new()),
+        |(mut stream, mut current_value, mut row_ids_for_value)| async move {
+            loop {
+                let Some(batch) = stream.next().await.transpose()? else {
+                    return Ok(None);
+                };
+
+                let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .expect_ok()?
+                    .as_primitive::<UInt64Type>();
+                let mut mask = Vec::with_capacity(batch.num_rows());
+
+                for idx in 0..batch.num_rows() {
+                    let value = ScalarValue::try_from_array(values, idx)?;
+                    match current_value.as_ref() {
+                        Some(current)
+                            if OrderableScalarValue(current.clone())
+                                .cmp(&OrderableScalarValue(value.clone()))
+                                == Ordering::Equal => {}
+                        _ => {
+                            current_value = Some(value);
+                            row_ids_for_value.clear();
+                        }
+                    }
+                    mask.push(row_ids_for_value.insert(row_ids.value(idx)));
+                }
+
+                let mask = BooleanArray::from(mask);
+                let batch = arrow_select::filter::filter_record_batch(&batch, &mask)?;
+                if batch.num_rows() > 0 {
+                    return Ok(Some((batch, (stream, current_value, row_ids_for_value))));
+                }
+            }
+        },
+    );
+    Box::pin(RecordBatchStreamAdapter::new(schema, deduplicated))
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
