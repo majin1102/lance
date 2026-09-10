@@ -768,35 +768,24 @@ impl FilteredReadStream {
         };
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
-        let (row_id_sequence, num_logical_rows, index_upper_ranges) = if dataset
-            .manifest
-            .uses_stable_row_ids()
-        {
-            let (row_id_sequence, index_upper_ranges) = if let Some(routing) = stable_index_routing
-            {
-                (routing.row_id_sequence, routing.upper_ranges)
+        let (row_id_sequence, num_logical_rows, index_upper_ranges) =
+            if dataset.manifest.uses_stable_row_ids() {
+                let (row_id_sequence, index_upper_ranges) =
+                    if let Some(routing) = stable_index_routing {
+                        (routing.row_id_sequence, routing.upper_ranges)
+                    } else {
+                        (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
+                    };
+                let num_logical_rows = row_id_sequence.len();
+                (row_id_sequence, num_logical_rows, index_upper_ranges)
             } else {
-                (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
+                debug_assert!(stable_index_routing.is_none());
+                let row_ids_start = frag.id << 32;
+                let row_ids_end = row_ids_start + num_physical_rows;
+                let num_logical_rows = file_fragment.count_rows(None).await? as u64;
+                let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
+                (addrs_as_ids, num_logical_rows, None)
             };
-            if row_id_sequence.len() != num_physical_rows {
-                return Err(Error::internal(format!(
-                    "row-id sequence length={} does not match physical_row_count={} for fragment_id={} in dataset version={}",
-                    row_id_sequence.len(),
-                    num_physical_rows,
-                    frag.id,
-                    dataset.version().version
-                )));
-            }
-            let num_logical_rows = row_id_sequence.len();
-            (row_id_sequence, num_logical_rows, index_upper_ranges)
-        } else {
-            debug_assert!(stable_index_routing.is_none());
-            let row_ids_start = frag.id << 32;
-            let row_ids_end = row_ids_start + num_physical_rows;
-            let num_logical_rows = file_fragment.count_rows(None).await? as u64;
-            let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
-            (addrs_as_ids, num_logical_rows, None)
-        };
         Ok(LoadedFragment {
             row_id_sequence,
             index_upper_ranges,
@@ -2846,6 +2835,7 @@ impl RowStreamRead {
     fn plan_batch_from_addresses(
         addrs: &RowAddrTreeMap,
         fragments: &StreamFragments,
+        physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
     ) -> FilteredReadInternalPlan {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         for (fragment_id, requested) in addrs.iter() {
@@ -2856,6 +2846,16 @@ impl RowStreamRead {
             let requested = match requested {
                 RowAddrSelection::Full => vec![0..fragment.num_physical_rows],
                 RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
+            };
+            let requested = match physical_row_addr_prefilter {
+                Some(allowed) => match allowed.get(fragment_id) {
+                    Some(RowAddrSelection::Full) => requested,
+                    Some(RowAddrSelection::Partial(bitmap)) => {
+                        FilteredReadStream::intersect_ranges(&requested, &bitmap_to_ranges(bitmap))
+                    }
+                    None => continue,
+                },
+                None => requested,
             };
             let valid = FilteredReadStream::full_frag_range(
                 fragment.num_physical_rows,
@@ -2879,6 +2879,7 @@ impl RowStreamRead {
         ids: RowAddrTreeMap,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
         fragments: &StreamFragments,
+        physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
     ) -> FilteredReadInternalPlan {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         let (Some(min_key), Some(max_key)) = (arrow::compute::min(keys), arrow::compute::max(keys))
@@ -2902,13 +2903,24 @@ impl RowStreamRead {
             if offsets.is_empty() {
                 continue;
             }
+            let fragment_id = fragment.fragment.id() as u32;
+            let offsets = match physical_row_addr_prefilter {
+                Some(allowed) => match allowed.get(&fragment_id) {
+                    Some(RowAddrSelection::Full) => offsets,
+                    Some(RowAddrSelection::Partial(bitmap)) => {
+                        FilteredReadStream::intersect_ranges(&offsets, &bitmap_to_ranges(bitmap))
+                    }
+                    None => continue,
+                },
+                None => offsets,
+            };
             let valid = FilteredReadStream::full_frag_range(
                 fragment.num_physical_rows,
                 &fragment.deletion_vector,
             );
             let matched = FilteredReadStream::intersect_ranges(&valid, &offsets);
             if !matched.is_empty() {
-                rows.insert(fragment.fragment.id() as u32, matched);
+                rows.insert(fragment_id, matched);
             }
         }
         FilteredReadInternalPlan {
@@ -2954,12 +2966,26 @@ impl RowStreamRead {
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
+        let physical_row_addr_prefilter = self
+            .source
+            .read_options
+            .physical_row_addr_prefilter
+            .as_deref();
         // Row ids equal row addresses when the dataset does not use stable
         // row ids, so either key resolves directly by position
         if self.source.key_column == ROW_ADDR || !self.dataset.manifest.uses_stable_row_ids() {
-            Ok(Self::plan_batch_from_addresses(&batch_keys, fragments))
+            Ok(Self::plan_batch_from_addresses(
+                &batch_keys,
+                fragments,
+                physical_row_addr_prefilter,
+            ))
         } else {
-            Ok(Self::plan_batch_from_row_ids(batch_keys, keys, fragments))
+            Ok(Self::plan_batch_from_row_ids(
+                batch_keys,
+                keys,
+                fragments,
+                physical_row_addr_prefilter,
+            ))
         }
     }
 
@@ -3342,8 +3368,13 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
+            let num_rows = if self.options.physical_row_addr_prefilter.is_some() {
+                Precision::Inexact(total_rows as usize)
+            } else {
+                Precision::Exact(total_rows as usize)
+            };
             return Ok(Arc::new(Statistics {
-                num_rows: Precision::Exact(total_rows as usize),
+                num_rows,
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
             }));
         };
@@ -4694,6 +4725,17 @@ mod tests {
         let stats = plan.partition_statistics(None).unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
+
+        // A physical selection can exclude rows within a fragment, so the
+        // fragment row count is only an upper bound until the read is planned.
+        let mut physical_rows = RowAddrTreeMap::new();
+        physical_rows.insert_range(0..3);
+        let options = base_options
+            .clone()
+            .with_physical_row_addr_prefilter(Arc::new(physical_rows));
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(250));
 
         // No filter with range (before or after) is still exact
         let options = base_options
@@ -6343,6 +6385,75 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::Int32Type>();
             assert_eq!(i_col.value(0), 12);
+        }
+
+        /// A physical selection further narrows row-stream keys within each fragment.
+        #[rstest]
+        #[case::by_row_addr(false, ROW_ADDR)]
+        #[case::by_row_id(false, ROW_ID)]
+        #[case::stable_by_row_addr(true, ROW_ADDR)]
+        #[case::stable_by_row_id(true, ROW_ID)]
+        #[tokio::test]
+        async fn take_intersects_physical_selection(
+            #[case] stable_row_ids: bool,
+            #[case] key: &str,
+        ) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            // Rows 3 and 21 are inside the physical selection. Row 8 is in a
+            // selected fragment but outside its range, and row 15 is in an
+            // unselected fragment.
+            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
+                vec![3, 8, 21, 15]
+            } else {
+                vec![addr(0, 3), addr(0, 8), addr(2, 1), addr(1, 5)]
+            };
+            let input_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("score", DataType::Float32, false),
+                ArrowField::new(key, DataType::UInt64, true),
+            ]));
+            let input = RecordBatch::try_new(
+                input_schema,
+                vec![
+                    Arc::new(Float32Array::from(vec![0.9, 0.8, 0.7, 0.6])),
+                    Arc::new(UInt64Array::from(keys)),
+                ],
+            )
+            .unwrap();
+
+            let mut physical_rows = RowAddrTreeMap::new();
+            physical_rows.insert_range(addr(0, 2)..addr(0, 5));
+            physical_rows.insert_range(addr(2, 0)..addr(2, 2));
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection)
+                    .with_physical_row_addr_prefilter(Arc::new(physical_rows)),
+                Some(rows_input(vec![input])),
+            )
+            .unwrap();
+
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(
+                result
+                    .column_by_name("i")
+                    .unwrap()
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values(),
+                &[3, 21]
+            );
+            assert_eq!(
+                result
+                    .column_by_name("score")
+                    .unwrap()
+                    .as_primitive::<Float32Type>()
+                    .values(),
+                &[0.9, 0.7]
+            );
         }
 
         /// A batch whose keys span the whole id range but hit only two rows:

@@ -600,8 +600,8 @@ public class ScanOptions {
      *
      * <p>Each slice is interpreted against the dataset snapshot used to create the scanner. When
      * {@link #fragmentIds(List)} is also set, both restrictions are applied. Slice order is not an
-     * output ordering contract; results follow the scanner's fragment and physical-row order. Plain
-     * scans with fragment slices require V2 storage; legacy V1 storage throws {@link
+     * output ordering contract; results follow the scanner's fragment and physical-row order.
+     * Fragment slices require V2 storage; legacy V1 storage throws {@link
      * UnsupportedOperationException} when the scan is executed. Fragment slices currently cannot be
      * combined with nearest-neighbor or full-text search.
      *

@@ -363,6 +363,9 @@ fn apply_fragment_slices(
                         "physical row count does not fit in u64 for fragment_id={fragment_id}"
                     ))
                 })?;
+            // JNI validates while the original Java slice values are still available so errors
+            // can identify rowOffset and rowCount. Scanner validation intentionally repeats the
+            // canonical bounds checks for native callers and deserialized execution plans.
             let mut validated_ranges = Vec::with_capacity(ranges.len());
             for (row_offset, row_count) in ranges {
                 let end = row_offset.checked_add(row_count).ok_or_else(|| {
@@ -371,7 +374,7 @@ fn apply_fragment_slices(
                         dataset.version().version
                     ))
                 })?;
-                if row_offset > physical_row_count || end > physical_row_count {
+                if end > physical_row_count {
                     return Err(Error::input_error(format!(
                         "fragment slice is outside fragment bounds: fragment_id={fragment_id}, row_offset={row_offset}, row_count={row_count}, physical_row_count={physical_row_count}, dataset_version={}",
                         dataset.version().version

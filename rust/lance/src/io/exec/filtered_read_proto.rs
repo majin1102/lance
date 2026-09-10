@@ -129,6 +129,8 @@ fn fr_options_to_proto(
         .physical_row_addr_prefilter
         .as_ref()
         .map(|rows| {
+            let mut rows = rows.as_ref().clone();
+            rows.optimize();
             let mut bytes = Vec::with_capacity(rows.serialized_size());
             rows.serialize_into(&mut bytes)?;
             Ok::<Vec<u8>, Error>(bytes)
@@ -810,7 +812,7 @@ mod tests {
         let ctx = SessionContext::new();
         let state = ctx.state();
 
-        let rows = RowAddrTreeMap::from_iter([7u64]);
+        let rows = RowAddrTreeMap::from_iter(0..1_000_000);
         let options = FilteredReadOptions::basic_full_read(&dataset)
             .with_physical_row_addr_prefilter(Arc::new(rows.clone()));
         let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
@@ -818,14 +820,14 @@ mod tests {
 
         let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
         assert!(proto.plan.is_none());
-        assert!(
-            proto
-                .options
-                .as_ref()
-                .unwrap()
-                .physical_row_addr_allowlist
-                .is_some()
-        );
+        let serialized_rows = proto
+            .options
+            .as_ref()
+            .unwrap()
+            .physical_row_addr_allowlist
+            .as_ref()
+            .unwrap();
+        assert!(serialized_rows.len() < 1024);
 
         let back = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
             .await
