@@ -18,6 +18,10 @@ use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
+pub(crate) mod dist_table_quant;
+pub mod ex_dot;
+pub(crate) mod pairwise;
+pub mod prune;
 pub mod rotation;
 pub mod storage;
 pub mod transform;
@@ -25,6 +29,8 @@ pub mod transform;
 pub const RABIT_MIN_NUM_BITS: u8 = 1;
 pub const RABIT_MAX_NUM_BITS: u8 = 9;
 pub const RABIT_BINARY_NUM_BITS: u8 = 1;
+/// Default number of bits per dimension for IVF_RQ indexes.
+pub(crate) const RABIT_DEFAULT_NUM_BITS: u8 = 5;
 
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}
@@ -62,8 +68,9 @@ impl BinaryQuantization {
 ///
 /// Use the sign bit of the float vector to represent the binary vector.
 fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
-    let iter = data.chunks_exact(8);
-    iter.clone()
+    let (chunks, remainder) = data.as_chunks::<8>();
+    chunks
+        .iter()
         .map(|c| {
             // Auto vectorized.
             // Before changing this code, please check the assembly output.
@@ -75,7 +82,7 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
         })
         .chain(once(0).map(move |_| {
             let mut bits: u8 = 0;
-            iter.remainder().iter().enumerate().for_each(|(idx, v)| {
+            remainder.iter().enumerate().for_each(|(idx, v)| {
                 bits |= (v.is_sign_positive() as u8) << idx;
             });
             bits
@@ -107,6 +114,7 @@ impl FromStr for RQRotationType {
 
 #[derive(Clone, Debug)]
 pub struct RQBuildParams {
+    /// Number of bits per dimension. Defaults to 5.
     pub num_bits: u8,
     pub rotation_type: RQRotationType,
     /// Optional pre-built rotation to reuse instead of generating a fresh random one.
@@ -190,7 +198,7 @@ impl QuantizerBuildParams for RQBuildParams {
 impl Default for RQBuildParams {
     fn default() -> Self {
         Self {
-            num_bits: 1,
+            num_bits: RABIT_DEFAULT_NUM_BITS,
             rotation_type: RQRotationType::default(),
             rotation: None,
         }
@@ -232,6 +240,11 @@ mod tests {
             RQRotationType::Matrix
         );
         assert!("invalid".parse::<RQRotationType>().is_err());
+    }
+
+    #[test]
+    fn test_rq_build_params_default_num_bits() {
+        assert_eq!(RQBuildParams::default().num_bits, 5);
     }
 
     #[test]

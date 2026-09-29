@@ -28,10 +28,13 @@ from lance_namespace import (
     AlterTransactionResponse,
     AnalyzeTableQueryPlanRequest,
     CountTableRowsRequest,
+    CountTableRowsResponse,
     CreateMaterializedViewRequest,
     CreateMaterializedViewResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableBranchRequest,
+    CreateTableBranchResponse,
     CreateTableIndexRequest,
     CreateTableIndexResponse,
     CreateTableRequest,
@@ -42,6 +45,8 @@ from lance_namespace import (
     DeclareTableResponse,
     DeleteFromTableRequest,
     DeleteFromTableResponse,
+    DeleteTableBranchRequest,
+    DeleteTableBranchResponse,
     DeleteTableTagRequest,
     DeleteTableTagResponse,
     DeregisterTableRequest,
@@ -70,6 +75,8 @@ from lance_namespace import (
     LanceNamespace,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableBranchesRequest,
+    ListTableBranchesResponse,
     ListTableIndicesRequest,
     ListTableIndicesResponse,
     ListTablesRequest,
@@ -81,6 +88,8 @@ from lance_namespace import (
     MergeInsertIntoTableRequest,
     MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
+    NamespaceExistsResponse,
+    QueryTableResponse,
     RefreshMaterializedViewRequest,
     RefreshMaterializedViewResponse,
     RegisterTableRequest,
@@ -90,6 +99,7 @@ from lance_namespace import (
     RestoreTableRequest,
     RestoreTableResponse,
     TableExistsRequest,
+    TableExistsResponse,
     UpdateTableRequest,
     UpdateTableResponse,
     UpdateTableSchemaMetadataRequest,
@@ -336,12 +346,13 @@ class DirectoryNamespace(LanceNamespace):
     >>>
     >>> # With AWS credential vending (requires credential-vendor-aws feature)
     >>> # Use **dict to pass property names with dots
-    >>> ns = lance.namespace.DirectoryNamespace(**{
+    >>> aws_properties = {
     ...     "root": "s3://my-bucket/data",
     ...     "credential_vendor.enabled": "true",
     ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
     ...     "credential_vendor.aws_duration_millis": "3600000",
-    ... })
+    ... }
+    >>> # ns = lance.namespace.DirectoryNamespace(**aws_properties)
 
     With dynamic context provider:
 
@@ -406,8 +417,11 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.drop_namespace(request.model_dump())
         return DropNamespaceResponse.from_dict(response_dict)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
         self._inner.namespace_exists(request.model_dump())
+        return NamespaceExistsResponse()
 
     # Table operations
 
@@ -423,8 +437,9 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.register_table(request.model_dump())
         return RegisterTableResponse.from_dict(response_dict)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
         self._inner.table_exists(request.model_dump())
+        return TableExistsResponse()
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
         response_dict = self._inner.drop_table(request.model_dump())
@@ -516,7 +531,9 @@ class DirectoryNamespace(LanceNamespace):
 
     # Data manipulation operations
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+    def count_table_rows(
+        self, request: CountTableRowsRequest
+    ) -> CountTableRowsResponse:
         """Count the number of rows in a table, optionally filtered by a predicate.
 
         Parameters
@@ -526,10 +543,11 @@ class DirectoryNamespace(LanceNamespace):
 
         Returns
         -------
-        int
-            The number of rows matching the criteria
+        CountTableRowsResponse
+            Response whose ``count`` is the number of rows matching the criteria
         """
-        return self._inner.count_table_rows(request.model_dump())
+        count = self._inner.count_table_rows(request.model_dump())
+        return CountTableRowsResponse(count=count)
 
     def insert_into_table(
         self, request: InsertIntoTableRequest, request_data: bytes
@@ -609,7 +627,7 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.delete_from_table(request.model_dump())
         return DeleteFromTableResponse.from_dict(response_dict)
 
-    def query_table(self, request) -> bytes:
+    def query_table(self, request) -> QueryTableResponse:
         """Query a table and return results as Arrow IPC.
 
         Parameters
@@ -620,12 +638,13 @@ class DirectoryNamespace(LanceNamespace):
 
         Returns
         -------
-        bytes
-            Arrow IPC file format containing the query results
+        QueryTableResponse
+            Response whose ``data`` is the query results in Arrow IPC file format
         """
         if hasattr(request, "model_dump"):
             request = request.model_dump()
-        return self._inner.query_table(request)
+        data = self._inner.query_table(request)
+        return QueryTableResponse(data=data)
 
     # Index operations
 
@@ -849,6 +868,27 @@ class DirectoryNamespace(LanceNamespace):
         """Update a tag to point to a different version."""
         response_dict = self._inner.update_table_tag(request.model_dump())
         return UpdateTableTagResponse.from_dict(response_dict)
+
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        """Create a new branch forked from a table version."""
+        response_dict = self._inner.create_table_branch(request.model_dump())
+        return CreateTableBranchResponse.from_dict(response_dict)
+
+    def list_table_branches(
+        self, request: ListTableBranchesRequest
+    ) -> ListTableBranchesResponse:
+        """List all branches of a table."""
+        response_dict = self._inner.list_table_branches(request.model_dump())
+        return ListTableBranchesResponse.from_dict(response_dict)
+
+    def delete_table_branch(
+        self, request: DeleteTableBranchRequest
+    ) -> DeleteTableBranchResponse:
+        """Delete a branch from a table."""
+        response_dict = self._inner.delete_table_branch(request.model_dump())
+        return DeleteTableBranchResponse.from_dict(response_dict)
 
     # Operation metrics methods
 
@@ -976,8 +1016,11 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.drop_namespace(request.model_dump())
         return DropNamespaceResponse.from_dict(response_dict)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
         self._inner.namespace_exists(request.model_dump())
+        return NamespaceExistsResponse()
 
     # Table operations
 
@@ -993,8 +1036,9 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.register_table(request.model_dump())
         return RegisterTableResponse.from_dict(response_dict)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
         self._inner.table_exists(request.model_dump())
+        return TableExistsResponse()
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
         response_dict = self._inner.drop_table(request.model_dump())
@@ -1086,7 +1130,9 @@ class RestNamespace(LanceNamespace):
 
     # Data manipulation operations
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+    def count_table_rows(
+        self, request: CountTableRowsRequest
+    ) -> CountTableRowsResponse:
         """Count the number of rows in a table, optionally filtered by a predicate.
 
         Parameters
@@ -1096,10 +1142,11 @@ class RestNamespace(LanceNamespace):
 
         Returns
         -------
-        int
-            The number of rows matching the criteria
+        CountTableRowsResponse
+            Response whose ``count`` is the number of rows matching the criteria
         """
-        return self._inner.count_table_rows(request.model_dump())
+        count = self._inner.count_table_rows(request.model_dump())
+        return CountTableRowsResponse(count=count)
 
     def insert_into_table(
         self, request: InsertIntoTableRequest, request_data: bytes
@@ -1179,7 +1226,7 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.delete_from_table(request.model_dump())
         return DeleteFromTableResponse.from_dict(response_dict)
 
-    def query_table(self, request) -> bytes:
+    def query_table(self, request) -> QueryTableResponse:
         """Query a table and return results as Arrow IPC.
 
         Parameters
@@ -1190,12 +1237,13 @@ class RestNamespace(LanceNamespace):
 
         Returns
         -------
-        bytes
-            Arrow IPC file format containing the query results
+        QueryTableResponse
+            Response whose ``data`` is the query results in Arrow IPC file format
         """
         if hasattr(request, "model_dump"):
             request = request.model_dump()
-        return self._inner.query_table(request)
+        data = self._inner.query_table(request)
+        return QueryTableResponse(data=data)
 
     # Index operations
 
@@ -1419,6 +1467,27 @@ class RestNamespace(LanceNamespace):
         """Update a tag to point to a different version."""
         response_dict = self._inner.update_table_tag(request.model_dump())
         return UpdateTableTagResponse.from_dict(response_dict)
+
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        """Create a new branch forked from a table version."""
+        response_dict = self._inner.create_table_branch(request.model_dump())
+        return CreateTableBranchResponse.from_dict(response_dict)
+
+    def list_table_branches(
+        self, request: ListTableBranchesRequest
+    ) -> ListTableBranchesResponse:
+        """List all branches of a table."""
+        response_dict = self._inner.list_table_branches(request.model_dump())
+        return ListTableBranchesResponse.from_dict(response_dict)
+
+    def delete_table_branch(
+        self, request: DeleteTableBranchRequest
+    ) -> DeleteTableBranchResponse:
+        """Delete a branch from a table."""
+        response_dict = self._inner.delete_table_branch(request.model_dump())
+        return DeleteTableBranchResponse.from_dict(response_dict)
 
     # Operation metrics methods
 

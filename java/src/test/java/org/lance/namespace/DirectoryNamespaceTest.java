@@ -190,6 +190,33 @@ public class DirectoryNamespaceTest {
   }
 
   @Test
+  void testOpenSpecificVersionDoesNotPassVersionToDescribeTable() throws Exception {
+    VersionRejectingNamespace versionRejectingNamespace =
+        new VersionRejectingNamespace(innerNamespaceClient);
+    namespaceClient = versionRejectingNamespace;
+    List<String> tableId = Arrays.asList("test_table");
+
+    namespaceClient.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+    namespaceClient.insertIntoTable(
+        new InsertIntoTableRequest().id(tableId).mode("append"), createTestTableData());
+
+    try (Dataset versionOne =
+        Dataset.open()
+            .allocator(allocator)
+            .namespaceClient(namespaceClient)
+            .tableId(tableId)
+            .readOptions(new ReadOptions.Builder().setVersion(1L).build())
+            .build()) {
+      assertEquals(1, versionOne.version());
+      assertEquals(3, versionOne.countRows());
+    }
+
+    assertTrue(
+        versionRejectingNamespace.getDescribeTableCallCount() > 0,
+        "Expected describeTable to be called when opening through namespace");
+  }
+
+  @Test
   void testCreateAndListNamespaces() {
     // Create a namespace
     CreateNamespaceRequest createReq = new CreateNamespaceRequest().id(Arrays.asList("workspace"));
@@ -1134,7 +1161,7 @@ public class DirectoryNamespaceTest {
     // Count rows
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(3, count);
   }
 
@@ -1156,7 +1183,7 @@ public class DirectoryNamespaceTest {
         new CountTableRowsRequest()
             .id(Arrays.asList("workspace", "test_table"))
             .predicate("age > 28");
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(2, count); // Alice (30) and Charlie (35)
   }
 
@@ -1183,7 +1210,7 @@ public class DirectoryNamespaceTest {
     // Verify row count increased
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(6, count);
   }
 
@@ -1206,7 +1233,7 @@ public class DirectoryNamespaceTest {
             .id(Arrays.asList("workspace", "test_table"))
             .k(10)
             .vector(new QueryTableRequestVector());
-    byte[] resultBytes = namespaceClient.queryTable(queryReq);
+    byte[] resultBytes = namespaceClient.queryTable(queryReq).getData();
     assertNotNull(resultBytes);
     assertTrue(resultBytes.length > 0);
   }
@@ -1437,6 +1464,27 @@ public class DirectoryNamespaceTest {
         writer.writeBatch();
       }
       return out.toByteArray();
+    }
+  }
+
+  private static class VersionRejectingNamespace extends CustomNamespace {
+    private final AtomicInteger describeTableCallCount = new AtomicInteger();
+
+    VersionRejectingNamespace(DirectoryNamespace inner) {
+      super(inner);
+    }
+
+    @Override
+    public DescribeTableResponse describeTable(DescribeTableRequest request) {
+      describeTableCallCount.incrementAndGet();
+      assertNull(
+          request.getVersion(),
+          "Dataset version should be passed to dataset open, not describeTable");
+      return super.describeTable(request);
+    }
+
+    int getDescribeTableCallCount() {
+      return describeTableCallCount.get();
     }
   }
 }

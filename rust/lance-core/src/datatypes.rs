@@ -18,13 +18,14 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+    BlobVersion, Encoding, Field, LANCE_FIELD_ID_KEY, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
     LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
-    escape_field_path_for_project, format_field_path, parse_field_path,
+    escape_field_path_for_project, format_field_path, format_field_path_minimal, parse_field_path,
+    validate_fixed_size_list_dimensions,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -47,6 +48,84 @@ pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
+/// The minimal logical blob v2 fields accepted from writers.
+///
+/// Logical values may also use [`BLOB_V2_LOGICAL_FIELDS`] when an external
+/// object range is present.
+pub static BLOB_V2_LOGICAL_MINIMAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+    ])
+});
+
+/// The complete logical blob v2 fields used for writer input and rewrite output.
+///
+/// `position` and `size` are an optional range within the external object named
+/// by `uri`; when present, `size` must be greater than zero. Every non-null row
+/// must set exactly one of `data` and `uri`. These fields do not describe
+/// Lance-managed data, packed, or dedicated storage.
+pub static BLOB_V2_LOGICAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    let mut fields = BLOB_V2_LOGICAL_MINIMAL_FIELDS
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.extend([
+        Arc::new(ArrowField::new("position", DataType::UInt64, true)),
+        Arc::new(ArrowField::new("size", DataType::UInt64, true)),
+    ]);
+    Fields::from(fields)
+});
+
+/// The complete logical blob v2 struct type.
+pub static BLOB_V2_LOGICAL_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()));
+
+/// Writer-prepared blob v2 fields consumed by the structural encoder.
+///
+/// The populated fields depend on [`BlobKind`]:
+///
+/// - [`BlobKind::Inline`] carries `data`; the encoder derives the stored
+///   `position` and `size` from the out-of-line buffer it creates.
+/// - [`BlobKind::Packed`] carries `blob_id`, `position`, and `blob_size`.
+/// - [`BlobKind::Dedicated`] carries `blob_id` and `blob_size`; its stored
+///   `position` is zero.
+/// - [`BlobKind::External`] carries `uri`, optional `blob_id`, `position`, and
+///   `blob_size`. A zero `blob_size` is resolved to the complete external object
+///   length when read.
+///
+/// `blob_size` is distinct from the logical `size`, which is only an optional
+/// external-object range before preparation. For external blobs, `uri` is
+/// normalized into the stable stored `blob_uri` field.
+pub static BLOB_V2_PREPARED_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("kind", DataType::UInt8, true),
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("blob_id", DataType::UInt32, true),
+        ArrowField::new("blob_size", DataType::UInt64, true),
+        ArrowField::new("position", DataType::UInt64, true),
+    ])
+});
+
+/// The writer-prepared blob v2 struct type.
+pub static BLOB_V2_PREPARED_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_PREPARED_FIELDS.clone()));
+
+/// Stored blob v2 descriptor fields.
+///
+/// These field names are part of the stable file format. Their meaning depends
+/// on `kind`:
+///
+/// - [`BlobKind::Inline`]: `position` and `size` locate an out-of-line buffer in
+///   the Lance data file.
+/// - [`BlobKind::Packed`]: `blob_id` identifies a shared packed blob file, and
+///   `position` and `size` locate a range within it.
+/// - [`BlobKind::Dedicated`]: `blob_id` identifies a dedicated raw blob file,
+///   `position` is zero, and `size` is the complete file length.
+/// - [`BlobKind::External`]: `blob_uri` and `blob_id` identify the object, while
+///   `position` and `size` select a range. A zero `size` is resolved to the
+///   object's complete length when read.
 pub static BLOB_V2_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
         ArrowField::new("kind", DataType::UInt8, false),
@@ -70,25 +149,95 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
-/// Blob v2 user-view struct fields used by internal rewrite paths.
-///
-/// This schema converts the descriptor view back into the write-side view used
-/// by blob compaction.
-pub static BLOB_V2_USER_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
-    Fields::from(vec![
-        ArrowField::new("data", DataType::LargeBinary, true),
-        ArrowField::new("uri", DataType::Utf8, true),
-        ArrowField::new("position", DataType::UInt64, true),
-        ArrowField::new("size", DataType::UInt64, true),
-    ])
-});
+/// The in-memory representation of a blob v2 struct.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobV2Layout {
+    /// Writer input or rewrite output.
+    ///
+    /// Both the minimal `data, uri` fields and the complete
+    /// `data, uri, position, size` fields have this layout.
+    Logical,
+    /// Kind-aware writer intermediate consumed by the structural encoder.
+    Prepared,
+    /// Stable descriptor stored in Lance files and returned by descriptor scans.
+    Descriptor,
+}
 
-/// Blob v2 user-view struct type used by internal rewrite paths.
-///
-/// This schema converts the descriptor view back into the write-side view used
-/// by blob compaction.
-pub static BLOB_V2_USER_TYPE: LazyLock<DataType> =
-    LazyLock::new(|| DataType::Struct(BLOB_V2_USER_FIELDS.clone()));
+impl BlobV2Layout {
+    /// Classify blob v2 child fields by name, type, order, and layout-specific
+    /// nullability requirements.
+    ///
+    /// Child metadata is not part of the representation. The complete logical
+    /// layout also accepts non-nullable `position` and `size` fields, matching
+    /// the existing writer-input contract. Descriptor child nullability is
+    /// ignored because it changed across released schemas; row nullness has
+    /// been represented by either parent struct validity or a nullable `kind`
+    /// child.
+    pub fn classify(fields: &Fields) -> Option<Self> {
+        if logical_blob_v2_fields_match(fields) {
+            Some(Self::Logical)
+        } else if blob_v2_fields_match(fields, &BLOB_V2_PREPARED_FIELDS, true) {
+            Some(Self::Prepared)
+        } else if blob_v2_fields_match(fields, &BLOB_V2_DESC_FIELDS, false) {
+            Some(Self::Descriptor)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for BlobV2Layout {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Logical => write!(f, "logical"),
+            Self::Prepared => write!(f, "prepared"),
+            Self::Descriptor => write!(f, "descriptor"),
+        }
+    }
+}
+
+fn blob_v2_field_matches(
+    actual: &ArrowField,
+    expected: &ArrowField,
+    compare_nullability: bool,
+) -> bool {
+    actual.name() == expected.name()
+        && actual.data_type() == expected.data_type()
+        && (!compare_nullability || actual.is_nullable() == expected.is_nullable())
+}
+
+fn blob_v2_fields_match(actual: &Fields, expected: &Fields, compare_nullability: bool) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| {
+                blob_v2_field_matches(actual.as_ref(), expected.as_ref(), compare_nullability)
+            })
+}
+
+fn logical_blob_v2_fields_match(fields: &Fields) -> bool {
+    if blob_v2_fields_match(fields, &BLOB_V2_LOGICAL_MINIMAL_FIELDS, true) {
+        return true;
+    }
+    fields.len() == BLOB_V2_LOGICAL_FIELDS.len()
+        && fields
+            .iter()
+            .zip(BLOB_V2_LOGICAL_FIELDS.iter())
+            .enumerate()
+            .all(|(index, (actual, expected))| {
+                blob_v2_field_matches(actual.as_ref(), expected.as_ref(), index < 2)
+            })
+}
+
+/// Deprecated name for [`BLOB_V2_LOGICAL_FIELDS`].
+#[deprecated(note = "use BLOB_V2_LOGICAL_FIELDS")]
+pub use self::BLOB_V2_LOGICAL_FIELDS as BLOB_V2_USER_FIELDS;
+
+/// Deprecated name for [`BLOB_V2_LOGICAL_TYPE`].
+#[deprecated(note = "use BLOB_V2_LOGICAL_TYPE")]
+pub use self::BLOB_V2_LOGICAL_TYPE as BLOB_V2_USER_TYPE;
 
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
@@ -116,7 +265,7 @@ impl LogicalType {
         self.0.starts_with("fixed_size_list:struct:")
     }
 
-    fn is_struct(&self) -> bool {
+    pub fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
 
@@ -380,14 +529,17 @@ impl TryFrom<&LogicalType> for DataType {
                     }
                 }
                 "timestamp" => {
-                    if splits.len() != 3 {
+                    if splits.len() < 3 {
                         Err(Error::schema(format!("Unsupported timestamp type: {}", lt)))
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
-                        let tz: Option<Arc<str>> = if splits[2] == "-" {
+                        // A fixed-offset timezone such as "+08:00" contains a colon, so the
+                        // trailing segments must be rejoined instead of read as a single one.
+                        let tz_str = splits[2..].join(":");
+                        let tz: Option<Arc<str>> = if tz_str == "-" {
                             None
                         } else {
-                            Some(splits[2].into())
+                            Some(tz_str.into())
                         };
                         Ok(Timestamp(timeunit, tz))
                     }
@@ -459,5 +611,193 @@ impl TryFrom<u8> for BlobKind {
                 format!("Unknown blob kind {other:?}").into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::Schema as ArrowSchema;
+    use rstest::rstest;
+
+    #[test]
+    fn test_classify_blob_v2_layouts() {
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_LOGICAL_MINIMAL_FIELDS),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_LOGICAL_FIELDS),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_PREPARED_FIELDS),
+            Some(BlobV2Layout::Prepared)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_DESC_FIELDS),
+            Some(BlobV2Layout::Descriptor)
+        );
+    }
+
+    #[test]
+    fn test_classify_blob_v2_layout_uses_structural_contract() {
+        let logical_with_required_range = Fields::from(vec![
+            ArrowField::new("data", DataType::LargeBinary, true),
+            ArrowField::new("uri", DataType::Utf8, true),
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt64, false),
+        ]);
+        assert_eq!(
+            BlobV2Layout::classify(&logical_with_required_range),
+            Some(BlobV2Layout::Logical)
+        );
+
+        let prepared_with_child_metadata =
+            Fields::from(
+                BLOB_V2_PREPARED_FIELDS
+                    .iter()
+                    .map(|field| {
+                        Arc::new(field.as_ref().clone().with_metadata(HashMap::from([(
+                            "source".to_string(),
+                            "test".to_string(),
+                        )])))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        assert_eq!(
+            BlobV2Layout::classify(&prepared_with_child_metadata),
+            Some(BlobV2Layout::Prepared)
+        );
+
+        let nullable_descriptor = Fields::from(
+            BLOB_V2_DESC_FIELDS
+                .iter()
+                .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&nullable_descriptor),
+            Some(BlobV2Layout::Descriptor)
+        );
+
+        let malformed_descriptor = Fields::from(vec![
+            ArrowField::new("kind", DataType::UInt8, false),
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt32, false),
+            ArrowField::new("blob_id", DataType::UInt32, false),
+            ArrowField::new("blob_uri", DataType::Utf8, false),
+        ]);
+        assert_eq!(BlobV2Layout::classify(&malformed_descriptor), None);
+    }
+
+    /// The `timestamp:<unit>:<timezone>` encoding embeds the timezone verbatim, so a
+    /// fixed-offset zone such as `+08:00` contributes a colon of its own. Round-tripping
+    /// every timezone shape guards the parser against splitting on that colon.
+    #[rstest]
+    #[case::second_no_timezone(TimeUnit::Second, None)]
+    #[case::millisecond_no_timezone(TimeUnit::Millisecond, None)]
+    #[case::microsecond_no_timezone(TimeUnit::Microsecond, None)]
+    #[case::nanosecond_no_timezone(TimeUnit::Nanosecond, None)]
+    #[case::named_utc(TimeUnit::Microsecond, Some("UTC"))]
+    #[case::named_region(TimeUnit::Nanosecond, Some("America/Los_Angeles"))]
+    #[case::offset_without_colon(TimeUnit::Microsecond, Some("+0800"))]
+    #[case::offset_positive(TimeUnit::Microsecond, Some("+08:00"))]
+    #[case::offset_negative(TimeUnit::Millisecond, Some("-05:00"))]
+    #[case::offset_half_hour(TimeUnit::Nanosecond, Some("+05:30"))]
+    #[case::offset_zero(TimeUnit::Second, Some("+00:00"))]
+    fn test_timestamp_logical_type_round_trip(
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+    ) {
+        let data_type = DataType::Timestamp(timeunit, timezone.map(Arc::from));
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(
+            DataType::try_from(&logical_type).unwrap(),
+            data_type,
+            "logical type: {logical_type}"
+        );
+    }
+
+    /// Pins the on-disk spelling as well as the round trip: the timezone is written
+    /// verbatim, which is why the parser cannot assume a fixed segment count.
+    #[rstest]
+    #[case::no_timezone(TimeUnit::Second, None, "timestamp:s:-")]
+    #[case::named_utc(TimeUnit::Millisecond, Some("UTC"), "timestamp:ms:UTC")]
+    #[case::offset_positive(TimeUnit::Microsecond, Some("+08:00"), "timestamp:us:+08:00")]
+    #[case::offset_negative(TimeUnit::Nanosecond, Some("-05:00"), "timestamp:ns:-05:00")]
+    fn test_timestamp_logical_type_encoding(
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let data_type = DataType::Timestamp(timeunit, timezone.map(Arc::from));
+        assert_eq!(
+            LogicalType::try_from(&data_type).unwrap().to_string(),
+            expected
+        );
+    }
+
+    /// Opening an existing dataset parses the stored string directly, so cover that
+    /// direction on its own rather than only as half of a round trip.
+    #[rstest]
+    #[case::offset_positive("timestamp:us:+08:00", TimeUnit::Microsecond, Some("+08:00"))]
+    #[case::offset_negative("timestamp:ms:-05:00", TimeUnit::Millisecond, Some("-05:00"))]
+    #[case::offset_half_hour("timestamp:ns:+05:30", TimeUnit::Nanosecond, Some("+05:30"))]
+    #[case::named_utc("timestamp:s:UTC", TimeUnit::Second, Some("UTC"))]
+    #[case::no_timezone("timestamp:us:-", TimeUnit::Microsecond, None)]
+    fn test_parse_timestamp_logical_type(
+        #[case] encoded: &str,
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+    ) {
+        assert_eq!(
+            DataType::try_from(&LogicalType::from(encoded)).unwrap(),
+            DataType::Timestamp(timeunit, timezone.map(Arc::from))
+        );
+    }
+
+    /// `Field::data_type` unwraps the parse, so a timezone it cannot read surfaces as a
+    /// panic instead of an error. Walk the Arrow -> Lance -> Arrow trip end to end.
+    #[test]
+    fn test_field_round_trip_with_fixed_offset_timezone() {
+        let data_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+08:00".into()));
+        let arrow_field = ArrowField::new("ts", data_type.clone(), true);
+        let field = Field::try_from(&arrow_field).unwrap();
+        assert_eq!(field.data_type(), data_type);
+        assert_eq!(ArrowField::from(&field), arrow_field);
+    }
+
+    /// The conversion a write performs, mixing both timezone spellings in one schema.
+    #[test]
+    fn test_schema_round_trip_with_fixed_offset_timezone() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "ts_offset",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+08:00".into())),
+                true,
+            ),
+            ArrowField::new(
+                "ts_named",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(ArrowSchema::from(&schema), arrow_schema);
+    }
+
+    /// A timezone cannot be recovered from fewer than three segments, and an unknown
+    /// time unit is still an error, so neither becomes collateral damage of the rejoin.
+    #[rstest]
+    #[case::unit_and_timezone_missing("timestamp")]
+    #[case::timezone_missing("timestamp:us")]
+    #[case::unknown_timeunit("timestamp:decade:UTC")]
+    #[case::unknown_timeunit_with_offset("timestamp:decade:+08:00")]
+    fn test_malformed_timestamp_logical_type_is_rejected(#[case] encoded: &str) {
+        assert!(
+            DataType::try_from(&LogicalType::from(encoded)).is_err(),
+            "expected {encoded} to be rejected"
+        );
     }
 }
