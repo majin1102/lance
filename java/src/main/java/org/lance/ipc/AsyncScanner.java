@@ -28,6 +28,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -69,6 +70,7 @@ public class AsyncScanner implements AutoCloseable {
               dataset,
               options.getFragmentIds(),
               options.getFragmentSlices(),
+              options.getIndexSegments(),
               options.getColumns(),
               options.getSubstraitFilter(),
               options.getFilter(),
@@ -102,6 +104,7 @@ public class AsyncScanner implements AutoCloseable {
       Dataset dataset,
       Optional<List<Integer>> fragmentIds,
       Optional<List<FragmentSlice>> fragmentSlices,
+      Optional<List<UUID>> indexSegments,
       Optional<List<String>> columns,
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,

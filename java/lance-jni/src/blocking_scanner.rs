@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{import_vec_from_method, import_vec_to_rust};
+use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
@@ -30,6 +30,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
+use uuid::Uuid;
 
 use crate::{
     RT, block_on,
@@ -260,6 +261,7 @@ fn get_document_granularity(
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
     pub fragment_slices_obj: JObject<'a>,
+    pub index_segments_obj: JObject<'a>,
     pub columns_obj: JObject<'a>,
     pub substrait_filter_obj: JObject<'a>,
     pub filter_obj: JObject<'a>,
@@ -465,6 +467,13 @@ pub(crate) fn build_scanner_with_options<'a>(
         &options.fragment_slices_obj,
         fragment_ids_opt.as_deref(),
     )?;
+
+    env.get_optional(&options.index_segments_obj, |env, java_segments| {
+        let index_segments: Vec<Uuid> =
+            import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+        scanner.with_index_segments(index_segments)?;
+        Ok(())
+    })?;
 
     let columns_opt = env.get_strings_opt(&options.columns_obj)?;
     if let Some(columns) = columns_opt {
@@ -675,6 +684,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,    // Optional<List<Integer>>
     fragment_slices_obj: JObject<'local>, // Optional<List<FragmentSlice>>
+    index_segments_obj: JObject<'local>,  // Optional<List<UUID>>
     columns_obj: JObject<'local>,         // Optional<List<String>>
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
     filter_obj: JObject<'local>,          // Optional<String>
@@ -708,6 +718,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             jdataset,
             fragment_ids_obj,
             fragment_slices_obj,
+            index_segments_obj,
             columns_obj,
             substrait_filter_obj,
             filter_obj,
@@ -743,6 +754,7 @@ fn inner_create_scanner<'local>(
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
     fragment_slices_obj: JObject<'local>,
+    index_segments_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
@@ -777,6 +789,7 @@ fn inner_create_scanner<'local>(
     let options = ScannerOptions {
         fragment_ids_obj,
         fragment_slices_obj,
+        index_segments_obj,
         columns_obj,
         substrait_filter_obj,
         filter_obj,
