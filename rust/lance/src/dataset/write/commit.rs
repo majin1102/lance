@@ -13,7 +13,7 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
+use crate::io::commit::default_commit_retry_timeout;
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -54,6 +54,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Set only by `Dataset::deep_clone`, after it has copied the source files.
+    deep_clone_files_copied: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -73,11 +75,12 @@ impl<'a> CommitBuilder<'a> {
             session: None,
             detached: false,
             commit_config: Default::default(),
-            retry_timeout: DEFAULT_COMMIT_RETRY_TIMEOUT,
+            retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            deep_clone_files_copied: false,
         }
     }
 
@@ -95,11 +98,14 @@ impl<'a> CommitBuilder<'a> {
 
     /// Pass the storage format to use for the dataset.
     ///
-    /// This is only needed when creating a new empty table. If any data files are
-    /// passed, the storage format will be inferred from the data files.
+    /// On creation, this sets the default storage version. If omitted, the version
+    /// is inferred from homogeneous data files, or uses the stable version for an
+    /// empty table. Creating from mixed prewritten files requires an explicit default.
     ///
-    /// All data files must use the same storage format as the existing dataset.
-    /// If a different format is passed, an error will be returned.
+    /// For an existing dataset, this only sets the manifest default on overwrite;
+    /// other operations preserve the existing default. If
+    /// prewritten fragments introduce another exact V2 version, the commit
+    /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
         self.storage_format = Some(storage_format.resolve());
 
@@ -274,6 +280,17 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Mark this commit as the last step of [`Dataset::deep_clone`], which has
+    /// already copied the source's data, deletion and index files to the
+    /// destination.
+    ///
+    /// A deep `Operation::Clone` points every file at the destination but the
+    /// commit itself copies nothing, so it is rejected unless this is set.
+    pub(crate) fn with_deep_clone_files_copied(mut self) -> Self {
+        self.deep_clone_files_copied = true;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -301,6 +318,21 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        if matches!(
+            transaction.operation,
+            Operation::Clone {
+                is_shallow: false,
+                ..
+            }
+        ) && !self.deep_clone_files_copied
+        {
+            return Err(Error::invalid_input(
+                "A deep Clone cannot be committed directly: the commit does not copy the \
+                 source files, so the new dataset would reference files that do not exist. \
+                 Use deep_clone instead.",
+            ));
+        }
+
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -417,21 +449,6 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-        // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset()
-            && let Some(storage_format) = self.storage_format
-        {
-            let passed_storage_format = DataStorageFormat::new(storage_format);
-            if ds.manifest.data_storage_format != passed_storage_format
-                && !matches!(transaction.operation, Operation::Overwrite { .. })
-            {
-                return Err(Error::invalid_input_source(format!(
-                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                    ds.manifest.data_storage_format,
-                    passed_storage_format
-                ).into()));
-            }
-        }
 
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
@@ -608,6 +625,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
     use lance_table::format::{
@@ -901,8 +919,11 @@ mod tests {
     #[test]
     fn test_commit_retry_timeout_default_is_thirty_seconds() {
         let builder = CommitBuilder::new("memory://default-retry-timeout");
-        assert_eq!(builder.retry_timeout, DEFAULT_COMMIT_RETRY_TIMEOUT);
-        assert_eq!(DEFAULT_COMMIT_RETRY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(builder.retry_timeout, default_commit_retry_timeout());
+        assert_eq!(
+            crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT,
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]
@@ -930,6 +951,61 @@ mod tests {
         assert!(
             matches!(res, Err(Error::InvalidInput { .. })),
             "got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_deep_clone_requires_deep_clone_api() {
+        let source_dir = TempStrDir::default();
+        let source = InsertBuilder::new(source_dir.as_str())
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let clone_txn = |is_shallow| {
+            Transaction::new(
+                source.manifest.version,
+                Operation::Clone {
+                    is_shallow,
+                    ref_name: None,
+                    ref_version: source.manifest.version,
+                    ref_path: source.uri().to_string(),
+                    branch_name: None,
+                },
+                None,
+            )
+        };
+
+        // Committed directly, a deep clone would reference files never copied
+        // to the destination.
+        let deep_dir = TempStrDir::default();
+        let res = CommitBuilder::new(deep_dir.as_str())
+            .execute(clone_txn(false))
+            .await;
+        assert!(
+            matches!(res, Err(Error::InvalidInput { .. })),
+            "got {res:?}"
+        );
+        assert!(Dataset::open(deep_dir.as_str()).await.is_err());
+
+        // A shallow clone reads the source files in place, so it stays allowed.
+        let shallow_dir = TempStrDir::default();
+        let shallow = CommitBuilder::new(shallow_dir.as_str())
+            .execute(clone_txn(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            shallow.scan().try_into_batch().await.unwrap().num_rows(),
+            10
         );
     }
 

@@ -202,37 +202,6 @@ public class AsyncScannerTest {
   }
 
   @Test
-  void testAsyncScanWithIgnoredScalarIndex(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("async_scanner_ignored_scalar_index").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-
-      try (Dataset dataset = testDataset.write(1, 40)) {
-        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{}");
-        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-        IndexOptions indexOptions =
-            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
-                .withIndexName("id_btree_index")
-                .replace(true)
-                .build();
-        dataset.createIndex(indexOptions);
-
-        ScanOptions options =
-            new ScanOptions.Builder()
-                .filter("id < 20")
-                .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
-                .build();
-        try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
-            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
-          assertEquals(20, countRows(reader));
-        }
-      }
-    }
-  }
-
-  @Test
   void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("async_scanner_fast_search_scalar_index").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -268,6 +237,19 @@ public class AsyncScannerTest {
             ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
             assertEquals(5, countRows(reader));
             reader.close();
+          }
+
+          // Without an index query, fast search falls back to both fragments. A dropped
+          // ignore list in the async JNI path would incorrectly return only five rows.
+          ScanOptions ignoredOptions =
+              new ScanOptions.Builder()
+                  .filter("id < 5")
+                  .fastSearch(true)
+                  .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
+                  .build();
+          try (AsyncScanner scanner = AsyncScanner.create(appended, ignoredOptions, allocator);
+              ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+            assertEquals(10, countRows(reader));
           }
         }
       }

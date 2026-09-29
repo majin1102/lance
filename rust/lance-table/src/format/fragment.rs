@@ -13,7 +13,10 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
-use super::row_ids::{ExternalFile, RowIdMeta};
+use super::row_ids::{
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    RowIdMeta,
+};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -318,13 +321,9 @@ impl DataFileFieldInterner {
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
                 Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
             }
-            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                file,
-            ) => Ok(RowDatasetVersionMeta::External(ExternalFile {
-                path: file.path,
-                offset: file.offset,
-                size: file.size,
-            })),
+            pb::data_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(_) => {
+                Ok(RowDatasetVersionMeta::Column)
+            }
         }
     }
 
@@ -337,12 +336,8 @@ impl DataFileFieldInterner {
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
                 Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
             }
-            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
-                Ok(RowDatasetVersionMeta::External(ExternalFile {
-                    path: file.path,
-                    offset: file.offset,
-                    size: file.size,
-                }))
+            pb::data_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
+                Ok(RowDatasetVersionMeta::Column)
             }
         }
     }
@@ -571,6 +566,98 @@ impl Fragment {
             .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
     }
 
+    /// Whether any of this fragment's row lineage sequences lives in a data
+    /// file column rather than inline.
+    pub fn has_spilled_row_lineage(&self) -> bool {
+        matches!(self.row_id_meta, Some(RowIdMeta::Column))
+            || matches!(
+                self.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            )
+            || matches!(
+                self.last_updated_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            )
+    }
+
+    /// The data file holding the row lineage column with the reserved
+    /// `field_id`, which is the one entry of [`Self::files`] whose fields carry
+    /// it. `None` when no file does, which for a sequence whose metadata says
+    /// it is spilled is corruption; so is more than one file carrying the id,
+    /// which this reports as an error.
+    pub fn row_lineage_file(&self, field_id: i32) -> Result<Option<&DataFile>> {
+        let mut carriers = self
+            .files
+            .iter()
+            .filter(|file| file.fields.contains(&field_id));
+        let file = carriers.next();
+        if let Some(extra) = carriers.next() {
+            return Err(Error::corrupt_file_named(
+                &extra.path,
+                format!(
+                    "fragment {} has more than one data file carrying row lineage field {}",
+                    self.id, field_id
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// The reserved field ids of the row lineage sequences this fragment
+    /// marks as spilled: [`ROW_ID_FIELD_ID`] when its row ids are, and
+    /// likewise [`ROW_CREATED_AT_VERSION_FIELD_ID`] and
+    /// [`ROW_LAST_UPDATED_AT_VERSION_FIELD_ID`] for its versions.
+    ///
+    /// These ids are never in the dataset schema, so code that decides whether
+    /// a data file is still needed by its schema fields has to keep a file
+    /// carrying one of them as well: that file is the sequence's only copy.
+    pub fn spilled_row_lineage_field_ids(&self) -> Vec<i32> {
+        let mut field_ids = Vec::new();
+        if matches!(self.row_id_meta, Some(RowIdMeta::Column)) {
+            field_ids.push(ROW_ID_FIELD_ID);
+        }
+        if matches!(
+            self.created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_CREATED_AT_VERSION_FIELD_ID);
+        }
+        if matches!(
+            self.last_updated_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_LAST_UPDATED_AT_VERSION_FIELD_ID);
+        }
+        field_ids
+    }
+
+    /// Check that every sequence this fragment marks as spilled has exactly
+    /// one carrier among [`Self::files`], and that the carrier is a v2 file,
+    /// the only version that can hold the columns.
+    ///
+    /// This reads metadata only. Committing a fragment that fails it would
+    /// publish lineage no reader can load, and once cleanup removed the
+    /// unreferenced carrier that lineage would be lost for good.
+    pub(crate) fn validate_row_lineage_carriers(&self) -> Result<()> {
+        for field_id in self.spilled_row_lineage_field_ids() {
+            let Some(file) = self.row_lineage_file(field_id)? else {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: it marks row lineage field {} as spilled but \
+                     none of its data files carries it",
+                    self.id, field_id
+                )));
+            };
+            if file.file_version()? == ConcreteFileVersion::V1 {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: its spilled row lineage field {} is carried by \
+                     legacy v1 data file {}, which cannot hold row lineage columns",
+                    self.id, field_id, file.path
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_json(json: &str) -> Result<Self> {
         let fragment: Self = serde_json::from_str(json)?;
         Ok(fragment)
@@ -653,15 +740,15 @@ impl Fragment {
         // Determine version from first file
         let Some(sample_file) = fragments
             .iter()
-            .find(|f| !f.files.is_empty())
-            .map(|f| &f.files[0])
+            .flat_map(Self::referenced_lance_files)
+            .next()
         else {
             return Ok(None);
         };
         let file_version = sample_file.file_version()?;
         // Ensure all files match
         for frag in fragments {
-            for file in &frag.files {
+            for file in frag.referenced_lance_files() {
                 let this_file_version = file.file_version()?;
                 if file_version != this_file_version {
                     return Err(Error::invalid_input(format!(
@@ -733,14 +820,10 @@ impl From<&Fragment> for pb::DataFragment {
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
             RowIdMeta::Inline(data) => {
-                pb::data_fragment::RowIdSequence::InlineRowIds(data.to_vec())
+                pb::data_fragment::RowIdSequence::InlineRowIds(data.bytes().clone())
             }
-            RowIdMeta::External(file) => {
-                pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                })
+            RowIdMeta::Column => {
+                pb::data_fragment::RowIdSequence::ColumnRowIds(pb::RowLineageColumn {})
             }
         });
         let last_updated_at_version_sequence =
@@ -951,6 +1034,23 @@ mod tests {
             Fragment::try_infer_version(&[v2_0.clone(), v2_0_second]).unwrap(),
             Some(ConcreteFileVersion::V2_0)
         );
+
+        let mut mixed_overlay = v2_0.clone();
+        mixed_overlay.overlays.push(DataOverlayFile {
+            data_file: DataFile::new(
+                "overlay-v2_1.lance",
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_1,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+            committed_version: 1,
+        });
+        let error = Fragment::try_infer_version(&[mixed_overlay]).unwrap_err();
+        assert!(error.to_string().contains("2.0"));
+        assert!(error.to_string().contains("2.1"));
 
         let v2_1 = Fragment::new(2).with_file(
             "v2_1.lance",
