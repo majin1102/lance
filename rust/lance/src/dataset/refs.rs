@@ -339,6 +339,9 @@ impl Tags<'_> {
             }
         };
 
+        // Direct Ref::Version construction bypasses normalization in the tuple conversions.
+        let branch = branch.as_deref().and_then(standardize_branch);
+
         let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
