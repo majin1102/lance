@@ -3254,7 +3254,7 @@ mod tests {
                     ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
                 ] {
                     let file = DataFile::new(
-                        &format!("lineage-{field_id}.lance"),
+                        format!("lineage-{field_id}.lance"),
                         vec![field_id],
                         vec![0],
                         ConcreteFileVersion::V2_0,
