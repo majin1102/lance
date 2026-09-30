@@ -27,6 +27,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
 use crate::Dataset;
+use crate::dataset::fragment_slice::validate_physical_rows;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
@@ -38,6 +39,10 @@ use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 // =============================================================================
 
 /// Convert a [`FilteredReadExec`] to proto for serialization.
+///
+/// Sliced plans require coordinated planner/executor upgrades. Older executors
+/// can ignore the physical allowlist and read outside the requested slices;
+/// this wire protocol does not negotiate capabilities.
 ///
 /// Uses `table_identifier_from_dataset` by default (no manifest bytes).
 /// The caller can replace the `table` field with
@@ -66,6 +71,10 @@ pub async fn filtered_read_exec_to_proto(
 }
 
 /// Reconstruct a [`FilteredReadExec`] from proto.
+///
+/// A supplied dataset must be the snapshot used to plan the scan. Sliced plans
+/// require the planner and all executors to support physical row selections;
+/// mixed-version execution with older executors is unsupported.
 pub async fn filtered_read_exec_from_proto(
     proto: pb::FilteredReadExecProto,
     dataset: Option<Arc<Dataset>>,
@@ -187,14 +196,13 @@ async fn fr_options_from_proto(
     // particular, a serialized exec may not have a pre-computed plan yet.
     if let Some(bytes) = proto.physical_row_addr_allowlist {
         let rows = RowAddrTreeMap::deserialize_from(Cursor::new(bytes))?;
+        validate_physical_rows(dataset, &rows).await?;
         options = options.with_physical_row_addr_prefilter(Arc::new(rows));
     }
 
     // Scan ranges
     if let Some(range) = proto.scan_range_before_filter {
-        options = options
-            .with_scan_range_before_filter(range_from_proto(&range))
-            .map_err(|e| Error::internal(e.to_string()))?;
+        options = options.with_scan_range_before_filter(range_from_proto(&range))?;
     }
     if let Some(range) = proto.scan_range_after_filter {
         options = options
@@ -270,8 +278,10 @@ pub fn plan_to_proto(
     filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
 ) -> Result<pb::FilteredReadPlanProto> {
-    let mut buf = Vec::with_capacity(plan.rows.serialized_size());
-    plan.rows.serialize_into(&mut buf)?;
+    let mut rows = plan.rows.clone();
+    rows.optimize();
+    let mut buf = Vec::with_capacity(rows.serialized_size());
+    rows.serialize_into(&mut buf)?;
 
     // Deduplicate filter expressions by Arc pointer identity.
     let mut ptr_to_id: HashMap<*const Expr, u32> = HashMap::new();
@@ -812,7 +822,7 @@ mod tests {
         let ctx = SessionContext::new();
         let state = ctx.state();
 
-        let rows = RowAddrTreeMap::from_iter(0..1_000_000);
+        let rows = RowAddrTreeMap::from_iter(0..10);
         let options = FilteredReadOptions::basic_full_read(&dataset)
             .with_physical_row_addr_prefilter(Arc::new(rows.clone()));
         let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
@@ -835,6 +845,84 @@ mod tests {
         assert_eq!(
             back.options().physical_row_addr_prefilter.as_deref(),
             Some(&rows)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing_fragment(42, 0, "not present")]
+    #[case::invalid_offset(0, 1_000_000, "physical_row_count")]
+    #[tokio::test]
+    async fn test_physical_selection_decode_validation(
+        #[case] fragment_id: u32,
+        #[case] row_offset: u32,
+        #[case] message: &str,
+    ) {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let exec = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset),
+            None,
+        )
+        .unwrap();
+        let mut proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let rows = RowAddrTreeMap::from_iter([u64::from(
+            lance_core::utils::address::RowAddress::new_from_parts(fragment_id, row_offset),
+        )]);
+        let mut bytes = Vec::new();
+        rows.serialize_into(&mut bytes).unwrap();
+        proto.options.as_mut().unwrap().physical_row_addr_allowlist = Some(bytes);
+        let error = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_physical_selection_rejects_prefilter_range() {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let rows = Arc::new(RowAddrTreeMap::from_iter([0]));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_physical_row_addr_prefilter(rows.clone());
+        let error = options
+            .clone()
+            .with_scan_range_before_filter(0..1)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        let reversed = FilteredReadOptions::basic_full_read(&dataset)
+            .with_scan_range_before_filter(0..1)
+            .unwrap()
+            .with_physical_row_addr_prefilter(rows);
+        let error = FilteredReadExec::try_new(dataset.clone(), reversed, None).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let mut proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        proto.options.as_mut().unwrap().scan_range_before_filter = Some(range_to_proto(&(0..1)));
+        let error = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_physical_selection_plan_compression() {
+        let state = SessionContext::new().state();
+        let plan = FilteredReadPlan {
+            rows: RowAddrTreeMap::from_iter(0..1_000_000),
+            filters: HashMap::new(),
+            scan_range_after_filter: None,
+        };
+        let proto = plan_to_proto(&plan, &Arc::new(ArrowSchema::empty()), &state).unwrap();
+        assert!(proto.row_addr_tree_map.len() < 1024);
+        assert!(proto.row_addr_tree_map.len() * 10 < plan.rows.serialized_size());
+        assert_eq!(
+            RowAddrTreeMap::deserialize_from(Cursor::new(proto.row_addr_tree_map)).unwrap(),
+            plan.rows
         );
     }
 
