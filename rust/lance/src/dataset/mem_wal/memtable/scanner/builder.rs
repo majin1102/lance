@@ -705,8 +705,7 @@ impl MemTableScanner {
 
     /// Set the number of probes for IVF search.
     ///
-    /// This is a convenience method that sets both minimum and maximum nprobes
-    /// to the same value, guaranteeing exactly `n` partitions will be searched.
+    /// Sets both the minimum and maximum to `n`.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(ref mut q) = self.nearest {
             q.nprobes = n;
@@ -1235,7 +1234,8 @@ impl MemTableScanner {
         // is the only correct arm here. An upper bound is safe on HNSW: it
         // trims the far tail, which the top-k would have dropped anyway.
         let hnsw_safe_with_bounds = query.distance_lower_bound.is_none();
-        let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
+        let exec: Arc<dyn ExecutionPlan> = if self.use_index
+            && filter_predicate.is_none()
             && hnsw_safe_with_pk
             && hnsw_safe_with_bounds
             && self.has_vector_index(&query.column, query.distance_type)

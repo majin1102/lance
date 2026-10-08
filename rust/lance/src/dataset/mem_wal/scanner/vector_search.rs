@@ -28,7 +28,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
@@ -36,6 +36,21 @@ use super::projection::{
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProbeBounds {
+    pub minimum_nprobes: Option<usize>,
+    pub maximum_nprobes: Option<usize>,
+}
+
+impl ProbeBounds {
+    pub(super) fn exact(nprobes: usize) -> Self {
+        Self {
+            minimum_nprobes: Some(nprobes),
+            maximum_nprobes: Some(nprobes),
+        }
+    }
+}
 
 /// Plans vector search queries over LSM data.
 ///
@@ -232,7 +247,7 @@ impl LsmVectorSearchPlanner {
     ///
     /// * `query_vector` - Query vector for KNN search
     /// * `k` - Number of nearest neighbors to return
-    /// * `nprobes` - Number of IVF partitions to search (for IVF-based indexes)
+    /// * `nprobes` - Exact number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
     /// * `refine_base_table` - When true, the base-table arm re-ranks its
     ///   candidates with exact distances (refine factor 1). Useful when the base
@@ -255,7 +270,6 @@ impl LsmVectorSearchPlanner {
     ///
     /// An execution plan that returns the top-K nearest neighbors across all
     /// LSM levels, with stale results filtered out.
-    #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
     pub async fn plan_search(
         &self,
         query_vector: &FixedSizeListArray,
@@ -265,11 +279,50 @@ impl LsmVectorSearchPlanner {
         refine_base_table: bool,
         overfetch_factor: f64,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if nprobes == 0 {
+            return Err(Error::invalid_input("nprobes must be positive".to_string()));
+        }
+        self.plan_search_with_probe_bounds(
+            query_vector,
+            k,
+            ProbeBounds::exact(nprobes),
+            projection,
+            refine_base_table,
+            overfetch_factor,
+        )
+        .await
+    }
+
+    #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, minimum_nprobes = ?probe_bounds.minimum_nprobes, maximum_nprobes = ?probe_bounds.maximum_nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
+    pub(super) async fn plan_search_with_probe_bounds(
+        &self,
+        query_vector: &FixedSizeListArray,
+        k: usize,
+        probe_bounds: ProbeBounds,
+        projection: Option<&[String]>,
+        refine_base_table: bool,
+        overfetch_factor: f64,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         if k == 0 {
             return Err(Error::invalid_input("k must be positive".to_string()));
         }
-        if nprobes == 0 {
-            return Err(Error::invalid_input("nprobes must be positive".to_string()));
+        if probe_bounds.minimum_nprobes == Some(0) {
+            return Err(Error::invalid_input(
+                "minimum_nprobes must be positive".to_string(),
+            ));
+        }
+        if probe_bounds.maximum_nprobes == Some(0) {
+            return Err(Error::invalid_input(
+                "maximum_nprobes must be positive".to_string(),
+            ));
+        }
+        if let (Some(minimum_nprobes), Some(maximum_nprobes)) =
+            (probe_bounds.minimum_nprobes, probe_bounds.maximum_nprobes)
+            && minimum_nprobes > maximum_nprobes
+        {
+            return Err(Error::invalid_input(format!(
+                "minimum_nprobes ({minimum_nprobes}) must not exceed maximum_nprobes ({maximum_nprobes})"
+            )));
         }
 
         let sources = self.collector.collect()?;
@@ -338,7 +391,7 @@ impl LsmVectorSearchPlanner {
                         source,
                         query_vector,
                         *fetch_k,
-                        nprobes,
+                        probe_bounds,
                         projection,
                         *is_base && refine_base,
                     ));
@@ -383,12 +436,11 @@ impl LsmVectorSearchPlanner {
 
         // No cross-source dedup needed (see struct doc): SortExec(per partition)
         // + SortPreservingMerge does the p-way distance-ordered top-k merge.
-        #[allow(deprecated)]
         // The downstream `SortPreservingMergeExec` already spawns one driver
         // task per input partition (one per union arm) via `spawn_buffered`, so
         // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
         // task without an extra repartition.
-        let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
+        let merged = UnionExec::try_new(knn_plans)?;
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(
@@ -462,7 +514,7 @@ impl LsmVectorSearchPlanner {
         source: &LsmDataSource,
         query_vector: &FixedSizeListArray,
         k: usize,
-        nprobes: usize,
+        probe_bounds: ProbeBounds,
         projection: Option<&[String]>,
         refine: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -494,7 +546,12 @@ impl LsmVectorSearchPlanner {
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
-                scanner.nprobes(nprobes);
+                if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
+                    scanner.minimum_nprobes(minimum_nprobes);
+                }
+                if let Some(maximum_nprobes) = probe_bounds.maximum_nprobes {
+                    scanner.maximum_nprobes(maximum_nprobes);
+                }
                 scanner.distance_metric(self.distance_type);
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
@@ -579,7 +636,12 @@ impl LsmVectorSearchPlanner {
                 };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
-                scanner.nprobes(nprobes);
+                if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
+                    scanner.minimum_nprobes(minimum_nprobes);
+                }
+                if let Some(maximum_nprobes) = probe_bounds.maximum_nprobes {
+                    scanner.maximum_nprobes(maximum_nprobes);
+                }
                 scanner.distance_metric(self.distance_type);
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
@@ -588,11 +650,7 @@ impl LsmVectorSearchPlanner {
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -604,27 +662,77 @@ impl LsmVectorSearchPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-                // Supply PKs so the memtable scanner can choose HNSW for
-                // append-only data and exact newest-before-top-k search when
-                // PK rewrites or filters make stale suppression necessary.
-                scanner.with_pk_columns(self.pk_columns.clone());
                 // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                if let Some(ref filter) = self.filter {
+
+                // A memtable created before a schema change uses old column names.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let vector_column = match &generation {
+                    Some(generation) => match generation.stored_name(&self.vector_column) {
+                        Some(stored) => stored.to_string(),
+                        // Created before the searched column existed: no candidates.
+                        None => return self.empty_plan(projection),
+                    },
+                    None => self.vector_column.clone(),
+                };
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(self.filter.as_ref()),
+                    None => (self.filter.clone(), None),
+                };
+
+                // Supply PKs so the memtable scanner can choose HNSW for
+                // append-only data and exact newest-before-top-k search when
+                // PK rewrites or filters make stale suppression necessary.
+                match &generation {
+                    Some(generation) => {
+                        scanner.with_pk_columns(generation.stored_pk_columns()?);
+                        scanner.project(&generation.stored_projection())?;
+                    }
+                    None => {
+                        scanner.with_pk_columns(self.pk_columns.clone());
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
+                }
+                if let Some(stored) = stored_filter {
                     // Routed to filtered brute-force (see `plan_vector_search`):
                     // the predicate masks rows before the memtable top-k cut.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored);
                 }
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+                // A filter applied after the scan would run after the top-k cut,
+                // so search every row exactly and let the filter cut instead.
+                let k = match above {
+                    None => k,
+                    Some(_) => {
+                        scanner.use_index(false);
+                        batch_store.total_rows().max(1)
+                    }
+                };
+                scanner.nearest(&vector_column, query_vector, k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
-                scanner.nprobes(nprobes);
+                if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
+                    scanner.minimum_nprobes(minimum_nprobes);
+                }
+                if let Some(maximum_nprobes) = probe_bounds.maximum_nprobes {
+                    scanner.maximum_nprobes(maximum_nprobes);
+                }
                 scanner.distance_metric(self.distance_type);
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                scanner.create_plan().await
+                let plan = Box::pin(scanner.create_plan()).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(plan, &above),
+                    None => Ok(plan),
+                }
             }
         }
     }
@@ -870,6 +978,45 @@ mod tests {
         assert!(
             err.to_string().contains("nprobes must be positive"),
             "expected nprobes validation error, got {err}"
+        );
+
+        let err = planner
+            .plan_search_with_probe_bounds(
+                &query,
+                1,
+                ProbeBounds {
+                    minimum_nprobes: None,
+                    maximum_nprobes: Some(0),
+                },
+                None,
+                false,
+                1.0,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("maximum_nprobes must be positive"),
+            "expected maximum_nprobes validation error, got {err}"
+        );
+
+        let err = planner
+            .plan_search_with_probe_bounds(
+                &query,
+                1,
+                ProbeBounds {
+                    minimum_nprobes: Some(2),
+                    maximum_nprobes: Some(1),
+                },
+                None,
+                false,
+                1.0,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("minimum_nprobes (2) must not exceed maximum_nprobes (1)"),
+            "expected probe-bound ordering error, got {err}"
         );
     }
 
