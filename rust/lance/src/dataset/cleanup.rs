@@ -450,14 +450,8 @@ impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
         let track_removed_manifests = policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
-        let delete_limiter = policy
-            .delete_rate_limit
-            .filter(|_| action.deletes_files())
-            .map(|rate| {
-                let mut ticker = interval(calculate_duration(rate));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                Arc::new(tokio::sync::Mutex::new(ticker))
-            });
+        let delete_limiter =
+            create_delete_limiter(policy.delete_rate_limit.filter(|_| action.deletes_files()));
         Self::new_with_ignored_manifests(
             dataset,
             policy,
@@ -1488,15 +1482,18 @@ impl<'a> CleanupTask<'a> {
                             .await?;
                         let ignored_manifests =
                             final_result.lock().unwrap().removed_manifests.clone();
-                        if let Some(result) = cleanup_cascade_branch_run(
-                            &branch_dataset,
-                            branch_dataset.manifest.as_ref(),
-                            action,
-                            ignored_manifests,
-                            self.delete_limiter.clone(),
-                        )
-                        .await?
+                        if let Some(policy) =
+                            build_cleanup_policy(&branch_dataset, branch_dataset.manifest.as_ref())
+                                .await?
                         {
+                            let result = cleanup_cascade_branch_run(
+                                &branch_dataset,
+                                policy,
+                                action,
+                                ignored_manifests,
+                                self.delete_limiter.clone(),
+                            )
+                            .await?;
                             final_result
                                 .lock()
                                 .unwrap()
@@ -1832,6 +1829,16 @@ async fn expired_manifest_size(
     }
 }
 
+fn create_delete_limiter(
+    rate: Option<u64>,
+) -> Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>> {
+    rate.map(|rate| {
+        let mut ticker = interval(calculate_duration(rate));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Arc::new(tokio::sync::Mutex::new(ticker))
+    })
+}
+
 /// The interval between delete permits for a `delete_rate_limit` of `rate` requests/s.
 ///
 /// One permit issues exactly one `delete`, so the interval is the reciprocal of the
@@ -2043,44 +2050,44 @@ pub async fn cleanup_cascade_branch(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    let Some(mut policy) = build_cleanup_policy(dataset, manifest).await? else {
+    let Some(policy) = build_cleanup_policy(dataset, manifest).await? else {
         return Ok(None);
     };
-    policy.clean_referenced_branches = false;
-    policy.error_if_tagged_old_versions = false;
-    info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
-    let mut cleanup = CleanupTask::new(dataset, policy, CleanupAction::Execute);
-    cleanup.track_removed_manifests = true;
-    Ok(Some(cleanup.run().await?.stats))
+    let delete_limiter = create_delete_limiter(policy.delete_rate_limit);
+    let result = cleanup_cascade_branch_run(
+        dataset,
+        policy,
+        CleanupAction::Execute,
+        HashSet::new(),
+        delete_limiter,
+    )
+    .await?;
+    Ok(Some(result.stats))
 }
 
 async fn cleanup_cascade_branch_run(
     dataset: &Dataset,
-    manifest: &Manifest,
+    mut policy: CleanupPolicy,
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
     delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
-) -> Result<Option<CleanupRunResult>> {
-    let policy = build_cleanup_policy(dataset, manifest).await?;
-    if let Some(mut policy) = policy {
-        policy.clean_referenced_branches = false;
-        policy.error_if_tagged_old_versions = false;
-        if action.deletes_files() {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
-        }
-        let cleanup = CleanupTask::new_with_ignored_manifests(
-            dataset,
-            policy,
-            action,
-            ignored_manifests,
-            true,
-            false,
-            delete_limiter,
-        );
-        Ok(Some(cleanup.run().await?))
-    } else {
-        Ok(None)
+) -> Result<CleanupRunResult> {
+    policy.clean_referenced_branches = false;
+    policy.error_if_tagged_old_versions = false;
+    if action.deletes_files() {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
     }
+    CleanupTask::new_with_ignored_manifests(
+        dataset,
+        policy,
+        action,
+        ignored_manifests,
+        true,
+        false,
+        delete_limiter,
+    )
+    .run()
+    .await
 }
 
 pub async fn build_cleanup_policy(
@@ -5806,19 +5813,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::single(Some(1), false, None)]
-    #[case::single_unlimited(None, false, None)]
-    #[case::cascade_missing(Some(1), true, None)]
-    #[case::cascade_different(Some(1), true, Some("100"))]
-    #[case::cascade_unlimited(None, true, Some("1"))]
-    #[case::cascade_invalid(Some(1), true, Some("invalid"))]
-    #[case::cascade_zero(Some(1), true, Some("0"))]
-    #[case::cascade_unlimited_invalid(None, true, Some("invalid"))]
+    #[case::single(Some(1), false, None, false)]
+    #[case::single_unlimited(None, false, None, false)]
+    #[case::cascade_missing(Some(1), true, None, false)]
+    #[case::cascade_different(Some(1), true, Some("100"), false)]
+    #[case::cascade_unlimited(None, true, Some("1"), false)]
+    #[case::cascade_invalid(Some(1), true, Some("invalid"), false)]
+    #[case::cascade_zero(Some(1), true, Some("0"), false)]
+    #[case::cascade_unlimited_invalid(None, true, Some("invalid"), false)]
+    #[case::standalone(Some(1), false, None, true)]
+    #[case::standalone_unlimited(None, false, None, true)]
     #[tokio::test(start_paused = true)]
     async fn test_cleanup_with_rate_limit(
         #[case] rate: Option<u64>,
         #[case] clean_referenced_branches: bool,
         #[case] child_rate: Option<&str>,
+        #[case] standalone: bool,
     ) {
         let data = || {
             lance_datagen::gen_batch()
@@ -5917,7 +5927,27 @@ mod tests {
         let explanation = operation.explain().await.unwrap();
         assert_eq!(start.elapsed(), Duration::ZERO);
         assert!(requests.lock().unwrap().is_empty());
-        let stats = operation.execute().await.unwrap();
+        let stats = if standalone {
+            let mut manifest = parent.manifest.as_ref().clone();
+            manifest
+                .config
+                .insert("lance.auto_cleanup.interval".into(), "1".into());
+            manifest
+                .config
+                .insert("lance.auto_cleanup.retain_versions".into(), "1".into());
+            if let Some(rate) = rate {
+                manifest.config.insert(
+                    "lance.auto_cleanup.delete_rate_limit".into(),
+                    rate.to_string(),
+                );
+            }
+            cleanup_cascade_branch(&parent, &manifest)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            operation.execute().await.unwrap()
+        };
         assert_eq!(stats, explanation.stats);
         let requests = requests.lock().unwrap();
         assert!(requests.len() > 2);
