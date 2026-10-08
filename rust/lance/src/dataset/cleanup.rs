@@ -5823,7 +5823,7 @@ mod tests {
         let mock_store = Arc::new(MockObjectStore::new());
         let mut parent = Dataset::write(
             data(),
-            "memory://",
+            "memory://cleanup",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
                     object_store_wrapper: Some(mock_store.clone()),
