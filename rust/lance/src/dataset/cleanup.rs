@@ -949,7 +949,7 @@ impl<'a> CleanupTask<'a> {
             .boxed();
 
         let all_files = stream::iter(vec![unreferenced_files, manifest_files]).flatten();
-        let all_files_to_remove = all_files.map(|file| {
+        let all_files_to_remove = all_files.map(|file| -> Result<CleanupFile> {
             let file = file?;
             if deletes_files {
                 let mode = if file.unverified {
@@ -985,7 +985,7 @@ impl<'a> CleanupTask<'a> {
                     parent = dir_path.parent();
                 }
             }
-            Ok::<_, Error>(file)
+            Ok(file)
         });
 
         if deletes_files {
@@ -2061,8 +2061,7 @@ async fn cleanup_cascade_branch_run(
     ignored_manifests: HashSet<Path>,
     delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
 ) -> Result<Option<CleanupRunResult>> {
-    // Retention belongs to the branch; delete pacing belongs to the initiating operation.
-    let policy = build_cleanup_policy_without_rate_limit(dataset, manifest).await?;
+    let policy = build_cleanup_policy(dataset, manifest).await?;
     if let Some(mut policy) = policy {
         policy.clean_referenced_branches = false;
         policy.error_if_tagged_old_versions = false;
@@ -2085,35 +2084,6 @@ async fn cleanup_cascade_branch_run(
 }
 
 pub async fn build_cleanup_policy(
-    dataset: &Dataset,
-    manifest: &Manifest,
-) -> Result<Option<CleanupPolicy>> {
-    let Some(policy) = build_cleanup_policy_without_rate_limit(dataset, manifest).await? else {
-        return Ok(None);
-    };
-    let mut builder = CleanupPolicyBuilder { policy };
-    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
-        let rate: u64 = match delete_rate_limit.parse() {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(Error::Cleanup {
-                    message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
-                        e
-                    ),
-                });
-            }
-        };
-        builder = match builder.delete_rate_limit(rate) {
-            Ok(b) => b,
-            Err(e) => return Err(e),
-        };
-    }
-
-    Ok(Some(builder.build()))
-}
-
-async fn build_cleanup_policy_without_rate_limit(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<CleanupPolicy>> {
@@ -2181,6 +2151,24 @@ async fn build_cleanup_policy_without_rate_limit(
         };
         // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
+    }
+
+    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+        let rate: u64 = match delete_rate_limit.parse() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
+                        e
+                    ),
+                });
+            }
+        };
+        builder = match builder.delete_rate_limit(rate) {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
     }
 
     Ok(Some(builder.build()))
@@ -5800,16 +5788,36 @@ mod tests {
         assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 4);
     }
 
+    #[test]
+    fn test_calculate_duration() {
+        // One permit is one delete request, so the interval is the reciprocal of the
+        // configured rate. Scaling by a bulk-delete batch size here would let the
+        // limiter issue batch_size times the rate the caller asked for: at 100
+        // requests/s an S3 multiplier of 1,000 would give 10us instead of 10ms.
+        assert_eq!(calculate_duration(100), Duration::from_millis(10));
+        assert_eq!(calculate_duration(1_000), Duration::from_millis(1));
+        assert_eq!(calculate_duration(1), Duration::from_secs(1));
+
+        // Edge case: rate too small is clamped to 1.
+        assert_eq!(calculate_duration(0), calculate_duration(1));
+
+        // Edge case: a rate finer than 1ns is clamped to 1ns.
+        assert_eq!(calculate_duration(2_000_000_000), Duration::from_nanos(1));
+    }
+
     #[rstest]
-    #[case::missing(Some(1), None)]
-    #[case::different(Some(1), Some("100"))]
-    #[case::invalid(Some(1), Some("invalid"))]
-    #[case::zero(Some(1), Some("0"))]
-    #[case::unlimited(None, Some("1"))]
-    #[case::unlimited_invalid(None, Some("invalid"))]
+    #[case::single(Some(1), false, None)]
+    #[case::single_unlimited(None, false, None)]
+    #[case::cascade_missing(Some(1), true, None)]
+    #[case::cascade_different(Some(1), true, Some("100"))]
+    #[case::cascade_unlimited(None, true, Some("1"))]
+    #[case::cascade_invalid(Some(1), true, Some("invalid"))]
+    #[case::cascade_zero(Some(1), true, Some("0"))]
+    #[case::cascade_unlimited_invalid(None, true, Some("invalid"))]
     #[tokio::test(start_paused = true)]
-    async fn test_cascade_shared_rate_limit(
+    async fn test_cleanup_with_rate_limit(
         #[case] rate: Option<u64>,
+        #[case] clean_referenced_branches: bool,
         #[case] child_rate: Option<&str>,
     ) {
         let data = || {
@@ -5836,7 +5844,12 @@ mod tests {
         .unwrap();
         let mut branch_bases = Vec::new();
         // Cover sequential siblings and independently scheduled branch chains.
-        for name in ["first", "sibling", "second"] {
+        let branches: &[&str] = if clean_referenced_branches {
+            &["first", "sibling", "second"]
+        } else {
+            &[]
+        };
+        for &name in branches {
             let mut child = parent
                 .create_branch(name, (None, None), None)
                 .await
@@ -5867,10 +5880,12 @@ mod tests {
                 parent.append(data(), None).await.unwrap();
             }
         }
-        // Leave an expired parent version that no child branches from.
-        parent.append(data(), None).await.unwrap();
+        // These versions are not branch sources, so the parent also has deletions.
+        for _ in 0..2 {
+            parent.append(data(), None).await.unwrap();
+        }
         let mut policy = CleanupPolicyBuilder::default()
-            .clean_referenced_branches(true)
+            .clean_referenced_branches(clean_referenced_branches)
             .retain_n_versions(&parent, 1)
             .await
             .unwrap()
@@ -5892,6 +5907,13 @@ mod tests {
         );
         let operation = parent.cleanup(policy);
         let start = tokio::time::Instant::now();
+        if matches!(child_rate, Some("invalid" | "0")) {
+            let error = operation.execute().await.unwrap_err();
+            assert!(matches!(error, Error::Cleanup { .. }));
+            assert_contains!(error.to_string(), "delete_rate_limit");
+            assert!(requests.lock().unwrap().is_empty());
+            return;
+        }
         let explanation = operation.explain().await.unwrap();
         assert_eq!(start.elapsed(), Duration::ZERO);
         assert!(requests.lock().unwrap().is_empty());
@@ -5914,96 +5936,6 @@ mod tests {
         } else {
             assert_eq!(start.elapsed(), Duration::ZERO);
         }
-    }
-
-    #[rstest]
-    #[case::missing(None)]
-    #[case::valid(Some("2"))]
-    #[case::zero(Some("0"))]
-    #[case::invalid(Some("invalid"))]
-    #[tokio::test(start_paused = true)]
-    async fn test_standalone_cleanup_rate_config(#[case] value: Option<&str>) {
-        let dataset = Dataset::write(some_batch(), "memory://", None)
-            .await
-            .unwrap();
-        let mut manifest = dataset.manifest.as_ref().clone();
-        manifest
-            .config
-            .insert("lance.auto_cleanup.interval".into(), "1".into());
-        if let Some(value) = value {
-            manifest
-                .config
-                .insert("lance.auto_cleanup.delete_rate_limit".into(), value.into());
-        }
-        let result = build_cleanup_policy(&dataset, &manifest).await;
-        match value {
-            Some("0" | "invalid") => {
-                let error = result.unwrap_err();
-                assert!(matches!(error, Error::Cleanup { .. }));
-                assert_contains!(error.to_string(), "delete_rate_limit");
-                let error = cleanup_cascade_branch(&dataset, &manifest)
-                    .await
-                    .unwrap_err();
-                assert!(matches!(error, Error::Cleanup { .. }));
-                assert_contains!(error.to_string(), "delete_rate_limit");
-            }
-            _ => assert_eq!(result.unwrap().unwrap().delete_rate_limit, value.map(|_| 2)),
-        }
-    }
-
-    #[test]
-    fn test_calculate_duration() {
-        // One permit is one delete request, so the interval is the reciprocal of the
-        // configured rate. Scaling by a bulk-delete batch size here would let the
-        // limiter issue batch_size times the rate the caller asked for: at 100
-        // requests/s an S3 multiplier of 1,000 would give 10us instead of 10ms.
-        assert_eq!(calculate_duration(100), Duration::from_millis(10));
-        assert_eq!(calculate_duration(1_000), Duration::from_millis(1));
-        assert_eq!(calculate_duration(1), Duration::from_secs(1));
-
-        // Edge case: rate too small is clamped to 1.
-        assert_eq!(calculate_duration(0), calculate_duration(1));
-
-        // Edge case: a rate finer than 1ns is clamped to 1ns.
-        assert_eq!(calculate_duration(2_000_000_000), Duration::from_nanos(1));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_cleanup_with_rate_limit() {
-        // Create multiple versions with data files that will be deleted.
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        // Create several old versions
-        for _ in 0..4 {
-            fixture.overwrite_some_data().await.unwrap();
-        }
-
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-
-        // Set rate limit to 1 ops/second so cleanup of several files must take at least ~1s
-        let policy = CleanupPolicyBuilder::default()
-            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
-            .delete_rate_limit(1)
-            .unwrap()
-            .build();
-
-        let start = tokio::time::Instant::now();
-        let db = fixture.open().await.unwrap();
-        let stats = cleanup_old_versions(&db, policy).await.unwrap();
-        let elapsed = start.elapsed();
-
-        // We deleted old versions, so there should be removed files
-        assert!(
-            stats.old_versions > 0,
-            "expected some old versions to be removed"
-        );
-        // With rate=1 and multiple files, it must take at least 2s
-        // (even just 2 deletions at 1/s means ≥2s)
-        assert!(
-            elapsed.as_millis() >= 2000,
-            "expected cleanup to be rate-limited (elapsed: {:?})",
-            elapsed
-        );
     }
 
     use lance_table::io::commit::external_manifest::ExternalManifestStore;
