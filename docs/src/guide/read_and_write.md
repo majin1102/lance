@@ -594,6 +594,16 @@ dataset.cleanup_old_versions(
     is **extremely dangerous** — if any other operation is in-progress at all,
     its data files may be deleted, leading to dataset corruption.
 
+Use `delete_rate_limit` to limit deletion requests per second for a cleanup
+operation. When cleaning referenced branches, the initiating operation and all
+cascaded branches share this budget; child branches' own rate settings are ignored.
+If the initiating operation has no rate limit, the entire operation is unthrottled.
+Separate cleanup calls do not share a budget.
+
+```python
+dataset.cleanup_old_versions(delete_rate_limit=100)
+```
+
 ### Automatic cleanup
 
 Instead of calling `cleanup_old_versions` manually, you can configure Lance to

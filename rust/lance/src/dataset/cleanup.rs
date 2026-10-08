@@ -39,7 +39,6 @@ use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
 use futures::future::try_join_all;
-use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
@@ -66,11 +65,10 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
-use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
@@ -300,6 +298,7 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
+    delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
     dataset: &'a Dataset,
     policy: CleanupPolicy,
     action: CleanupAction,
@@ -451,6 +450,14 @@ impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
         let track_removed_manifests = policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
+        let delete_limiter = policy
+            .delete_rate_limit
+            .filter(|_| action.deletes_files())
+            .map(|rate| {
+                let mut ticker = interval(calculate_duration(rate));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                Arc::new(tokio::sync::Mutex::new(ticker))
+            });
         Self::new_with_ignored_manifests(
             dataset,
             policy,
@@ -458,6 +465,7 @@ impl<'a> CleanupTask<'a> {
             HashSet::new(),
             track_removed_manifests,
             include_referenced_branches,
+            delete_limiter,
         )
     }
 
@@ -468,8 +476,10 @@ impl<'a> CleanupTask<'a> {
         ignored_manifests: HashSet<Path>,
         track_removed_manifests: bool,
         include_referenced_branches: bool,
+        delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
     ) -> Self {
         Self {
+            delete_limiter,
             dataset,
             policy,
             action,
@@ -975,30 +985,21 @@ impl<'a> CleanupTask<'a> {
                     parent = dir_path.parent();
                 }
             }
-            Ok(file)
+            Ok::<_, Error>(file)
         });
 
         if deletes_files {
-            let files_to_delete: BoxStream<Result<CleanupFile>> =
-                if let Some(rate) = self.policy.delete_rate_limit {
-                    let duration = calculate_duration(rate);
-                    let mut ticker = interval(duration);
-                    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                    IntervalStream::new(ticker)
-                        .zip(all_files_to_remove)
-                        .map(|(_, file)| file)
-                        .boxed()
-                } else {
-                    all_files_to_remove.boxed()
-                };
-
             // Deleting here rather than through `remove_stream` keeps each outcome
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
             let store = &self.dataset.object_store;
-            files_to_delete
+            all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
+                    if let Some(limiter) = &self.delete_limiter {
+                        let mut ticker = limiter.lock().await;
+                        ticker.tick().await;
+                    }
                     let outcome = match store.delete(&file.path).await {
                         Ok(()) => Ok(()),
                         // Cleanup lists first and deletes after, so a concurrent
@@ -1492,6 +1493,7 @@ impl<'a> CleanupTask<'a> {
                             branch_dataset.manifest.as_ref(),
                             action,
                             ignored_manifests,
+                            self.delete_limiter.clone(),
                         )
                         .await?
                         {
@@ -1865,6 +1867,8 @@ pub struct CleanupPolicy {
     /// cleanup. Cleanup deletes one path per request, so this is also the number of
     /// paths removed per second. For example, `Some(100)` limits deletions to 100
     /// delete requests per second.
+    /// The budget is shared by this cleanup and all cascaded branches, ignoring
+    /// their own rate settings. `None` leaves the entire operation unthrottled.
     pub delete_rate_limit: Option<u64>,
 }
 
@@ -1978,7 +1982,7 @@ impl CleanupPolicyBuilder {
     ///
     /// By default (None), deletions run at full speed. Set this to a positive value to
     /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
-    /// On backends with bulk delete APIs, effective path throughput scales with batch size.
+    /// The request budget is shared with all cascaded branches, overriding their rate settings.
     ///
     /// # Errors
     ///
@@ -2039,11 +2043,15 @@ pub async fn cleanup_cascade_branch(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    Ok(
-        cleanup_cascade_branch_run(dataset, manifest, CleanupAction::Execute, HashSet::new())
-            .await?
-            .map(|result| result.stats),
-    )
+    let Some(mut policy) = build_cleanup_policy(dataset, manifest).await? else {
+        return Ok(None);
+    };
+    policy.clean_referenced_branches = false;
+    policy.error_if_tagged_old_versions = false;
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
+    let mut cleanup = CleanupTask::new(dataset, policy, CleanupAction::Execute);
+    cleanup.track_removed_manifests = true;
+    Ok(Some(cleanup.run().await?.stats))
 }
 
 async fn cleanup_cascade_branch_run(
@@ -2051,8 +2059,10 @@ async fn cleanup_cascade_branch_run(
     manifest: &Manifest,
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
+    delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
 ) -> Result<Option<CleanupRunResult>> {
-    let policy = build_cleanup_policy(dataset, manifest).await?;
+    // Retention belongs to the branch; delete pacing belongs to the initiating operation.
+    let policy = build_cleanup_policy_without_rate_limit(dataset, manifest).await?;
     if let Some(mut policy) = policy {
         policy.clean_referenced_branches = false;
         policy.error_if_tagged_old_versions = false;
@@ -2066,6 +2076,7 @@ async fn cleanup_cascade_branch_run(
             ignored_manifests,
             true,
             false,
+            delete_limiter,
         );
         Ok(Some(cleanup.run().await?))
     } else {
@@ -2074,6 +2085,35 @@ async fn cleanup_cascade_branch_run(
 }
 
 pub async fn build_cleanup_policy(
+    dataset: &Dataset,
+    manifest: &Manifest,
+) -> Result<Option<CleanupPolicy>> {
+    let Some(policy) = build_cleanup_policy_without_rate_limit(dataset, manifest).await? else {
+        return Ok(None);
+    };
+    let mut builder = CleanupPolicyBuilder { policy };
+    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+        let rate: u64 = match delete_rate_limit.parse() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
+                        e
+                    ),
+                });
+            }
+        };
+        builder = match builder.delete_rate_limit(rate) {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+    }
+
+    Ok(Some(builder.build()))
+}
+
+async fn build_cleanup_policy_without_rate_limit(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<CleanupPolicy>> {
@@ -2141,23 +2181,6 @@ pub async fn build_cleanup_policy(
         };
         // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
-    }
-    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
-        let rate: u64 = match delete_rate_limit.parse() {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(Error::Cleanup {
-                    message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
-                        e
-                    ),
-                });
-            }
-        };
-        builder = match builder.delete_rate_limit(rate) {
-            Ok(b) => b,
-            Err(e) => return Err(e),
-        };
     }
 
     Ok(Some(builder.build()))
@@ -5775,6 +5798,157 @@ mod tests {
             .clear_before_policy("missing_manifest");
         store.put(&path, b"1234".as_slice()).await.unwrap();
         assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 4);
+    }
+
+    #[rstest]
+    #[case::missing(Some(1), None)]
+    #[case::different(Some(1), Some("100"))]
+    #[case::invalid(Some(1), Some("invalid"))]
+    #[case::zero(Some(1), Some("0"))]
+    #[case::unlimited(None, Some("1"))]
+    #[case::unlimited_invalid(None, Some("invalid"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_cascade_shared_rate_limit(
+        #[case] rate: Option<u64>,
+        #[case] child_rate: Option<&str>,
+    ) {
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 1.into())
+        };
+        let mock_store = Arc::new(MockObjectStore::new());
+        let mut parent = Dataset::write(
+            data(),
+            "memory://",
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(mock_store.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut branch_bases = Vec::new();
+        // Cover sequential siblings and independently scheduled branch chains.
+        for name in ["first", "sibling", "second"] {
+            let mut child = parent
+                .create_branch(name, (None, None), None)
+                .await
+                .unwrap();
+            let mut updates = vec![
+                ("lance.auto_cleanup.interval", "1"),
+                ("lance.auto_cleanup.retain_versions", "1"),
+            ];
+            if let Some(value) = child_rate {
+                updates.push(("lance.auto_cleanup.delete_rate_limit", value));
+            }
+            child.update_config(updates).await.unwrap();
+            for _ in 0..2 {
+                child
+                    .append(
+                        data(),
+                        Some(WriteParams {
+                            skip_auto_cleanup: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(child.get_fragments().len() > 1);
+            branch_bases.push(child.base.clone());
+            if name != "first" {
+                parent.append(data(), None).await.unwrap();
+            }
+        }
+        // Leave an expired parent version that no child branches from.
+        parent.append(data(), None).await.unwrap();
+        let mut policy = CleanupPolicyBuilder::default()
+            .clean_referenced_branches(true)
+            .retain_n_versions(&parent, 1)
+            .await
+            .unwrap()
+            .build();
+        policy.delete_rate_limit = rate;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        mock_store.policy.lock().unwrap().set_before_policy(
+            "record_deletes",
+            Arc::new(move |operation, path| {
+                if operation == "delete" {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((path.clone(), tokio::time::Instant::now()));
+                }
+                Ok(())
+            }),
+        );
+        let operation = parent.cleanup(policy);
+        let start = tokio::time::Instant::now();
+        let explanation = operation.explain().await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(requests.lock().unwrap().is_empty());
+        let stats = operation.execute().await.unwrap();
+        assert_eq!(stats, explanation.stats);
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() > 2);
+        for base in branch_bases {
+            assert!(requests.iter().any(|(path, _)| path.prefix_matches(&base)));
+        }
+        assert!(
+            requests
+                .iter()
+                .any(|(path, _)| path.prefix_matches(&parent.versions_dir()))
+        );
+        if rate.is_some() {
+            for pair in requests.windows(2) {
+                assert!(pair[1].1.duration_since(pair[0].1) >= Duration::from_secs(1));
+            }
+        } else {
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::valid(Some("2"))]
+    #[case::zero(Some("0"))]
+    #[case::invalid(Some("invalid"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_standalone_cleanup_rate_config(#[case] value: Option<&str>) {
+        let dataset = Dataset::write(some_batch(), "memory://", None)
+            .await
+            .unwrap();
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "1".into());
+        if let Some(value) = value {
+            manifest
+                .config
+                .insert("lance.auto_cleanup.delete_rate_limit".into(), value.into());
+        }
+        let result = build_cleanup_policy(&dataset, &manifest).await;
+        match value {
+            Some("0" | "invalid") => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::Cleanup { .. }));
+                assert_contains!(error.to_string(), "delete_rate_limit");
+                let error = cleanup_cascade_branch(&dataset, &manifest)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, Error::Cleanup { .. }));
+                assert_contains!(error.to_string(), "delete_rate_limit");
+            }
+            _ => assert_eq!(result.unwrap().unwrap().delete_rate_limit, value.map(|_| 2)),
+        }
     }
 
     #[test]
