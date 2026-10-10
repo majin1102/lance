@@ -13,11 +13,13 @@ pub mod block;
 pub mod byte_stream_split;
 pub mod constant;
 pub mod delta;
+pub mod dictionary;
 pub mod fsst;
 pub mod general;
 pub mod packed;
 pub mod range;
 pub mod rle;
+pub(crate) mod sequence;
 pub mod value;
 
 pub(crate) fn try_vec_with_capacity<T>(num_values: u64, label: &str) -> Result<Vec<T>> {
