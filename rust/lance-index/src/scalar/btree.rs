@@ -3141,10 +3141,6 @@ impl ScalarIndex for BTreeIndex {
         self.results_are_row_addresses
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
@@ -4093,6 +4089,10 @@ impl BasicTrainer for BTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
