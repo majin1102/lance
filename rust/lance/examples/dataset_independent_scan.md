@@ -16,8 +16,10 @@ cargo test -p lance --lib dataset::fragment::tests::test_lazy_column_metadata_sc
 
 This is an experimental, same-build demonstration of an execution boundary for
 distributed engines. The worker constructs its scanners from primitive metadata;
-it does not receive scanners or read tasks created by a Dataset. This does not
-implement a Spark connector or propose a stable task serialization format.
+it does not receive scanners or read tasks created by a Dataset. The standalone
+Rust executable demonstrates that boundary; the accompanying
+[lance-spark demo branch](https://github.com/majin1102/lance-spark/tree/codex/primitive-scan-engine-demo)
+integrates the Java/JNI primitives with Spark. Task serialization remains experimental.
 
 ## Direct construction
 
@@ -139,10 +141,81 @@ are execution primitives, not a global SQL planner: index coverage, unindexed
 fallback, cross-segment combination and residual filtering remain the engine's
 responsibility.
 
-Production integration still needs snapshot/file retention for scanner lifetime,
-credentials and storage configuration outside the metadata payload, and shared
-worker caches. Stable row IDs, fragment-reuse translation, overlays and ANN search
+Production integration still needs snapshot/file retention for scanner lifetime.
+The Spark demo provides an opt-in fragment reader and explicit BTree task composition;
+automatic scalar-index planning is outside its scope.
+Shared worker sessions and worker-local storage parameters
+can be supplied through `open_with_session`; neither is part of the task payload.
+Stable row IDs, fragment-reuse translation, overlays and ANN search
 require explicit semantics. ANN also needs prefiltering, partition search, global
 candidate merging and possibly refinement; this BTree example does not establish
-those contracts. A Spark adapter can carry these primitives in input partitions
-and construct readers directly on executors.
+those contracts. The Spark adapter carries fragment primitives in input partitions
+and constructs readers directly on executors.
+
+## Engine integration contract
+
+The Java adapters expose immutable, serializable `FragmentReadTask` and
+`IndexSegmentReadTask` descriptors. `capture` is a convenience for a driver that
+already uses Lance's Dataset. `fromFragment` / `fromSegment` accept complete
+format metadata directly, so an engine with its own table abstraction does not
+need that convenience adapter. Metadata must preserve Lance field IDs and all
+feature markers; reconstructing it through a partial language-specific model can
+silently lose information.
+
+Execution uses Arrow C streams. A worker supplies its own allocator, shared
+Session, storage options and optional namespace credential provider. The stream
+owns its native read state until the consumer closes it, including an early close.
+Closing the driver's Dataset does not invalidate a transported descriptor.
+
+Build and install the matching Java/JNI artifact from `java/` using Java 11:
+
+```sh
+./mvnw install -DskipTests
+```
+
+The Spark demo must set `-Dlance.version=14.0.0-beta.8` and use this locally built
+artifact on both driver and executors. The released artifact with that version
+does not contain these experimental APIs. See the
+[Spark example and test commands](https://github.com/majin1102/lance-spark/blob/codex/primitive-scan-engine-demo/docs/src/examples/primitive-scan.md)
+for the connector option and the separate BTree composition example.
+
+```text
+Driver / engine table implementation
+    +-- resolve one snapshot and retain its files
+    +-- fragment descriptors -> scan tasks
+    +-- segment descriptors  -> index search tasks
+                                   |
+                            physical row addresses
+                                   |
+                     engine routes by fragment ID
+                                   |
+                  fragment descriptors + offset selections
+                                   |
+                         Arrow streams -> engine operators
+```
+
+The last route matters for large segments: a segment task should not need every
+fragment's metadata just to search its index. The engine can distribute the
+fragment descriptors separately and join them with candidate addresses. Uncovered
+fragments require a scan, and overlapping candidate sets require deduplication.
+The engine must preserve residual predicates and apply global ordering, limits
+and aggregation with its normal query semantics.
+
+| Boundary | Contract |
+| --- | --- |
+| Snapshot | Schema, fragment/deletion metadata and index coverage describe the selected snapshot. A version number alone does not pin files. |
+| Row addresses | Physical addresses are distinct from stable row IDs. Rewrites requiring remapping need an explicit mapping; they cannot be inferred from index metadata. |
+| Deletions | BTree hits may include deleted rows. Fragment materialization applies the captured deletion vector. |
+| Runtime | Credentials, cache/session handles and allocators are not serialized. Credential renewal must not change the task's storage location or snapshot. |
+| Retry | Reopen the same immutable descriptor. Missing retained files are errors; do not silently switch to the latest Dataset. |
+| Query execution | A fragment reader does not implement arbitrary SQL predicates. An adapter must leave unsupported predicates with the engine rather than report them as fully pushed down. |
+| Compatibility | Existing Dataset APIs and persistent file formats are unchanged. Task transport is experimental and requires a matching driver, executor, Java artifact and native build. Unknown protocol versions are rejected. |
+
+An empty fragment projection returns zero-column batches carrying live row counts.
+`with_row_address` adds physical `_rowaddr` without requiring stable-ID resolution.
+These support engine count and candidate-routing paths without reopening a Dataset.
+
+This is not a general ANN execution contract. In particular, applying deletion or
+user prefilters only after local top-k can lose valid candidates. An ANN adapter
+must define prefilters before candidate selection, partition probing, candidate
+budgets, global merging and refinement before replacing an existing vector scanner.

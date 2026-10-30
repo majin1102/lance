@@ -5,9 +5,14 @@
 //!
 //! This experimental boundary supports exact BTree predicates. It does not
 //! resolve a table snapshot, remap row IDs, or materialize fragment columns.
+//! ANN requires a separate contract for live-row prefilters, partition probing,
+//! candidate merging and refinement; these scalar tasks do not implement it.
 
+use std::ops::Bound;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
+use datafusion::common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
@@ -16,11 +21,35 @@ use lance_index::scalar::btree::BTreeIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{SargableQuery, ScalarIndex, SearchResult};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, uri_to_url};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, uri_to_url};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::IndexMetadata;
 use object_store::path::Path;
+use prost::Message;
 use serde::{Deserialize, Serialize};
+
+use crate::session::Session;
+
+// Same-build task transport only; this is not a persistent Lance file format.
+#[derive(Clone, Message)]
+struct TaskEnvelope {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(string, tag = "2")]
+    storage_uri: String,
+    #[prost(string, tag = "3")]
+    segment_path: String,
+    #[prost(message, optional, tag = "4")]
+    metadata: Option<lance_table::format::pb::IndexMetadata>,
+    #[prost(enumeration = "TaskRowIdMode", tag = "5")]
+    row_id_mode: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+enum TaskRowIdMode {
+    Unspecified = 0,
+    PhysicalAddresses = 1,
+}
 
 /// How the IDs stored in a segment relate to the fragments being queried.
 ///
@@ -140,6 +169,53 @@ impl IndexSegmentReadTask {
         &self.metadata
     }
 
+    /// Encode complete segment metadata for a worker running the same build.
+    ///
+    /// The task contains no credentials, session or Dataset. The physical row-ID
+    /// contract is explicit; a missing contract is never inferred on decode.
+    pub fn encode(&self) -> Vec<u8> {
+        TaskEnvelope {
+            version: 1,
+            storage_uri: self.storage_uri.clone(),
+            segment_path: self.segment_path.to_string(),
+            metadata: Some(self.metadata.as_ref().into()),
+            row_id_mode: TaskRowIdMode::PhysicalAddresses as i32,
+        }
+        .encode_to_vec()
+    }
+
+    /// Decode and validate a same-build task without opening storage.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let envelope = TaskEnvelope::decode(bytes)?;
+        if envelope.version != 1 {
+            return Err(Error::not_supported(format!(
+                "Index segment task version {} is unsupported; expected 1",
+                envelope.version
+            )));
+        }
+        if envelope.row_id_mode != TaskRowIdMode::PhysicalAddresses as i32 {
+            return Err(Error::not_supported(format!(
+                "Index segment task requires explicit physical row addresses; got mode {}",
+                envelope.row_id_mode
+            )));
+        }
+        let metadata = envelope
+            .metadata
+            .ok_or_else(|| Error::invalid_input("Index segment task is missing its metadata"))?;
+        let path = Path::parse(&envelope.segment_path).map_err(|error| {
+            Error::invalid_input(format!(
+                "Invalid index segment path {:?}: {error}",
+                envelope.segment_path
+            ))
+        })?;
+        Self::from_segment(
+            &envelope.storage_uri,
+            path,
+            Arc::new(IndexMetadata::try_from(metadata)?),
+            SegmentRowIdMode::PhysicalAddresses,
+        )
+    }
+
     /// Open the segment using worker-local storage configuration.
     ///
     /// `None` uses default storage configuration. The scanner owns the runtime
@@ -148,8 +224,21 @@ impl IndexSegmentReadTask {
         &self,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<IndexSegmentScanner> {
+        self.open_with_session(store_params, Arc::new(Session::default()))
+            .await
+    }
+
+    /// Open with a worker's shared session and worker-local storage credentials.
+    ///
+    /// Index caches are scoped by storage URI, resolved segment path and UUID.
+    /// The scanner retains the cache owner required by the BTree reader.
+    pub async fn open_with_session(
+        &self,
+        store_params: Option<ObjectStoreParams>,
+        session: Arc<Session>,
+    ) -> Result<IndexSegmentScanner> {
         let (store, _) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+            session.store_registry(),
             &self.storage_uri,
             &store_params.unwrap_or_default(),
         )
@@ -157,10 +246,19 @@ impl IndexSegmentReadTask {
         let index_store = LanceIndexStore::new(
             store,
             self.segment_path.clone(),
-            Arc::new(LanceCache::no_cache()),
+            Arc::new(
+                session
+                    .metadata_cache
+                    .for_dataset(&self.storage_uri)
+                    .file_metadata_cache(&self.segment_path),
+            ),
         )
         .with_file_sizes(self.metadata.file_size_map());
-        let cache = LanceCache::no_cache();
+        let cache = session
+            .index_cache
+            .for_dataset(&self.storage_uri)
+            .for_index(&self.metadata.uuid, None)
+            .with_key_prefix(self.segment_path.as_ref());
         let details = self.metadata.index_details.as_deref().ok_or_else(|| {
             Error::invalid_input(format!(
                 "Index segment {} is missing index details",
@@ -204,11 +302,57 @@ impl IndexSegmentScanner {
     /// fragment rows. An older segment build version can therefore be valid.
     ///
     /// No stable-ID lookup, remapping, or whole-table fallback is performed.
+    /// Query literals must have the index's key type, including decimal scale
+    /// and timestamp timezone. Type mismatches are rejected without coercion.
     pub async fn search(
         &self,
         query: &SargableQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<RowAddrTreeMap> {
+        let key_type = self.index.training_data_type().ok_or_else(|| {
+            Error::not_supported(format!(
+                "Index segment {} does not expose its key type",
+                self.metadata.uuid
+            ))
+        })?;
+        // The Dataset planner normally coerces literals before index dispatch.
+        // Independent callers bypass it, and the BTree ordering requires matching
+        // types (including decimal precision/scale) rather than arbitrary scalars.
+        let validate_literal = |value: &ScalarValue| -> Result<()> {
+            let actual_type = value.data_type();
+            if actual_type != key_type {
+                return Err(Error::invalid_input(format!(
+                    "Index segment {} query literal type {actual_type} does not match key type {key_type}",
+                    self.metadata.uuid
+                )));
+            }
+            Ok(())
+        };
+        match query {
+            SargableQuery::Equals(value) => validate_literal(value)?,
+            SargableQuery::Range(lower, upper) => {
+                for bound in [lower, upper] {
+                    if let Bound::Included(value) | Bound::Excluded(value) = bound {
+                        validate_literal(value)?;
+                    }
+                }
+            }
+            SargableQuery::IsIn(values) => {
+                for value in values {
+                    validate_literal(value)?;
+                }
+            }
+            SargableQuery::LikePrefix(value) => {
+                validate_literal(value)?;
+                if !matches!(key_type, DataType::Utf8 | DataType::LargeUtf8) {
+                    return Err(Error::invalid_input(format!(
+                        "Index segment {} LIKE prefix requires a string key, got {key_type}",
+                        self.metadata.uuid
+                    )));
+                }
+            }
+            SargableQuery::IsNull() | SargableQuery::FullTextSearch(_) => {}
+        }
         let SearchResult::Exact(matches) = self.index.search(query, metrics).await? else {
             return Err(Error::not_supported(
                 "Index segment scanner requires exact BTree results",
@@ -228,11 +372,168 @@ impl IndexSegmentScanner {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{RecordBatchIterator, record_batch};
+    use lance_core::utils::address::RowAddress;
+    use lance_index::IndexType;
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::pbold;
+    use lance_index::scalar::ScalarIndexParams;
     use rstest::rstest;
     use uuid::Uuid;
 
     use super::*;
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
+    use crate::index::DatasetIndexExt;
+
+    #[rstest]
+    #[case::unknown_version(99, TaskRowIdMode::PhysicalAddresses as i32, "version 99")]
+    #[case::missing_row_id_mode(1, TaskRowIdMode::Unspecified as i32, "explicit physical row addresses")]
+    #[case::unknown_row_id_mode(1, 99, "mode 99")]
+    fn unsupported_transport_is_rejected_before_storage_access(
+        #[case] version: u32,
+        #[case] row_id_mode: i32,
+        #[case] message: &str,
+    ) {
+        let bytes = TaskEnvelope {
+            version,
+            row_id_mode,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let error = IndexSegmentReadTask::decode(&bytes).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[tokio::test]
+    async fn transported_segment_uses_fresh_shared_session_without_manifest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let uri = temporary.path().to_str().unwrap();
+        let batch = record_batch!(("key", Int32, [Some(7), None, Some(7), Some(9)])).unwrap();
+        let input = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            input,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                max_rows_per_group: 2,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let metadata = dataset.load_indices().await.unwrap()[0].clone();
+        let expected_metadata = lance_table::format::pb::IndexMetadata::from(&metadata);
+        let task = IndexSegmentReadTask::from_segment(
+            uri,
+            dataset.indices_dir().join(metadata.uuid.to_string()),
+            Arc::new(metadata),
+            SegmentRowIdMode::PhysicalAddresses,
+        )
+        .unwrap();
+        let bytes = task.encode();
+        let expected_addresses = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| RowAddress::new_from_parts(fragment.id as u32, 0))
+            .collect::<Vec<_>>();
+        drop(task);
+        drop(dataset);
+        std::fs::remove_dir_all(temporary.path().join("_versions")).unwrap();
+        let decoded = IndexSegmentReadTask::decode(&bytes).unwrap();
+        assert_eq!(
+            lance_table::format::pb::IndexMetadata::from(decoded.metadata()),
+            expected_metadata,
+        );
+        let session = Arc::new(Session::default());
+        assert_eq!(session.approx_num_items(), 0);
+        for _ in 0..2 {
+            let scanner = decoded
+                .open_with_session(None, session.clone())
+                .await
+                .unwrap();
+            let matches = scanner
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                matches.row_addrs().unwrap().collect::<Vec<_>>(),
+                expected_addresses,
+            );
+        }
+        assert!(session.approx_num_items() > 0);
+        let scanner = decoded.open_with_session(None, session).await.unwrap();
+        assert_eq!(
+            scanner
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            expected_addresses,
+        );
+        for query in [
+            SargableQuery::Equals(ScalarValue::Utf8(Some("7".into()))),
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Utf8(Some("7".into()))),
+                Bound::Unbounded,
+            ),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Utf8(Some("9".into()))),
+            ),
+            SargableQuery::IsIn(vec![
+                ScalarValue::Int32(Some(7)),
+                ScalarValue::Utf8(Some("9".into())),
+            ]),
+            SargableQuery::LikePrefix(ScalarValue::Utf8(Some("7".into()))),
+        ] {
+            let error = scanner
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "{query:?}: {error}"
+            );
+            assert!(
+                error.to_string().contains("literal type Utf8"),
+                "{query:?}: {error}"
+            );
+            assert!(
+                error.to_string().contains("key type Int32"),
+                "{query:?}: {error}"
+            );
+        }
+        let error = scanner
+            .search(
+                &SargableQuery::LikePrefix(ScalarValue::Int32(Some(7))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("requires a string key"));
+    }
 
     #[rstest]
     #[case::stable_ids("stable_ids", "physical row addresses", true)]

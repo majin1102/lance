@@ -343,15 +343,6 @@ pub struct RowIdAndDeletesConfig {
     pub total_num_rows: u32,
 }
 
-impl RowIdAndDeletesConfig {
-    fn has_system_cols(&self) -> bool {
-        self.with_row_id
-            || self.with_row_addr
-            || self.with_row_last_updated_at_version
-            || self.with_row_created_at_version
-    }
-}
-
 pub fn apply_row_id_and_deletes(
     batch: RecordBatch,
     batch_offset: u32,
@@ -484,7 +475,6 @@ fn apply_row_id_and_deletes_with_system_columns(
         deletion_vector = None;
     }
     let has_deletions = deletion_vector.is_some();
-    debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);
 
     // If row id sequence is None, then row id IS row address.
     let should_fetch_row_addr = config.with_row_addr
@@ -1509,16 +1499,6 @@ mod tests {
                 for with_row_id in [false, true] {
                     for make_deletions_null in [false, true] {
                         for frag_id in [0, 1] {
-                            let has_deletions = if let Some(dv) = &deletion_vector {
-                                !matches!(dv.as_ref(), DeletionVector::NoDeletions)
-                            } else {
-                                false
-                            };
-                            if !has_columns && !has_deletions && !with_row_id {
-                                // This is an invalid case and should be prevented upstream,
-                                // no meaningful work is being done!
-                                continue;
-                            }
                             if make_deletions_null && !with_row_id {
                                 // This is an invalid case and should be prevented upstream
                                 // we cannot make the row_id column null if it isn't present
@@ -1591,6 +1571,12 @@ mod tests {
                                 },
                             };
                             assert_eq!(total_actually_deleted, expected_deletions);
+                            if !has_columns && !with_row_id {
+                                // Count-only scans preserve row counts without materializing a
+                                // data column, including fragments without deletion vectors.
+                                assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+                                assert_eq!(total_num_rows, 100 - expected_deletions);
+                            }
                             if expected_deletions > 0 && with_row_id {
                                 if make_deletions_null {
                                     // If we make deletions null we get 3 batches of all-null and then

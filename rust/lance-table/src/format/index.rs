@@ -300,10 +300,16 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             fragment_bitmap,
             index_details: proto.index_details.map(Arc::new),
             index_version: proto.index_version.unwrap_or_default(),
-            created_at: proto.created_at.map(|ts| {
-                DateTime::from_timestamp_millis(ts as i64)
-                    .expect("Invalid timestamp in index metadata")
-            }),
+            created_at: proto
+                .created_at
+                .map(|ts| {
+                    DateTime::from_timestamp_millis(ts as i64).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Index metadata created_at timestamp {ts} is outside the supported range"
+                        ))
+                    })
+                })
+                .transpose()?,
             base_id: proto.base_id,
             files,
         };

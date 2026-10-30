@@ -10,13 +10,13 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use lance_core::cache::LanceCache;
+use lance_arrow::schema::SchemaExt;
 use lance_core::datatypes::Schema;
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ADDR_FIELD, Result};
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::ConcreteFileVersion;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, uri_to_url};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, uri_to_url};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use lance_table::io::deletion::read_deletion_file;
@@ -26,6 +26,7 @@ use prost::Message;
 use super::current_reader::{CurrentFileReadContext, add_missing_columns};
 use super::{FragmentReader, MetadataMode};
 use crate::Dataset;
+use crate::session::Session;
 
 // An experimental task envelope, not a persistent Lance format or a promise of
 // compatibility across builds. Existing schema/fragment protobufs preserve IDs.
@@ -43,6 +44,8 @@ struct TaskEnvelope {
     fragment: Option<lance_table::format::pb::DataFragment>,
     #[prost(string, repeated, tag = "6")]
     projection: Vec<String>,
+    #[prost(bool, tag = "7")]
+    with_row_address: bool,
 }
 
 /// A self-contained description of a current-format fragment scan or take.
@@ -74,6 +77,7 @@ pub struct FragmentReadTask {
     schema: Arc<Schema>,
     fragment: Arc<Fragment>,
     projection: Vec<String>,
+    with_row_address: bool,
 }
 
 impl FragmentReadTask {
@@ -84,10 +88,11 @@ impl FragmentReadTask {
     /// must describe the same snapshot; `snapshot_version` records its version
     /// for the caller's consistency checks and does not reopen or pin it.
     ///
-    /// No manifest lookup is used to fill in missing information. The projection
-    /// must contain at least one supported user column; unsupported metadata and
-    /// formats are rejected before opening storage. The caller may deserialize
-    /// these primitives or obtain them from its own Table implementation.
+    /// No manifest lookup is used to fill in missing information. An empty
+    /// projection produces zero-column batches with live row counts, suitable
+    /// for `COUNT(*)`. Unsupported metadata and formats are rejected before
+    /// opening storage. The caller may deserialize these primitives or obtain
+    /// them from its own Table implementation.
     pub fn from_fragment(
         uri: impl AsRef<str>,
         snapshot_version: u64,
@@ -106,6 +111,7 @@ impl FragmentReadTask {
             schema,
             fragment,
             projection: projection.iter().map(|name| (*name).to_owned()).collect(),
+            with_row_address: false,
         };
         task.validate()?;
         Ok(task)
@@ -116,8 +122,8 @@ impl FragmentReadTask {
     /// This convenience adapter delegates to [`Self::from_fragment`]. Engines
     /// that already have the format primitives can use that constructor directly.
     ///
-    /// The projection must contain at least one user column. Unknown fragment
-    /// IDs and unsupported features are rejected before transport or file I/O.
+    /// Unknown fragment IDs and unsupported features are rejected before
+    /// transport or file I/O.
     pub fn try_new(dataset: &Dataset, fragment_id: u64, projection: &[&str]) -> Result<Self> {
         let fragment = dataset
             .find_fragment(fragment_id)
@@ -131,11 +137,30 @@ impl FragmentReadTask {
         )
     }
 
+    /// Append `_rowaddr`, containing physical fragment IDs and row offsets.
+    ///
+    /// Deleted rows are excluded in the same way as ordinary projected columns.
+    /// This does not expose stable logical row IDs, even on a stable-ID table.
+    pub fn with_row_address(mut self) -> Self {
+        self.with_row_address = true;
+        self
+    }
+
+    /// The Arrow schema returned by this task, without opening any files.
+    pub fn output_schema(&self) -> Result<Arc<ArrowSchema>> {
+        let projection = self.schema.project(&self.projection)?;
+        let mut schema = ArrowSchema::from(&projection);
+        if self.with_row_address {
+            schema = schema.try_with_column(ROW_ADDR_FIELD.clone())?;
+        }
+        Ok(Arc::new(schema))
+    }
+
     /// Encode for a worker running the same build. Credentials are not included.
     pub fn encode(&self) -> Vec<u8> {
         let fields: FieldsWithMeta = self.schema.as_ref().into();
         TaskEnvelope {
-            version: 1,
+            version: 2,
             uri: self.uri.clone(),
             snapshot_version: self.snapshot_version,
             schema: Some(lance_file::format::pb::Schema {
@@ -144,6 +169,7 @@ impl FragmentReadTask {
             }),
             fragment: Some(self.fragment.as_ref().into()),
             projection: self.projection.clone(),
+            with_row_address: self.with_row_address,
         }
         .encode_to_vec()
     }
@@ -151,9 +177,9 @@ impl FragmentReadTask {
     /// Decode and validate the task without opening storage or a Dataset.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let envelope = TaskEnvelope::decode(bytes)?;
-        if envelope.version != 1 {
+        if envelope.version != 2 {
             return Err(Error::not_supported(format!(
-                "Fragment task version {} is unsupported; expected 1",
+                "Fragment task version {} is unsupported; expected 2",
                 envelope.version
             )));
         }
@@ -172,6 +198,7 @@ impl FragmentReadTask {
             })?),
             fragment: Arc::new(Fragment::try_from(fragment)?),
             projection: envelope.projection,
+            with_row_address: envelope.with_row_address,
         };
         task.validate()?;
         Ok(task)
@@ -189,9 +216,9 @@ impl FragmentReadTask {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.uri.is_empty() || self.projection.is_empty() {
+        if self.uri.is_empty() {
             return Err(Error::invalid_input(
-                "Fragment task needs a URI and nonempty projection",
+                "Fragment task needs a nonempty storage URI",
             ));
         }
         self.schema.validate()?;
@@ -263,8 +290,23 @@ impl FragmentReadTask {
     /// no table-wide cache or fragment list is allocated. Missing files fail
     /// normally; task execution never refreshes to a newer snapshot.
     pub async fn open(&self, store_params: Option<ObjectStoreParams>) -> Result<FragmentReader> {
+        self.open_with_session(store_params, Arc::new(Session::default()))
+            .await
+    }
+
+    /// Open using a worker's shared session for storage registration and caches.
+    ///
+    /// The session contains runtime state, not a Dataset or snapshot. Cache keys
+    /// are scoped by storage URI and file path. Credentials remain worker-local
+    /// in `store_params`; neither credentials nor the session are serialized.
+    pub async fn open_with_session(
+        &self,
+        store_params: Option<ObjectStoreParams>,
+        session: Arc<Session>,
+    ) -> Result<FragmentReader> {
+        self.output_schema()?;
         let (store, base) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+            session.store_registry(),
             &self.uri,
             &store_params.unwrap_or_default(),
         )
@@ -298,6 +340,7 @@ impl FragmentReadTask {
         };
         let num_rows = physical_rows - deletion_vec.as_ref().map_or(0, |deletions| deletions.len());
         let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
+        let metadata_cache = session.metadata_cache.for_dataset(&self.uri);
         let mut readers = Vec::with_capacity(self.fragment.files.len() + 1);
         for file in &self.fragment.files {
             let Some(context) = CurrentFileReadContext::try_new(
@@ -318,7 +361,7 @@ impl FragmentReadTask {
                     .open(
                         file_scheduler,
                         0,
-                        LanceCache::no_cache(),
+                        metadata_cache.file_metadata_cache(&path),
                         FileReaderOptions::default(),
                         MetadataMode::LazyAllowed,
                     )
@@ -326,7 +369,7 @@ impl FragmentReadTask {
             );
         }
         add_missing_columns(&mut readers, &projection, physical_rows as u32);
-        FragmentReader::try_new(
+        let mut reader = FragmentReader::try_new(
             self.fragment.id as usize,
             deletion_vec,
             None,
@@ -335,15 +378,22 @@ impl FragmentReadTask {
             num_rows,
             physical_rows,
             self.fragment.clone(),
-        )
+        )?;
+        if self.with_row_address {
+            reader.with_row_address();
+        }
+        Ok(reader)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::compute::concat_batches;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{RecordBatchIterator, record_batch};
     use futures::{StreamExt, TryStreamExt};
+    use lance_core::utils::address::RowAddress;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use rstest::rstest;
 
@@ -446,13 +496,99 @@ mod tests {
     #[test]
     fn unsupported_task_version_is_rejected_before_storage_access() {
         let bytes = TaskEnvelope {
-            version: 2,
+            version: 99,
             ..Default::default()
         }
         .encode_to_vec();
         let error = FragmentReadTask::decode(&bytes).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("version 2"));
+        assert!(error.to_string().contains("version 99"));
+    }
+
+    #[rstest]
+    #[case::count_only(false, false)]
+    #[case::addresses_only(false, true)]
+    #[case::projected_addresses(true, true)]
+    #[tokio::test]
+    async fn transported_projection_preserves_live_rows_with_fresh_session(
+        #[case] project_id: bool,
+        #[case] with_row_address: bool,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let uri = temporary.path().to_str().unwrap();
+        let batch = record_batch!(("id", Int32, [0, 1, 2, 3, 4, 5])).unwrap();
+        let input = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            input,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                max_rows_per_group: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (1, 4)").await.unwrap();
+        let projection = if project_id { vec!["id"] } else { vec![] };
+        let tasks = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| {
+                let task = FragmentReadTask::try_new(&dataset, fragment.id, &projection).unwrap();
+                if with_row_address {
+                    task.with_row_address().encode()
+                } else {
+                    task.encode()
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_addresses = [
+            RowAddress::new_from_parts(dataset.fragments()[0].id as u32, 0),
+            RowAddress::new_from_parts(dataset.fragments()[1].id as u32, 0),
+            RowAddress::new_from_parts(dataset.fragments()[1].id as u32, 1),
+            RowAddress::new_from_parts(dataset.fragments()[2].id as u32, 1),
+        ]
+        .map(u64::from);
+        drop(dataset);
+        std::fs::remove_dir_all(temporary.path().join("_versions")).unwrap();
+        if !project_id {
+            // Counting and physical addresses need only the deletion files.
+            std::fs::remove_dir_all(temporary.path().join("data")).unwrap();
+        }
+        let session = Arc::new(Session::default());
+        assert_eq!(session.approx_num_items(), 0);
+        let mut row_count = 0;
+        let mut addresses = Vec::new();
+        let mut ids = Vec::new();
+        for bytes in tasks {
+            let task = FragmentReadTask::decode(&bytes).unwrap();
+            let schema = task.output_schema().unwrap();
+            let reader = task.open_with_session(None, session.clone()).await.unwrap();
+            let mut stream = reader.read_all(2).await.unwrap().buffered(2);
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                assert_eq!(batch.schema(), schema);
+                assert_eq!(
+                    batch.num_columns(),
+                    project_id as usize + with_row_address as usize
+                );
+                row_count += batch.num_rows();
+                if project_id {
+                    ids.extend_from_slice(batch["id"].as_primitive::<Int32Type>().values());
+                }
+                if with_row_address {
+                    addresses
+                        .extend_from_slice(batch["_rowaddr"].as_primitive::<UInt64Type>().values());
+                }
+            }
+        }
+        assert_eq!(row_count, 4);
+        if project_id {
+            assert_eq!(ids, [0, 2, 3, 5]);
+        }
+        if with_row_address {
+            assert_eq!(addresses, expected_addresses);
+        }
     }
 
     #[tokio::test]
