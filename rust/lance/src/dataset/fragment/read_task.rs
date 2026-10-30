@@ -3,9 +3,9 @@
 
 //! Experimental, same-build transport of a fragment read to an independent worker.
 //!
-//! Planning captures one fragment and its schema. Execution needs storage access,
-//! but neither a Dataset nor a manifest. The scheduler must keep referenced data
-//! and deletion files alive for the lifetime of the task.
+//! Construct a scan from a fragment primitive, its schema, and storage location.
+//! Neither construction nor execution requires a Dataset or a manifest. The
+//! scheduler must keep referenced data and deletion files alive for the task.
 
 use std::sync::Arc;
 
@@ -53,10 +53,13 @@ struct TaskEnvelope {
 /// row IDs are not exposed or resolved; `take` uses physical row offsets.
 ///
 /// ```
-/// # use lance::{Dataset, Result};
+/// # use std::sync::Arc;
+/// # use lance::Result;
+/// # use lance_core::datatypes::Schema;
+/// # use lance_table::format::Fragment;
 /// # use lance::dataset::fragment::read_task::FragmentReadTask;
-/// # async fn example(dataset: &Dataset) -> Result<()> {
-/// let task = FragmentReadTask::try_new(dataset, 0, &["id"])?;
+/// # async fn example(uri: &str, schema: Arc<Schema>, fragment: Arc<Fragment>) -> Result<()> {
+/// let task = FragmentReadTask::from_fragment(uri, 1, schema, fragment, &["id"])?;
 /// let transported = task.encode();
 /// // On a worker with no open Dataset:
 /// let reader = FragmentReadTask::decode(&transported)?.open(None).await?;
@@ -74,7 +77,44 @@ pub struct FragmentReadTask {
 }
 
 impl FragmentReadTask {
+    /// Construct a projected scan directly from format primitives, without I/O.
+    ///
+    /// `uri` locates the storage base containing the fragment's data and deletion
+    /// files. Local paths are resolved at construction. `schema` and `fragment`
+    /// must describe the same snapshot; `snapshot_version` records its version
+    /// for the caller's consistency checks and does not reopen or pin it.
+    ///
+    /// No manifest lookup is used to fill in missing information. The projection
+    /// must contain at least one supported user column; unsupported metadata and
+    /// formats are rejected before opening storage. The caller may deserialize
+    /// these primitives or obtain them from its own Table implementation.
+    pub fn from_fragment(
+        uri: impl AsRef<str>,
+        snapshot_version: u64,
+        schema: Arc<Schema>,
+        fragment: Arc<Fragment>,
+        projection: &[&str],
+    ) -> Result<Self> {
+        if uri.as_ref().is_empty() {
+            return Err(Error::invalid_input(
+                "Fragment task needs a nonempty storage URI",
+            ));
+        }
+        let task = Self {
+            uri: uri_to_url(uri.as_ref())?.to_string(),
+            snapshot_version,
+            schema,
+            fragment,
+            projection: projection.iter().map(|name| (*name).to_owned()).collect(),
+        };
+        task.validate()?;
+        Ok(task)
+    }
+
     /// Capture a fragment of this snapshot without retaining the Dataset.
+    ///
+    /// This convenience adapter delegates to [`Self::from_fragment`]. Engines
+    /// that already have the format primitives can use that constructor directly.
     ///
     /// The projection must contain at least one user column. Unknown fragment
     /// IDs and unsupported features are rejected before transport or file I/O.
@@ -82,15 +122,13 @@ impl FragmentReadTask {
         let fragment = dataset
             .find_fragment(fragment_id)
             .ok_or_else(|| Error::invalid_input(format!("Unknown fragment ID {fragment_id}")))?;
-        let task = Self {
-            uri: uri_to_url(dataset.uri())?.to_string(),
-            snapshot_version: dataset.version_id(),
-            schema: Arc::new(dataset.schema().clone()),
-            fragment: Arc::new(fragment.clone()),
-            projection: projection.iter().map(|name| (*name).to_owned()).collect(),
-        };
-        task.validate()?;
-        Ok(task)
+        Self::from_fragment(
+            dataset.uri(),
+            dataset.version_id(),
+            Arc::new(dataset.schema().clone()),
+            Arc::new(fragment.clone()),
+            projection,
+        )
     }
 
     /// Encode for a worker running the same build. Credentials are not included.
@@ -312,11 +350,27 @@ mod tests {
     use super::*;
     use crate::dataset::{NewColumnTransform, WriteParams};
 
+    #[test]
+    fn primitive_constructor_rejects_empty_storage_uri() {
+        let error = FragmentReadTask::from_fragment(
+            "",
+            1,
+            Arc::new(Schema::default()),
+            Arc::new(Fragment::new(0)),
+            &["id"],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("nonempty storage URI"));
+    }
+
     #[rstest]
     #[case::physical_ids(false)]
     #[case::stable_ids_user_columns_only(true)]
     #[tokio::test]
-    async fn task_reads_without_manifest_or_unrelated_fragment(#[case] stable_ids: bool) {
+    async fn construct_from_primitives_without_manifest_or_unrelated_fragment(
+        #[case] stable_ids: bool,
+    ) {
         let temporary = tempfile::tempdir().unwrap();
         let uri = temporary.path().to_str().unwrap();
         let batch = record_batch!(
@@ -346,13 +400,12 @@ mod tests {
         reference.project(&["value", "id"]).unwrap();
         reference.filter("id < 4").unwrap();
         let expected = reference.try_into_batch().await.unwrap();
-        let tasks = dataset.fragments()[..2]
+        let schema = Arc::new(dataset.schema().clone());
+        let snapshot_version = dataset.version_id();
+        let fragments = dataset.fragments()[..2]
             .iter()
-            .map(|fragment| {
-                FragmentReadTask::try_new(&dataset, fragment.id, &["value", "id"])
-                    .unwrap()
-                    .encode()
-            })
+            .cloned()
+            .map(Arc::new)
             .collect::<Vec<_>>();
         let unrelated = dataset.fragments()[2].files[0].path.clone();
         drop(reference);
@@ -361,8 +414,17 @@ mod tests {
         std::fs::remove_file(temporary.path().join("data").join(unrelated)).unwrap();
         assert!(Dataset::open(uri).await.is_err());
         let mut actual = Vec::new();
-        for encoded in tasks {
-            let task = FragmentReadTask::decode(&encoded).unwrap();
+        for fragment in fragments {
+            // The projection and scanner are chosen after the table is gone.
+            let task = FragmentReadTask::from_fragment(
+                uri,
+                snapshot_version,
+                schema.clone(),
+                fragment,
+                &["value", "id"],
+            )
+            .unwrap();
+            let task = FragmentReadTask::decode(&task.encode()).unwrap();
             let reader = task.open(None).await.unwrap();
             actual.extend(
                 reader

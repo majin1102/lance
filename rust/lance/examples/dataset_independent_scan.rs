@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! A planner sends fragment tasks and one BTree segment to a fresh worker process.
+//! A worker constructs scanners directly from fragment and index primitives.
 //! See `dataset_independent_scan.md` for the deliberately limited scope.
 
 use std::collections::BTreeMap;
@@ -19,16 +19,15 @@ use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance::dataset::fragment::read_task::FragmentReadTask;
 use lance::index::DatasetIndexExt;
-use lance_core::cache::LanceCache;
+use lance::index::segment::{IndexSegmentReadTask, SegmentRowIdMode};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
+use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::btree::BTreeIndexPlugin;
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::registry::ScalarIndexPlugin;
-use lance_index::scalar::{SargableQuery, ScalarIndexParams, SearchResult};
-use lance_io::object_store::ObjectStore;
-use lance_table::format::{IndexMetadata, pb};
+use lance_index::scalar::{SargableQuery, ScalarIndexParams};
+use lance_io::object_store::uri_to_url;
+use lance_table::format::{Fragment, IndexMetadata, pb};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -44,9 +43,11 @@ struct Args {
 struct Transport {
     table_uri: String,
     snapshot_version: u64,
-    fragment_tasks: Vec<Vec<u8>>,
+    schema: Vec<u8>,
+    fragments: Vec<Vec<u8>>,
     segment_path: String,
     index_metadata: Vec<u8>,
+    row_id_mode: SegmentRowIdMode,
     expected_scan_ids: Vec<i32>,
     expected_index_ids: Vec<i32>,
 }
@@ -147,26 +148,31 @@ async fn main() -> Result<()> {
     assert_eq!(expected_scan_ids, [0, 1, 3, 4, 5, 6, 7]);
     assert_eq!(expected_index_ids, [0, 4, 6]);
 
-    let fragment_tasks = dataset
+    let fragments = dataset
         .fragments()
         .iter()
-        .map(|fragment| {
-            FragmentReadTask::try_new(&dataset, fragment.id, &["id"]).map(|task| task.encode())
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|fragment| pb::DataFragment::from(fragment).encode_to_vec())
+        .collect();
+    let fields: FieldsWithMeta = dataset.schema().into();
     let transport = Transport {
-        table_uri: dataset.uri().to_string(),
+        table_uri: uri_to_url(dataset.uri())?.to_string(),
         snapshot_version: dataset.manifest().version,
-        fragment_tasks,
+        schema: lance_file::format::pb::Schema {
+            fields: fields.fields.0,
+            metadata: fields.metadata,
+        }
+        .encode_to_vec(),
+        fragments,
         segment_path: dataset
             .indices_dir()
             .join(segment.uuid.to_string())
             .to_string(),
         index_metadata: pb::IndexMetadata::from(segment).encode_to_vec(),
+        row_id_mode: SegmentRowIdMode::PhysicalAddresses,
         expected_scan_ids,
         expected_index_ids,
     };
-    let transport_path = temporary.path().join("tasks.json");
+    let transport_path = temporary.path().join("primitives.json");
     std::fs::write(&transport_path, serde_json::to_vec(&transport)?)?;
     drop(reference_scan);
     drop(indices);
@@ -181,17 +187,32 @@ async fn main() -> Result<()> {
         .arg(&transport_path)
         .status()?;
     assert!(status.success(), "Independent worker failed: {status}");
-    log::info!("Fragment scans and BTree lookup/take matched the Dataset reference");
+    log::info!("Scanners constructed from primitives matched the Dataset reference");
     Ok(())
 }
 
 async fn run_worker(transport_path: &Path) -> Result<()> {
     let transport: Transport = serde_json::from_slice(&std::fs::read(transport_path)?)?;
+    let schema = lance_file::format::pb::Schema::decode(transport.schema.as_slice())?;
+    let schema = Arc::new(Schema::try_from(FieldsWithMeta {
+        fields: Fields(schema.fields),
+        metadata: schema.metadata,
+    })?);
     let mut tasks = BTreeMap::new();
     let mut scanned_ids = Vec::new();
-    for encoded in &transport.fragment_tasks {
-        let task = FragmentReadTask::decode(encoded)?;
-        assert_eq!(task.snapshot_version(), transport.snapshot_version);
+    for encoded in &transport.fragments {
+        let fragment = Arc::new(Fragment::try_from(pb::DataFragment::decode(
+            encoded.as_slice(),
+        )?)?);
+        // The worker chooses its projection and constructs its scanner after
+        // the Dataset and manifest have gone. No prebuilt read task is sent.
+        let task = FragmentReadTask::from_fragment(
+            &transport.table_uri,
+            transport.snapshot_version,
+            schema.clone(),
+            fragment,
+            &["id"],
+        )?;
         let reader = task.open(None).await?;
         let mut batches = reader.read_all(2).await?.buffered(2);
         while let Some(batch) = batches.try_next().await? {
@@ -202,42 +223,22 @@ async fn run_worker(transport_path: &Path) -> Result<()> {
     scanned_ids.sort_unstable();
     assert_eq!(scanned_ids, transport.expected_scan_ids);
 
-    let segment = IndexMetadata::try_from(pb::IndexMetadata::decode(
+    let segment = Arc::new(IndexMetadata::try_from(pb::IndexMetadata::decode(
         transport.index_metadata.as_slice(),
-    )?)?;
-    let details = segment.index_details.as_deref().ok_or_else(|| {
-        Error::invalid_input(format!("Index {} has no type details", segment.uuid))
-    })?;
-    let version = u32::try_from(segment.index_version).map_err(|_| {
-        Error::invalid_input(format!(
-            "Index {} has negative version {}",
-            segment.uuid, segment.index_version
-        ))
-    })?;
-    let (object_store, _) = ObjectStore::from_uri(&transport.table_uri).await?;
-    let index_store = LanceIndexStore::new(
-        object_store,
+    )?)?);
+    let segment_scanner = IndexSegmentReadTask::from_segment(
+        &transport.table_uri,
         object_store::path::Path::parse(&transport.segment_path)?,
-        Arc::new(LanceCache::no_cache()),
-    )
-    .with_file_sizes(segment.file_size_map());
-    let index_cache = LanceCache::no_cache();
-    let index = BTreeIndexPlugin
-        .load_index(Arc::new(index_store), details, version, None, &index_cache)
+        segment.clone(),
+        transport.row_id_mode,
+    )?
+    .open(None)
+    .await?;
+    let query = SargableQuery::Equals(ScalarValue::Int32(Some(7)));
+    let matches = segment_scanner
+        .search(&query, &NoOpMetricsCollector)
         .await?;
-    let SearchResult::Exact(matches) = index
-        .search(
-            &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
-            &NoOpMetricsCollector,
-        )
-        .await?
-    else {
-        return Err(Error::not_supported(
-            "The demo requires exact BTree results",
-        ));
-    };
-    let true_rows = matches.true_rows();
-    let addresses = true_rows.row_addrs().ok_or_else(|| {
+    let addresses = matches.row_addrs().ok_or_else(|| {
         Error::not_supported("The demo requires individually enumerated row addresses")
     })?;
     let mut offsets_by_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -249,6 +250,37 @@ async fn run_worker(transport_path: &Path) -> Result<()> {
     }
     assert_eq!(offsets_by_fragment.values().map(Vec::len).sum::<usize>(), 4);
     assert_eq!(offsets_by_fragment.len(), 2);
+
+    // The same files retain both fragments' rows, but a metadata provider may
+    // withdraw one fragment from the segment's coverage without rewriting them.
+    let (&fragment_id, _) = offsets_by_fragment
+        .first_key_value()
+        .ok_or_else(|| Error::invalid_input("The fixture index returned no fragment addresses"))?;
+    let mut narrowed_segment = segment.as_ref().clone();
+    narrowed_segment.fragment_bitmap = Some([fragment_id as u32].into_iter().collect());
+    let narrowed_scanner = IndexSegmentReadTask::from_segment(
+        &transport.table_uri,
+        object_store::path::Path::parse(&transport.segment_path)?,
+        Arc::new(narrowed_segment),
+        transport.row_id_mode,
+    )?
+    .open(None)
+    .await?;
+    let narrowed_matches = narrowed_scanner
+        .search(&query, &NoOpMetricsCollector)
+        .await?;
+    let narrowed_addresses = narrowed_matches
+        .row_addrs()
+        .ok_or_else(|| {
+            Error::not_supported("The fixture requires individually enumerated row addresses")
+        })?
+        .collect::<Vec<_>>();
+    assert_eq!(narrowed_addresses.len(), 2);
+    assert!(
+        narrowed_addresses
+            .iter()
+            .all(|address| u64::from(address.fragment_id()) == fragment_id)
+    );
 
     let mut selected_ids = Vec::new();
     for (fragment_id, mut offsets) in offsets_by_fragment {
@@ -267,7 +299,7 @@ async fn run_worker(transport_path: &Path) -> Result<()> {
     selected_ids.sort_unstable();
     assert_eq!(selected_ids, transport.expected_index_ids);
     log::info!(
-        "Worker read {} live rows and selected {} rows using only transported tasks and files",
+        "Worker read {} live rows and selected {} rows using only primitive metadata and files",
         scanned_ids.len(),
         selected_ids.len()
     );
