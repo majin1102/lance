@@ -3,6 +3,8 @@
 
 //! Wraps a Fragment of the dataset.
 
+mod current_reader;
+pub mod read_task;
 pub mod session;
 pub mod write;
 
@@ -1408,14 +1410,15 @@ impl FileFragment {
         read_config: &FragReadConfig,
         metadata_mode: MetadataMode,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
-        let full_schema = self.dataset.schema();
-        let data_file_schema = Arc::new(data_file.schema(full_schema));
-        let projection = projection.unwrap_or(full_schema);
-        let schema_per_file =
-            Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
-        if schema_per_file.fields.is_empty() {
+        let Some(context) = current_reader::CurrentFileReadContext::try_new(
+            self.dataset.schema(),
+            data_file,
+            projection,
+            self.metadata.physical_rows,
+        )?
+        else {
             return Ok(None);
-        }
+        };
 
         let path = self
             .dataset
@@ -1452,101 +1455,25 @@ impl FileFragment {
         let file_scheduler = store_scheduler
             .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
             .await?;
-        let path = file_scheduler.reader().path().clone();
-        let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
-        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-            data_file
-                .fields
-                .iter()
-                .copied()
-                .zip(data_file.column_indices.iter().copied())
-                .filter_map(|(field_id, column_index)| {
-                    (column_index >= 0).then_some((field_id as u32, column_index as u32))
-                }),
-        ));
-        let file_version = data_file.file_version()?;
-        let physical_schema = if matches!(
-            file_version,
-            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
-        ) {
-            v2_adapter::legacy_blob_read_schema(&schema_per_file)
-        } else {
-            schema_per_file.as_ref().clone()
-        };
-        let reader_projection = file_versions::reader_projection_from_field_ids(
-            file_version,
-            &physical_schema,
-            field_id_to_column_idx.as_ref(),
-        )?;
+        let metadata_cache = self
+            .dataset
+            .metadata_cache
+            .file_metadata_cache(file_scheduler.reader().path());
         let file_reader_options = read_config
             .file_reader_options
             .clone()
             .or_else(|| self.dataset.file_reader_options.clone())
             .unwrap_or_default();
-        let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
-            && reader_projection.column_indices.len().saturating_mul(4)
-                < data_file
-                    .column_indices
-                    .iter()
-                    .filter(|column_index| **column_index >= 0)
-                    .count();
-        let known_schema = self
-            .metadata
-            .physical_rows
-            .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
-
-        let encodings_io = Arc::new(
-            LanceEncodingsIo::new(file_scheduler.clone())
-                .with_read_chunk_size(file_reader_options.read_chunk_size),
-        );
-        let reader = file_versions::open_projected_reader(
-            file_version,
-            &reader_projection,
-            prefer_indexed,
-            || async {
-                let metadata_index = self
-                    .get_file_metadata_index(&file_scheduler, known_schema.clone())
-                    .await?;
-                if (reader_projection.column_indices.len() as u32).saturating_mul(4)
-                    >= metadata_index.num_columns()
-                {
-                    return Ok(None);
-                }
-                Ok(Some(
-                    ProjectedFileReader::try_open_with_metadata_index(
-                        encodings_io.clone(),
-                        path.clone(),
-                        Some(reader_projection.clone()),
-                        Arc::<DecoderPlugins>::default(),
-                        metadata_index,
-                        &metadata_cache,
-                        file_reader_options.clone(),
-                    )
-                    .await?,
-                ))
-            },
-            || async {
-                let file_metadata = self.get_file_metadata(&file_scheduler).await?;
-                ProjectedFileReader::try_open_with_file_metadata(
-                    encodings_io.clone(),
-                    path.clone(),
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    file_metadata,
-                    &metadata_cache,
-                    file_reader_options.clone(),
-                )
-                .await
-            },
-        )
-        .await?;
-        Ok(Some(Box::new(v2_adapter::Reader::new(
-            Arc::new(reader),
-            schema_per_file,
-            field_id_to_column_idx,
-            reader_priority,
-            file_scheduler,
-        ))))
+        context
+            .open(
+                file_scheduler,
+                reader_priority,
+                metadata_cache,
+                file_reader_options,
+                metadata_mode,
+            )
+            .await
+            .map(Some)
     }
 
     async fn open_readers(
@@ -1601,19 +1528,7 @@ impl FileFragment {
             // deletions will be applied later
             let num_rows = self.physical_rows().await?;
 
-            // Check if there are any fields that are not in any data files
-            let field_ids_in_files = opened_files
-                .iter()
-                .flat_map(|r| r.projection().fields_pre_order().map(|f| f.id))
-                .filter(|id| *id >= 0)
-                .collect::<HashSet<_>>();
-            let mut missing_fields = projection.field_ids();
-            missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
-            if !missing_fields.is_empty() {
-                let missing_projection = projection.project_by_ids(&missing_fields, true);
-                let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
-                opened_files.push(Box::new(null_reader));
-            }
+            current_reader::add_missing_columns(&mut opened_files, projection, num_rows as u32);
 
             Ok(opened_files)
         }
@@ -2116,14 +2031,7 @@ impl FileFragment {
         let path = file_scheduler.reader().path();
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
-        let file_metadata = cache
-            .get_or_insert_with_key(FileMetadataCacheKey, || async {
-                let file_metadata: CachedFileMetadata =
-                    lance_file::reader::FileReader::read_all_metadata(file_scheduler).await?;
-                Ok(file_metadata)
-            })
-            .await?;
-        Ok(file_metadata)
+        current_reader::get_file_metadata(file_scheduler, &cache).await
     }
 
     pub async fn get_file_metadata_index(
@@ -2134,22 +2042,7 @@ impl FileFragment {
         let path = file_scheduler.reader().path();
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
-        let metadata_index = cache
-            .get_or_insert_with_key(FileMetadataIndexCacheKey, || async {
-                let metadata_index = if let Some((file_schema, num_rows)) = known_schema {
-                    lance_file::reader::FileReader::read_metadata_index_with_schema(
-                        file_scheduler,
-                        file_schema,
-                        num_rows,
-                    )
-                    .await?
-                } else {
-                    lance_file::reader::FileReader::read_metadata_index(file_scheduler).await?
-                };
-                Ok(metadata_index)
-            })
-            .await?;
-        Ok(metadata_index)
+        current_reader::get_file_metadata_index(file_scheduler, &cache, known_schema).await
     }
 
     /// Take rows based on internal local row offsets
