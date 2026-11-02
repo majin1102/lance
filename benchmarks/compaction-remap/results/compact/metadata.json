@@ -1,0 +1,30 @@
+{
+  "base": "3104052849d1a45c321bf13b3220254696d26eae",
+  "head": "d2082ceb698667535d1e494c70432158cbfa4775",
+  "system": "Linux-5.4.143.bsk.8-amd64-x86_64-with-debian-10.13",
+  "cpu": "Intel(R) Xeon(R) Platinum 8336C CPU @ 2.30GHz",
+  "memory_total_mib": 31896.796875,
+  "available_cpus": 16,
+  "profile": "release-with-debug",
+  "fragments": 16,
+  "text_bytes": 64,
+  "deleted_fraction": 0.1,
+  "index_cache_bytes": 2147483648,
+  "rss_sample_interval_ms": 1,
+  "os_page_cache": "not flushed; fixture copy precedes every sample",
+  "fixture_copy_flush": "fsync copied files and directories before each commit worker",
+  "repeats": 5,
+  "environment": {
+    "LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS": "8192",
+    "LANCE_BLOOMFILTER_DEFAULT_PROBABILITY": "0.00057",
+    "LANCE_FMINDEX_PARTITION_ROWS": "10000",
+    "LANCE_FMINDEX_PARTITION_BYTES": "16777216"
+  },
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "rustflags": [
+    "-C",
+    "target-cpu=haswell",
+    "-C",
+    "target-feature=+avx2,+fma,+f16c"
+  ]
+}

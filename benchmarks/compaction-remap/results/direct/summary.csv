@@ -1,0 +1,3 @@
+index,input_rows,mode,cache,base_commit_ms,base_rss_before_mib,base_sampled_peak_rss_mib,base_process_peak_rss_mib,base_read_bytes,base_min_ms,base_max_ms,pr_commit_ms,pr_rss_before_mib,pr_sampled_peak_rss_mib,pr_process_peak_rss_mib,pr_read_bytes,pr_min_ms,pr_max_ms,speedup,peak_rss_reduction_percent
+fm,10000000,direct,cold,6029.858016,30.17578125,1482.0703125,1482.0703125,493258779,5727.549491,6267.557688,3.671592,30.015625,39.53125,40.61328125,25019,3.617206,3.802638,1642.3006739310904,97.33270077225166
+bloomfilter,10000000,direct,cold,3629.0438489999997,34.296875,739.62890625,740.05859375,40391677,3595.553677,3843.599732,2.458059,34.1796875,38.375,39.45703125,26,2.142306,2.611219,1476.3859813779895,94.81158731416198
